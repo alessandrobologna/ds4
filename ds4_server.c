@@ -5004,18 +5004,48 @@ static bool responses_final_response(int fd, const request *r, const char *id,
 typedef enum {
     RESP_STREAM_THINKING,
     RESP_STREAM_TEXT,
+    RESP_STREAM_TOOL,
     RESP_STREAM_SUPPRESS,
 } responses_stream_mode;
+
+typedef enum {
+    RESP_TOOL_BETWEEN_INVOKES,
+    RESP_TOOL_BETWEEN_PARAMS,
+    RESP_TOOL_PARAM_VALUE,
+    RESP_TOOL_DONE,
+    RESP_TOOL_ERROR,
+} responses_tool_stream_state;
+
+typedef struct {
+    responses_tool_stream_state state;
+    const char *tool_calls_end;
+    const char *invoke_start;
+    const char *invoke_end;
+    const char *param_start;
+    const char *param_end;
+    size_t parse_pos;
+    int index;
+    int output_index;
+    bool active;
+    bool emitted_any;
+    bool args_open;
+    bool first_param;
+    bool param_is_string;
+    char *name;
+    buf args;
+} responses_tool_stream;
 
 typedef struct {
     responses_stream_mode mode;
     size_t emit_pos;
     int next_output_index;
     int message_index;
+    int streamed_function_calls;
     bool active;
     bool checked_think_prefix;
     bool message_started;
     bool sent_content;
+    responses_tool_stream tool;
 } responses_stream;
 
 static bool responses_sse_start_live(int fd, const request *r, const char *id,
@@ -5079,6 +5109,339 @@ static bool responses_sse_text_delta_n(int fd, responses_stream *st, const char 
     return ok;
 }
 
+static void responses_tool_stream_clear(responses_tool_stream *ts) {
+    free(ts->name);
+    ts->name = NULL;
+    buf_free(&ts->args);
+    ts->args = (buf){0};
+}
+
+static bool responses_tool_stream_init(responses_tool_stream *ts, const char *raw,
+                                       size_t raw_len, size_t pos) {
+    memset(ts, 0, sizeof(*ts));
+    ts->active = true;
+    ts->state = RESP_TOOL_BETWEEN_INVOKES;
+    ts->parse_pos = pos;
+    if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
+        ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
+        ts->tool_calls_end = DS4_TOOL_CALLS_END;
+        ts->invoke_start = DS4_INVOKE_START;
+        ts->invoke_end = DS4_INVOKE_END;
+        ts->param_start = DS4_PARAM_START;
+        ts->param_end = DS4_PARAM_END;
+    } else if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START_SHORT)) {
+        ts->parse_pos += strlen(DS4_TOOL_CALLS_START_SHORT);
+        ts->tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
+        ts->invoke_start = DS4_INVOKE_START_SHORT;
+        ts->invoke_end = DS4_INVOKE_END_SHORT;
+        ts->param_start = DS4_PARAM_START_SHORT;
+        ts->param_end = DS4_PARAM_END_SHORT;
+    } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
+        ts->parse_pos += strlen("<tool_calls>");
+        ts->tool_calls_end = "</tool_calls>";
+        ts->invoke_start = "<invoke";
+        ts->invoke_end = "</invoke>";
+        ts->param_start = "<parameter";
+        ts->param_end = "</parameter>";
+    } else {
+        ts->active = false;
+        ts->state = RESP_TOOL_ERROR;
+        return false;
+    }
+    return true;
+}
+
+static bool responses_sse_function_call_added(int fd, const char *id,
+                                              responses_tool_stream *ts) {
+    char item_id[128];
+    char call_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+    responses_function_call_id(call_id, sizeof(call_id), id, ts->index);
+
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"response.output_item.added\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":{\"type\":\"function_call\",\"id\":",
+               ts->output_index);
+    json_escape(&b, item_id);
+    buf_puts(&b, ",\"call_id\":");
+    json_escape(&b, call_id);
+    buf_puts(&b, ",\"name\":");
+    json_escape(&b, ts->name ? ts->name : "");
+    buf_puts(&b, ",\"arguments\":\"\"}}");
+    bool ok = sse_event(fd, "response.output_item.added", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_function_arg_delta_n(int fd, const char *id,
+                                               const responses_tool_stream *ts,
+                                               const char *text, size_t len) {
+    if (len == 0) return true;
+    char item_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"response.function_call_arguments.delta\",\"response_id\":");
+    json_escape(&b, id);
+    buf_puts(&b, ",\"item_id\":");
+    json_escape(&b, item_id);
+    buf_printf(&b, ",\"output_index\":%d,\"delta\":", ts->output_index);
+    json_escape_n(&b, text, len);
+    buf_putc(&b, '}');
+    bool ok = sse_event(fd, "response.function_call_arguments.delta", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_tool_emit_args_fragment(int fd, const char *id,
+                                              responses_tool_stream *ts,
+                                              const char *text, size_t len) {
+    if (len == 0) return true;
+    buf_append(&ts->args, text, len);
+    return responses_sse_function_arg_delta_n(fd, id, ts, text, len);
+}
+
+static bool responses_tool_emit_string_value(int fd, const char *id,
+                                             responses_tool_stream *ts,
+                                             const char *text, size_t len) {
+    if (len == 0) return true;
+    char *raw = xstrndup(text, len);
+    char *unescaped = dsml_unescape_text(raw);
+    buf frag = {0};
+    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    bool ok = responses_tool_emit_args_fragment(fd, id, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    free(unescaped);
+    free(raw);
+    return ok;
+}
+
+static bool responses_tool_emit_param_prefix(int fd, const char *id,
+                                             responses_tool_stream *ts,
+                                             const char *name, bool is_string) {
+    buf frag = {0};
+    if (ts->first_param) ts->first_param = false;
+    else buf_putc(&frag, ',');
+    json_escape(&frag, name ? name : "");
+    buf_putc(&frag, ':');
+    if (is_string) buf_putc(&frag, '"');
+    bool ok = responses_tool_emit_args_fragment(fd, id, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+static bool responses_tool_stream_fail(responses_tool_stream *ts) {
+    responses_tool_stream_clear(ts);
+    ts->active = false;
+    ts->state = RESP_TOOL_ERROR;
+    return true;
+}
+
+static bool responses_tool_start_invoke(int fd, const char *id,
+                                        responses_stream *st,
+                                        const char *raw, size_t raw_len) {
+    responses_tool_stream *ts = &st->tool;
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    free(tag);
+    if (!name) return responses_tool_stream_fail(ts);
+
+    responses_tool_stream_clear(ts);
+    ts->name = name;
+    ts->output_index = st->next_output_index++;
+    bool ok = responses_sse_function_call_added(fd, id, ts) &&
+              responses_tool_emit_args_fragment(fd, id, ts, "{", 1);
+    if (!ok) return false;
+
+    ts->emitted_any = true;
+    ts->args_open = true;
+    ts->first_param = true;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = RESP_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool responses_tool_start_param(int fd, const char *id,
+                                       responses_tool_stream *ts,
+                                       const char *raw, size_t raw_len) {
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    char *is_string = dsml_attr(tag, "string");
+    free(tag);
+    if (!name || !is_string) {
+        free(name);
+        free(is_string);
+        return responses_tool_stream_fail(ts);
+    }
+    bool string_value = !strcmp(is_string, "true");
+    bool ok = responses_tool_emit_param_prefix(fd, id, ts, name, string_value);
+    free(name);
+    free(is_string);
+    if (!ok) return false;
+
+    ts->param_is_string = string_value;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = RESP_TOOL_PARAM_VALUE;
+    return true;
+}
+
+static bool responses_tool_finish_param(int fd, const char *id,
+                                        responses_tool_stream *ts,
+                                        const char *raw, size_t value_end) {
+    if (value_end > ts->parse_pos) {
+        bool ok = ts->param_is_string ?
+            responses_tool_emit_string_value(fd, id, ts, raw + ts->parse_pos,
+                                             value_end - ts->parse_pos) :
+            responses_tool_emit_args_fragment(fd, id, ts, raw + ts->parse_pos,
+                                              value_end - ts->parse_pos);
+        if (!ok) return false;
+    }
+    if (ts->param_is_string &&
+        !responses_tool_emit_args_fragment(fd, id, ts, "\"", 1)) return false;
+    ts->parse_pos = value_end + strlen(ts->param_end);
+    ts->state = RESP_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool responses_sse_function_args_done(int fd, const char *id,
+                                             const responses_tool_stream *ts) {
+    char item_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"response.function_call_arguments.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_puts(&b, ",\"item_id\":");
+    json_escape(&b, item_id);
+    buf_printf(&b, ",\"output_index\":%d,\"name\":", ts->output_index);
+    json_escape(&b, ts->name ? ts->name : "");
+    buf_puts(&b, ",\"arguments\":");
+    json_escape(&b, ts->args.ptr ? ts->args.ptr : "{}");
+    buf_putc(&b, '}');
+    bool ok = sse_event(fd, "response.function_call_arguments.done", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_function_call_item_done_live(int fd, const char *id,
+                                                       const responses_tool_stream *ts) {
+    char item_id[128];
+    char call_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+    responses_function_call_id(call_id, sizeof(call_id), id, ts->index);
+
+    buf b = {0};
+    buf_printf(&b,
+               "{\"type\":\"response.output_item.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":{\"type\":\"function_call\",\"id\":",
+               ts->output_index);
+    json_escape(&b, item_id);
+    buf_puts(&b, ",\"call_id\":");
+    json_escape(&b, call_id);
+    buf_puts(&b, ",\"name\":");
+    json_escape(&b, ts->name ? ts->name : "");
+    buf_puts(&b, ",\"arguments\":");
+    json_escape(&b, ts->args.ptr ? ts->args.ptr : "{}");
+    buf_puts(&b, "}}");
+    bool ok = sse_event(fd, "response.output_item.done", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_tool_finish_invoke(int fd, const char *id,
+                                         responses_stream *st,
+                                         responses_tool_stream *ts) {
+    if (ts->args_open &&
+        !responses_tool_emit_args_fragment(fd, id, ts, "}", 1)) return false;
+    ts->args_open = false;
+    if (!responses_sse_function_args_done(fd, id, ts)) return false;
+    if (!responses_sse_function_call_item_done_live(fd, id, ts)) return false;
+    responses_tool_stream_clear(ts);
+    st->streamed_function_calls++;
+    ts->index++;
+    ts->state = RESP_TOOL_BETWEEN_INVOKES;
+    return true;
+}
+
+static bool responses_tool_stream_update(int fd, const char *id,
+                                         responses_stream *st,
+                                         const char *raw, size_t raw_len) {
+    responses_tool_stream *ts = &st->tool;
+    while (ts->active && ts->parse_pos < raw_len) {
+        if (ts->state == RESP_TOOL_BETWEEN_INVOKES) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
+                ts->parse_pos += strlen(ts->tool_calls_end);
+                ts->active = false;
+                ts->state = RESP_TOOL_DONE;
+                return true;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
+                size_t before_pos = ts->parse_pos;
+                responses_tool_stream_state before_state = ts->state;
+                if (!responses_tool_start_invoke(fd, id, st, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return responses_tool_stream_fail(ts);
+        }
+
+        if (ts->state == RESP_TOOL_BETWEEN_PARAMS) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
+                ts->parse_pos += strlen(ts->invoke_end);
+                if (!responses_tool_finish_invoke(fd, id, st, ts)) return false;
+                continue;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->param_start)) {
+                size_t before_pos = ts->parse_pos;
+                responses_tool_stream_state before_state = ts->state;
+                if (!responses_tool_start_param(fd, id, ts, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return responses_tool_stream_fail(ts);
+        }
+
+        if (ts->state == RESP_TOOL_PARAM_VALUE) {
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               ts->param_end);
+            if (end) {
+                if (!responses_tool_finish_param(fd, id, ts, raw,
+                                                 (size_t)(end - raw))) return false;
+                continue;
+            }
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len, ts->param_end,
+                                                            ts->param_is_string);
+            if (limit > ts->parse_pos) {
+                bool ok = ts->param_is_string ?
+                    responses_tool_emit_string_value(fd, id, ts, raw + ts->parse_pos,
+                                                     limit - ts->parse_pos) :
+                    responses_tool_emit_args_fragment(fd, id, ts, raw + ts->parse_pos,
+                                                      limit - ts->parse_pos);
+                if (!ok) return false;
+                ts->parse_pos = limit;
+            }
+            return true;
+        }
+
+        return true;
+    }
+    return true;
+}
+
 static bool responses_sse_stream_update(int fd, const request *r, const char *id,
                                         responses_stream *st,
                                         const char *raw, size_t raw_len,
@@ -5124,10 +5487,18 @@ static bool responses_sse_stream_update(int fd, const request *r, const char *id
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            st->mode = RESP_STREAM_SUPPRESS;
+            if (responses_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                st->mode = RESP_STREAM_TOOL;
+            } else {
+                st->mode = RESP_STREAM_SUPPRESS;
+            }
         } else if (final) {
             st->mode = RESP_STREAM_SUPPRESS;
         }
+    }
+    if (st->mode == RESP_STREAM_TOOL) {
+        if (!responses_tool_stream_update(fd, id, st, raw, raw_len)) return false;
+        if (!st->tool.active) st->mode = RESP_STREAM_SUPPRESS;
     }
     return true;
 }
@@ -5155,7 +5526,10 @@ static bool responses_sse_function_call_done(int fd, responses_stream *st, const
     int output_index = st->next_output_index++;
     buf b = {0};
     buf_printf(&b,
-               "{\"type\":\"response.output_item.done\",\"output_index\":%d,"
+               "{\"type\":\"response.output_item.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b,
+               ",\"output_index\":%d,"
                "\"item\":",
                output_index);
     append_responses_function_call_item(&b, tc, id, i, &r->tool_orders);
@@ -5194,10 +5568,11 @@ static bool responses_sse_finish_live(int fd, const request *r, const char *id,
         if (!responses_sse_message_done(fd, st, id, content ? content : "")) return false;
     }
     if (calls) {
-        for (int i = 0; i < calls->len; i++) {
+        for (int i = st->streamed_function_calls; i < calls->len; i++) {
             if (!responses_sse_function_call_done(fd, st, r, id, &calls->v[i], i)) return false;
         }
     }
+    responses_tool_stream_clear(&st->tool);
     return responses_sse_completed(fd, r, id, prompt_tokens, completion_tokens);
 }
 
@@ -9782,6 +10157,95 @@ static void test_responses_live_stream_sends_codex_events(void) {
     close(sv[0]);
     close(sv[1]);
 }
+
+static void test_responses_live_stream_sends_function_call_argument_deltas(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    responses_stream st;
+    TEST_ASSERT(responses_sse_start_live(sv[0], &r, "resp_tools", &st));
+    const char *raw_partial =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_tools", &st,
+                                            raw_partial, strlen(raw_partial), false));
+
+    const char *raw_complete =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_tools", &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_tools", &st,
+                                          raw_complete, strlen(raw_complete), "",
+                                          &calls, 10, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *created = strstr(out, "event: response.created");
+    const char *added = strstr(out, "event: response.output_item.added");
+    const char *func_added = strstr(out, "\"item\":{\"type\":\"function_call\"");
+    const char *delta = strstr(out, "event: response.function_call_arguments.delta");
+    const char *partial = strstr(out, "\"delta\":\"echo partial\"");
+    const char *rest = strstr(out, "\"delta\":\" done\"");
+    const char *args_done = strstr(out, "event: response.function_call_arguments.done");
+    const char *item_done = strstr(out, "event: response.output_item.done");
+    const char *completed = strstr(out, "event: response.completed");
+    int added_count = 0;
+    int done_count = 0;
+    for (const char *p = out; (p = strstr(p, "event: response.output_item.added")) != NULL; p++) added_count++;
+    for (const char *p = out; (p = strstr(p, "event: response.output_item.done")) != NULL; p++) done_count++;
+
+    TEST_ASSERT(created != NULL);
+    TEST_ASSERT(added != NULL);
+    TEST_ASSERT(func_added != NULL);
+    TEST_ASSERT(delta != NULL);
+    TEST_ASSERT(partial != NULL);
+    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(args_done != NULL);
+    TEST_ASSERT(item_done != NULL);
+    TEST_ASSERT(completed != NULL);
+    TEST_ASSERT(strstr(out, "\"response_id\":\"resp_tools\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"item_id\":\"fc_resp_tools_0\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"{\\\"command\\\":\\\"echo partial done\\\"}\"") != NULL);
+    TEST_ASSERT(added_count == 1);
+    TEST_ASSERT(done_count == 1);
+    TEST_ASSERT(created < added);
+    TEST_ASSERT(added < delta);
+    TEST_ASSERT(delta < partial);
+    TEST_ASSERT(partial < rest);
+    TEST_ASSERT(rest < args_done);
+    TEST_ASSERT(args_done < item_done);
+    TEST_ASSERT(item_done < completed);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") == NULL);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
 static void test_streaming_holds_partial_utf8(void) {
     const char partial[] = {'A', ' ', (char)0xf0, (char)0x9f, 0};
     const char complete[] = {'A', ' ', (char)0xf0, (char)0x9f,
@@ -11297,6 +11761,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_responses_input_renders_messages_and_tool_results();
     test_responses_live_stream_sends_codex_events();
+    test_responses_live_stream_sends_function_call_argument_deltas();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();

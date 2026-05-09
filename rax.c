@@ -2725,6 +2725,7 @@ unsigned long raxTouch(raxNode *n) {
 
     int numchildren = n->iscompr ? 1 : n->size;
     raxNode **cp = raxNodeFirstChildPtr(n);
+    int count = 0;
     for (int i = 0; i < numchildren; i++) {
         if (numchildren > 1) {
             sum += (long)n->data[i];
@@ -2736,6 +2737,8 @@ unsigned long raxTouch(raxNode *n) {
         } else {
             raxNode *child;
             memcpy(&child,cp,sizeof(child));
+            if (child == (void*)0x65d1760) count++;
+            if (count > 1) exit(1);
             sum += raxTouch(child);
         }
         cp++;

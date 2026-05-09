@@ -153,6 +153,7 @@ Supported endpoints:
 - `GET /v1/models/deepseek-v4-flash`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
+- `POST /v1/responses`
 - `POST /v1/messages`
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
@@ -161,13 +162,25 @@ Supported endpoints:
 Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
 tool calls are mapped back to OpenAI tool calls.
 
+`/v1/responses` is the OpenAI Responses-compatible endpoint used by newer Codex
+clients. It accepts `instructions`, `input`, Responses-style `tools`,
+`tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
+`seed`, `stream`, `stop`, and reasoning controls. Message, function-call, and
+function-call-output input items are mapped into the same DS4 chat/tool history
+as the chat-completions endpoint. Streaming responses use Responses SSE events
+such as `response.created`, `response.output_item.added`,
+`response.output_text.delta`, `response.output_item.done`, and
+`response.completed`.
+
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
-Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text.
+The chat-completions and Anthropic endpoints stream reasoning in their native
+API shape instead of mixing it into final text. The Responses endpoint streams
+assistant text and tool items in Responses shape; DS4 private thinking is not
+sent as final text.
 
 Minimal OpenAI example:
 
@@ -184,8 +197,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ### Agent Client Usage
 
 `ds4-server` can be used by local coding agents that speak OpenAI-compatible
-chat completions. Start the server first, and set the client context limit no
-higher than the `--ctx` value you started the server with:
+chat completions or the OpenAI Responses API. Start the server first, and set
+the client context limit no higher than the `--ctx` value you started the server
+with:
 
 ```sh
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
@@ -198,9 +212,34 @@ your system. With 128GB of RAM you would run the 2-bit quants, which are
 already 81GB, 26GB are going to be likely too much, so a context window
 of 100~300k tokens is wiser.
 
-The `384000` output limit below avoids token caps since the model is able
-to generate very long replies otherwise (up to 384k tokens). The server
-still stops when the configured context window is full.
+The `384000` output limits in the client examples avoid token caps since the
+model is able to generate very long replies otherwise (up to 384k tokens). The
+server still stops when the configured context window is full.
+
+For **Codex**, add a model provider and profile to `~/.codex/config.toml`:
+
+```toml
+model_context_window = 100000
+
+[model_providers.ds4]
+name = "ds4.c local"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+
+[profiles.ds4]
+model = "deepseek-v4-flash"
+model_provider = "ds4"
+```
+
+Then run Codex with that profile:
+
+```sh
+codex --profile ds4
+```
+
+`model_context_window` is top-level in current Codex config, so keep it aligned
+with the server `--ctx` value. `base_url` should include `/v1`; Codex appends
+`/responses` for `wire_api = "responses"`.
 
 For **opencode**, add a provider and agent entry to
 `~/.config/opencode/opencode.json`:

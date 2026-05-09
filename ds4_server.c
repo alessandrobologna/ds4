@@ -444,6 +444,7 @@ typedef enum {
 typedef enum {
     API_OPENAI,
     API_ANTHROPIC,
+    API_RESPONSES,
 } api_style;
 
 typedef struct {
@@ -460,6 +461,8 @@ typedef struct {
 
 typedef struct {
     char *name;
+    char *wire_name;
+    char *namespace;
     char **prop;
     int len;
     int cap;
@@ -559,6 +562,8 @@ static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
 
 static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
+    free(o->wire_name);
+    free(o->namespace);
     for (int i = 0; i < o->len; i++) free(o->prop[i]);
     free(o->prop);
     memset(o, 0, sizeof(*o));
@@ -603,6 +608,16 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
         orders->v = xrealloc(orders->v, (size_t)orders->cap * sizeof(orders->v[0]));
     }
     orders->v[orders->len++] = order;
+}
+
+static void tool_schema_orders_append_move(tool_schema_orders *dst, tool_schema_orders *src) {
+    for (int i = 0; i < src->len; i++) {
+        tool_schema_order order = src->v[i];
+        memset(&src->v[i], 0, sizeof(src->v[i]));
+        tool_schema_orders_push(dst, order);
+    }
+    free(src->v);
+    memset(src, 0, sizeof(*src));
 }
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
@@ -1004,6 +1019,8 @@ static void append_raw_json_line(buf *b, const char *json) {
     buf_puts(b, json);
 }
 
+static void json_escape(buf *b, const char *s);
+
 static char *openai_function_schema_from_tool(const char *raw) {
     const char *p = raw;
     json_ws(&p);
@@ -1032,6 +1049,156 @@ static char *openai_function_schema_from_tool(const char *raw) {
         json_ws(&p);
     }
     return NULL;
+}
+
+static char *responses_special_schema_from_tool(const char *raw) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+
+    char *type = NULL;
+    char *description = NULL;
+    char *parameters = NULL;
+    char *out = NULL;
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(&p, &type)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "description")) {
+            free(description);
+            if (!json_string(&p, &description)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "parameters")) {
+            free(parameters);
+            if (!json_raw_value(&p, &parameters)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+
+    if (type && !strcmp(type, "tool_search")) {
+        buf b = {0};
+        buf_puts(&b, "{\"name\":\"tool_search\",\"description\":");
+        json_escape(&b, description ? description : "Search available app and connector tools.");
+        buf_puts(&b, ",\"parameters\":");
+        buf_puts(&b, parameters ? parameters : "{\"type\":\"object\",\"properties\":{}}");
+        buf_putc(&b, '}');
+        out = buf_take(&b);
+    }
+
+done:
+    free(type);
+    free(description);
+    free(parameters);
+    return out;
+}
+
+static char *responses_namespace_function_schema_from_tool(const char *raw,
+                                                           const char *namespace,
+                                                           char **wire_name) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+
+    char *type = NULL;
+    char *name = NULL;
+    char *description = NULL;
+    char *parameters = NULL;
+    char *out = NULL;
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(&p, &type)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(&p, &name)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "description")) {
+            free(description);
+            if (!json_string(&p, &description)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "parameters") || !strcmp(key, "input_schema")) {
+            free(parameters);
+            if (!json_raw_value(&p, &parameters)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+
+    if ((!type || !strcmp(type, "function")) && namespace && name && name[0]) {
+        buf prompt_name = {0};
+        buf_puts(&prompt_name, namespace);
+        buf_puts(&prompt_name, name);
+
+        buf b = {0};
+        buf_puts(&b, "{\"name\":");
+        json_escape(&b, prompt_name.ptr ? prompt_name.ptr : name);
+        buf_puts(&b, ",\"description\":");
+        json_escape(&b, description ? description : "");
+        buf_puts(&b, ",\"parameters\":");
+        buf_puts(&b, parameters ? parameters : "{\"type\":\"object\",\"properties\":{}}");
+        buf_putc(&b, '}');
+        out = buf_take(&b);
+        if (wire_name) *wire_name = xstrdup(name);
+        buf_free(&prompt_name);
+    }
+
+done:
+    free(type);
+    free(name);
+    free(description);
+    free(parameters);
+    return out;
 }
 
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
@@ -1083,7 +1250,8 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
     return *p == '}';
 }
 
-static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json) {
+static void tool_schema_orders_add_json_wire(tool_schema_orders *orders, const char *json,
+                                             const char *namespace, const char *wire_name) {
     if (!orders || !json) return;
     const char *p = json;
     json_ws(&p);
@@ -1123,12 +1291,101 @@ static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *
         if (*p == ',') p++;
         json_ws(&p);
     }
-    if (order.name && order.len > 0) {
+    if (order.name) {
+        if (namespace && namespace[0]) order.namespace = xstrdup(namespace);
+        if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
         tool_schema_orders_push(orders, order);
         memset(&order, 0, sizeof(order));
     }
 done:
     tool_schema_order_free(&order);
+}
+
+static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json) {
+    tool_schema_orders_add_json_wire(orders, json, NULL, NULL);
+}
+
+static bool append_responses_namespace_tool_schemas(buf *schemas,
+                                                    tool_schema_orders *orders,
+                                                    const char *raw) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+
+    char *type = NULL;
+    char *name = NULL;
+    char *tools = NULL;
+    bool appended = false;
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(&p, &type)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(&p, &name)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "tools")) {
+            free(tools);
+            if (!json_raw_value(&p, &tools)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+
+    if (!type || strcmp(type, "namespace") || !name || !tools) goto done;
+
+    const char *tp = tools;
+    json_ws(&tp);
+    if (*tp != '[') goto done;
+    tp++;
+    json_ws(&tp);
+    while (*tp && *tp != ']') {
+        char *tool_raw = NULL;
+        if (!json_raw_value(&tp, &tool_raw)) goto done;
+        char *wire_name = NULL;
+        char *schema = responses_namespace_function_schema_from_tool(tool_raw, name, &wire_name);
+        if (schema) {
+            append_raw_json_line(schemas, schema);
+            tool_schema_orders_add_json_wire(orders, schema, name, wire_name);
+            appended = true;
+        }
+        free(schema);
+        free(wire_name);
+        free(tool_raw);
+        json_ws(&tp);
+        if (*tp == ',') tp++;
+        json_ws(&tp);
+    }
+
+done:
+    free(type);
+    free(name);
+    free(tools);
+    return appended;
 }
 
 /* OpenAI wraps tools as {"type":"function","function":{...}}. Anthropic sends
@@ -1150,9 +1407,16 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
         char *raw = NULL;
         if (!json_raw_value(p, &raw)) goto bad;
         char *function = openai_function_schema_from_tool(raw);
-        const char *schema = function ? function : raw;
-        append_raw_json_line(&schemas, schema);
-        tool_schema_orders_add_json(orders, schema);
+        if (function) {
+            append_raw_json_line(&schemas, function);
+            tool_schema_orders_add_json(orders, function);
+        } else if (!append_responses_namespace_tool_schemas(&schemas, orders, raw)) {
+            char *special = responses_special_schema_from_tool(raw);
+            const char *schema = special ? special : raw;
+            append_raw_json_line(&schemas, schema);
+            tool_schema_orders_add_json(orders, schema);
+            free(special);
+        }
         free(function);
         free(raw);
         json_ws(p);
@@ -2242,6 +2506,690 @@ bad:
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
+    snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+static void append_responses_content_text(buf *b, const char *s) {
+    if (!s || !s[0]) return;
+    buf_puts(b, s);
+}
+
+static void append_responses_image_ref(buf *b, const char *url) {
+    if (!url || !url[0]) return;
+    if (b->len && b->ptr[b->len - 1] != '\n') buf_putc(b, '\n');
+    buf_puts(b, "[image: ");
+    buf_puts(b, url);
+    buf_putc(b, ']');
+}
+
+static bool parse_responses_content_object(const char **p, buf *out) {
+    if (**p != '{') return false;
+    (*p)++;
+    char *type = NULL;
+    char *text = NULL;
+    char *image_url = NULL;
+
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(p, &type)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "text")) {
+            free(text);
+            if (!json_content(p, &text)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "image_url")) {
+            free(image_url);
+            if (!json_string(p, &image_url)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+
+    if (image_url && (!type || !strcmp(type, "input_image"))) {
+        append_responses_image_ref(out, image_url);
+    } else if (text && (!type ||
+                        !strcmp(type, "input_text") ||
+                        !strcmp(type, "output_text") ||
+                        !strcmp(type, "text")))
+    {
+        append_responses_content_text(out, text);
+    }
+
+    free(type);
+    free(text);
+    free(image_url);
+    return true;
+bad:
+    free(type);
+    free(text);
+    free(image_url);
+    return false;
+}
+
+static bool parse_responses_content(const char **p, char **out) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, out);
+    if (json_lit(p, "null")) {
+        *out = xstrdup("");
+        return true;
+    }
+    if (**p != '[') {
+        if (!json_skip_value(p)) return false;
+        *out = xstrdup("");
+        return true;
+    }
+    (*p)++;
+    buf b = {0};
+
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) goto bad;
+            append_responses_content_text(&b, s);
+            free(s);
+        } else if (**p == '{') {
+            if (!parse_responses_content_object(p, &b)) goto bad;
+        } else if (!json_skip_value(p)) {
+            goto bad;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto bad;
+    (*p)++;
+    *out = buf_take(&b);
+    return true;
+bad:
+    buf_free(&b);
+    return false;
+}
+
+static char *responses_tool_output_from_raw_object(const char *raw) {
+    const char *p = raw ? raw : "";
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    buf b = {0};
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "content") || !strcmp(key, "text") || !strcmp(key, "output")) {
+            char *part = NULL;
+            if (!parse_responses_content(&p, &part)) {
+                free(key);
+                goto bad;
+            }
+            append_responses_content_text(&b, part);
+            free(part);
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (b.len == 0) {
+        buf_free(&b);
+        return NULL;
+    }
+    return buf_take(&b);
+bad:
+    buf_free(&b);
+    return NULL;
+}
+
+static bool parse_responses_tool_output(const char **p, char **out) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        *out = xstrdup("");
+        return true;
+    }
+    if (**p == '"' || **p == '[') {
+        return parse_responses_content(p, out);
+    }
+
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    char *text = responses_tool_output_from_raw_object(raw);
+    if (text) {
+        free(raw);
+        *out = text;
+        return true;
+    }
+    char *min = json_minify_raw_value(raw);
+    free(raw);
+    *out = min;
+    return true;
+}
+
+static bool parse_string_or_minified_raw(const char **p, char **out) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, out);
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    *out = json_minify_raw_value(raw);
+    free(raw);
+    return true;
+}
+
+static bool parse_responses_input_item(const char **p, chat_msgs *msgs,
+                                       buf *loaded_tool_schemas,
+                                       tool_schema_orders *orders) {
+    json_ws(p);
+    if (**p == '"') {
+        chat_msg msg = {0};
+        msg.role = xstrdup("user");
+        if (!json_string(p, &msg.content)) {
+            chat_msg_free(&msg);
+            return false;
+        }
+        chat_msgs_push(msgs, msg);
+        return true;
+    }
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+
+    char *type = NULL;
+    char *role = NULL;
+    char *content = NULL;
+    char *name = NULL;
+    char *namespace = NULL;
+    char *arguments = NULL;
+    char *input = NULL;
+    char *action = NULL;
+    char *call_id = NULL;
+    char *id = NULL;
+    char *output = NULL;
+
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(p, &type)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "role")) {
+            free(role);
+            if (!json_string(p, &role)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "content")) {
+            free(content);
+            if (!parse_responses_content(p, &content)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(p, &name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "namespace")) {
+            free(namespace);
+            if (!json_string(p, &namespace)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "arguments")) {
+            free(arguments);
+            if (!parse_string_or_minified_raw(p, &arguments)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "input")) {
+            free(input);
+            if (!parse_string_or_minified_raw(p, &input)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "action")) {
+            free(action);
+            if (!parse_string_or_minified_raw(p, &action)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "call_id")) {
+            free(call_id);
+            if (!json_string(p, &call_id)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "id")) {
+            free(id);
+            if (!json_string(p, &id)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "output")) {
+            free(output);
+            if (!parse_responses_tool_output(p, &output)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tools")) {
+            free(output);
+            if (!parse_string_or_minified_raw(p, &output)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+
+    if (!type || !strcmp(type, "message")) {
+        chat_msg msg = {0};
+        msg.role = role ? role : xstrdup("user");
+        role = NULL;
+        msg.content = content ? content : xstrdup("");
+        content = NULL;
+        chat_msgs_push(msgs, msg);
+    } else if (!strcmp(type, "function_call") ||
+               !strcmp(type, "custom_tool_call") ||
+               !strcmp(type, "local_shell_call") ||
+               !strcmp(type, "tool_search_call"))
+    {
+        const char *call_name = name;
+        const char *call_args = arguments;
+        char *namespaced_name = NULL;
+        if (!strcmp(type, "custom_tool_call")) {
+            call_args = input ? input : "";
+        } else if (!strcmp(type, "local_shell_call")) {
+            call_name = "local_shell";
+            call_args = action ? action : "{}";
+        } else if (!strcmp(type, "tool_search_call")) {
+            call_name = "tool_search";
+            call_args = arguments ? arguments : "{}";
+        } else if (namespace && namespace[0] && name && name[0]) {
+            buf b = {0};
+            buf_puts(&b, namespace);
+            buf_puts(&b, name);
+            namespaced_name = buf_take(&b);
+            call_name = namespaced_name;
+        }
+        if (call_name && call_name[0]) {
+            chat_msg msg = {0};
+            msg.role = xstrdup("assistant");
+            msg.content = xstrdup("");
+            tool_call tc = {0};
+            tc.id = call_id ? xstrdup(call_id) : (id ? xstrdup(id) : NULL);
+            tc.name = xstrdup(call_name);
+            tc.arguments = xstrdup(call_args ? call_args : "{}");
+            tool_calls_push(&msg.calls, tc);
+            chat_msgs_push(msgs, msg);
+        }
+        free(namespaced_name);
+    } else if (!strcmp(type, "function_call_output") ||
+               !strcmp(type, "mcp_tool_call_output") ||
+               !strcmp(type, "custom_tool_call_output") ||
+               !strcmp(type, "tool_search_output"))
+    {
+        if (!strcmp(type, "tool_search_output") && output &&
+            loaded_tool_schemas && orders)
+        {
+            const char *tools_p = output;
+            char *schemas = NULL;
+            if (parse_tools_value(&tools_p, &schemas, orders)) {
+                if (schemas && schemas[0]) {
+                    if (loaded_tool_schemas->len) buf_putc(loaded_tool_schemas, '\n');
+                    buf_puts(loaded_tool_schemas, schemas);
+                }
+            }
+            free(schemas);
+        }
+        chat_msg msg = {0};
+        msg.role = xstrdup("tool");
+        msg.tool_call_id = call_id ? xstrdup(call_id) : NULL;
+        msg.content = output ? xstrdup(output) : xstrdup("");
+        chat_msgs_push(msgs, msg);
+    }
+
+    free(type);
+    free(role);
+    free(content);
+    free(name);
+    free(namespace);
+    free(arguments);
+    free(input);
+    free(action);
+    free(call_id);
+    free(id);
+    free(output);
+    return true;
+bad:
+    free(type);
+    free(role);
+    free(content);
+    free(name);
+    free(namespace);
+    free(arguments);
+    free(input);
+    free(action);
+    free(call_id);
+    free(id);
+    free(output);
+    return false;
+}
+
+static bool parse_responses_input(const char **p, chat_msgs *msgs,
+                                  buf *loaded_tool_schemas,
+                                  tool_schema_orders *orders) {
+    json_ws(p);
+    if (**p == '"') {
+        chat_msg msg = {0};
+        msg.role = xstrdup("user");
+        if (!json_string(p, &msg.content)) {
+            chat_msg_free(&msg);
+            return false;
+        }
+        chat_msgs_push(msgs, msg);
+        return true;
+    }
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (!parse_responses_input_item(p, msgs, loaded_tool_schemas, orders)) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_responses_tool_choice(const char **p, bool *tool_choice_none) {
+    json_ws(p);
+    if (**p == '"') {
+        char *choice = NULL;
+        if (!json_string(p, &choice)) return false;
+        *tool_choice_none = !strcmp(choice, "none");
+        free(choice);
+        return true;
+    }
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            char *choice = NULL;
+            if (!json_string(p, &choice)) {
+                free(key);
+                return false;
+            }
+            *tool_choice_none = !strcmp(choice, "none");
+            free(choice);
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_responses_request(ds4_engine *e, const char *body, int def_tokens,
+                                    int ctx_size, request *r, char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    r->api = API_RESPONSES;
+    const char *p = body;
+    bool got_input = false;
+    bool tool_choice_none = false;
+    bool got_thinking = false;
+    bool thinking_enabled = true;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    char *instructions = NULL;
+    char *tool_schemas = NULL;
+    buf loaded_tool_schemas = {0};
+    tool_schema_orders top_tool_orders = {0};
+    tool_schema_orders input_tool_orders = {0};
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "input")) {
+            chat_msgs_free(&msgs);
+            buf_free(&loaded_tool_schemas);
+            loaded_tool_schemas = (buf){0};
+            tool_schema_orders_free(&input_tool_orders);
+            if (!parse_responses_input(&p, &msgs, &loaded_tool_schemas, &input_tool_orders)) {
+                free(key);
+                goto bad;
+            }
+            got_input = true;
+        } else if (!strcmp(key, "instructions")) {
+            free(instructions);
+            if (!json_content(&p, &instructions)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tools")) {
+            free(tool_schemas);
+            tool_schemas = NULL;
+            tool_schema_orders_free(&top_tool_orders);
+            if (!parse_tools_value(&p, &tool_schemas, &top_tool_orders)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_choice")) {
+            if (!parse_responses_tool_choice(&p, &tool_choice_none)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "min_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->min_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "seed")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning")) {
+            if (!parse_output_config_effort(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "reasoning_effort")) {
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stop")) {
+            if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_input) {
+        snprintf(err, errlen, "missing input");
+        chat_msgs_free(&msgs);
+        free(instructions);
+        free(tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        tool_schema_orders_free(&top_tool_orders);
+        tool_schema_orders_free(&input_tool_orders);
+        request_free(r);
+        return false;
+    }
+    if (instructions && instructions[0]) {
+        chat_msg msg = {0};
+        msg.role = xstrdup("system");
+        msg.content = instructions;
+        instructions = NULL;
+        chat_msgs_push(&msgs, msg);
+    }
+    buf combined_tool_schemas = {0};
+    if (tool_schemas && tool_schemas[0]) buf_puts(&combined_tool_schemas, tool_schemas);
+    if (loaded_tool_schemas.ptr && loaded_tool_schemas.ptr[0]) {
+        if (combined_tool_schemas.len) buf_putc(&combined_tool_schemas, '\n');
+        buf_puts(&combined_tool_schemas, loaded_tool_schemas.ptr);
+    }
+    const char *effective_tool_schemas = combined_tool_schemas.ptr ?
+        combined_tool_schemas.ptr : "";
+    tool_schema_orders_free(&r->tool_orders);
+    tool_schema_orders_append_move(&r->tool_orders, &top_tool_orders);
+    tool_schema_orders_append_move(&r->tool_orders, &input_tool_orders);
+    r->has_tools = effective_tool_schemas[0] && !tool_choice_none;
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? effective_tool_schemas : NULL,
+                                             &r->tool_orders, r->think_mode);
+    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    buf_free(&combined_tool_schemas);
+    chat_msgs_free(&msgs);
+    free(instructions);
+    free(tool_schemas);
+    buf_free(&loaded_tool_schemas);
+    tool_schema_orders_free(&top_tool_orders);
+    tool_schema_orders_free(&input_tool_orders);
+    return true;
+bad:
+    chat_msgs_free(&msgs);
+    free(instructions);
+    free(tool_schemas);
+    buf_free(&loaded_tool_schemas);
+    tool_schema_orders_free(&top_tool_orders);
+    tool_schema_orders_free(&input_tool_orders);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
@@ -3435,6 +4383,7 @@ static bool request_uses_openai_live_stream(const request *r) {
 
 static bool request_uses_structured_stream(const request *r) {
     return r->stream && (r->api == API_ANTHROPIC ||
+                         r->api == API_RESPONSES ||
                          request_uses_openai_live_stream(r));
 }
 
@@ -3564,6 +4513,771 @@ static bool sse_event(int fd, const char *event, const char *data) {
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
+}
+
+static void append_responses_usage(buf *b, int prompt_tokens, int completion_tokens) {
+    buf_printf(b,
+               "{\"input_tokens\":%d,"
+               "\"input_tokens_details\":{\"cached_tokens\":0},"
+               "\"output_tokens\":%d,"
+               "\"output_tokens_details\":{\"reasoning_tokens\":0},"
+               "\"total_tokens\":%d}",
+               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+}
+
+static void responses_message_id(char *dst, size_t dstlen, const char *id) {
+    snprintf(dst, dstlen, "msg_%s", id);
+}
+
+static void responses_function_item_id(char *dst, size_t dstlen, const char *id, int i) {
+    snprintf(dst, dstlen, "fc_%s_%d", id, i);
+}
+
+static void responses_function_call_id(char *dst, size_t dstlen, const char *id, int i) {
+    snprintf(dst, dstlen, "call_%s_%d", id, i);
+}
+
+static bool responses_tool_name_is_tool_search(const char *name) {
+    return name && !strcmp(name, "tool_search");
+}
+
+static void append_responses_message_item(buf *b, const char *item_id, const char *text) {
+    buf_puts(b, "{\"id\":");
+    json_escape(b, item_id);
+    buf_puts(b, ",\"type\":\"message\",\"role\":\"assistant\",\"content\":[");
+    buf_puts(b, "{\"type\":\"output_text\",\"text\":");
+    json_escape(b, text ? text : "");
+    buf_puts(b, "}]}");
+}
+
+static void append_responses_tool_search_call_item(buf *b, const tool_call *tc,
+                                                   const char *id, int i,
+                                                   const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+    char item_id[128];
+    char call_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, i);
+    responses_function_call_id(call_id, sizeof(call_id), id, i);
+
+    buf_puts(b, "{\"id\":");
+    json_escape(b, item_id);
+    buf_puts(b, ",\"type\":\"tool_search_call\",\"call_id\":");
+    json_escape(b, tc->id && tc->id[0] ? tc->id : call_id);
+    buf_puts(b, ",\"status\":\"completed\",\"execution\":\"client\",\"arguments\":");
+    append_json_object_ordered_or_empty(b, tc->arguments, order);
+    buf_putc(b, '}');
+}
+
+static void append_responses_function_call_item(buf *b, const tool_call *tc, const char *id,
+                                                int i, const tool_schema_orders *orders) {
+    if (responses_tool_name_is_tool_search(tc->name)) {
+        append_responses_tool_search_call_item(b, tc, id, i, orders);
+        return;
+    }
+
+    const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+    char item_id[128];
+    char call_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, i);
+    responses_function_call_id(call_id, sizeof(call_id), id, i);
+
+    buf_puts(b, "{\"id\":");
+    json_escape(b, item_id);
+    buf_puts(b, ",\"type\":\"function_call\",\"call_id\":");
+    json_escape(b, tc->id && tc->id[0] ? tc->id : call_id);
+    buf_puts(b, ",\"name\":");
+    json_escape(b, order && order->wire_name ? order->wire_name : (tc->name ? tc->name : ""));
+    if (order && order->namespace) {
+        buf_puts(b, ",\"namespace\":");
+        json_escape(b, order->namespace);
+    }
+    buf_puts(b, ",\"arguments\":");
+    append_ordered_json_string(b, tc->arguments, order);
+    buf_putc(b, '}');
+}
+
+static void append_responses_output(buf *b, const char *id, const char *text,
+                                    const tool_calls *calls,
+                                    const tool_schema_orders *orders) {
+    buf_putc(b, '[');
+    bool wrote = false;
+    char msg_id[128];
+    responses_message_id(msg_id, sizeof(msg_id), id);
+    if ((text && text[0]) || !calls || calls->len == 0) {
+        append_responses_message_item(b, msg_id, text ? text : "");
+        wrote = true;
+    }
+    if (calls) {
+        for (int i = 0; i < calls->len; i++) {
+            if (wrote) buf_putc(b, ',');
+            append_responses_function_call_item(b, &calls->v[i], id, i, orders);
+            wrote = true;
+        }
+    }
+    buf_putc(b, ']');
+}
+
+static bool responses_final_response(int fd, const request *r, const char *id,
+                                     const char *text, const tool_calls *calls,
+                                     int prompt_tokens, int completion_tokens) {
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b,
+               "{\"id\":\"%s\",\"object\":\"response\",\"created_at\":%ld,"
+               "\"status\":\"completed\",\"model\":",
+               id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"output\":");
+    append_responses_output(&b, id, text, calls, &r->tool_orders);
+    buf_puts(&b, ",\"usage\":");
+    append_responses_usage(&b, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}\n");
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+typedef enum {
+    RESP_STREAM_THINKING,
+    RESP_STREAM_TEXT,
+    RESP_STREAM_TOOL,
+    RESP_STREAM_SUPPRESS,
+} responses_stream_mode;
+
+typedef enum {
+    RESP_TOOL_BETWEEN_INVOKES,
+    RESP_TOOL_BETWEEN_PARAMS,
+    RESP_TOOL_PARAM_VALUE,
+    RESP_TOOL_DONE,
+    RESP_TOOL_ERROR,
+} responses_tool_stream_state;
+
+typedef struct {
+    responses_tool_stream_state state;
+    const char *tool_calls_end;
+    const char *invoke_start;
+    const char *invoke_end;
+    const char *param_start;
+    const char *param_end;
+    size_t parse_pos;
+    int index;
+    int output_index;
+    bool active;
+    bool emitted_any;
+    bool args_open;
+    bool first_param;
+    bool param_is_string;
+    char *name;
+    buf args;
+} responses_tool_stream;
+
+typedef struct {
+    responses_stream_mode mode;
+    size_t emit_pos;
+    int next_output_index;
+    int message_index;
+    int streamed_function_calls;
+    bool active;
+    bool checked_think_prefix;
+    bool message_started;
+    bool message_done;
+    bool sent_content;
+    size_t message_content_start;
+    responses_tool_stream tool;
+} responses_stream;
+
+static bool responses_sse_start_live(int fd, const request *r, const char *id,
+                                     responses_stream *st) {
+    memset(st, 0, sizeof(*st));
+    st->active = true;
+    st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
+    st->message_index = -1;
+
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b,
+               "{\"type\":\"response.created\",\"response\":{\"id\":\"%s\","
+               "\"object\":\"response\",\"created_at\":%ld,\"status\":\"in_progress\","
+               "\"model\":",
+               id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, "}}");
+    bool ok = sse_event(fd, "response.created", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_ensure_message(int fd, responses_stream *st, const char *id) {
+    if (st->message_started) return true;
+    char msg_id[128];
+    responses_message_id(msg_id, sizeof(msg_id), id);
+    st->message_index = st->next_output_index++;
+
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"response.output_item.added\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":{\"id\":", st->message_index);
+    json_escape(&b, msg_id);
+    buf_puts(&b, ",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}");
+    bool ok = sse_event(fd, "response.output_item.added", b.ptr);
+    buf_free(&b);
+    if (ok) st->message_started = true;
+    return ok;
+}
+
+static bool responses_sse_text_delta_n(int fd, responses_stream *st, const char *id,
+                                       const char *text, size_t len) {
+    if (len == 0) return true;
+    if (!responses_sse_ensure_message(fd, st, id)) return false;
+
+    char msg_id[128];
+    responses_message_id(msg_id, sizeof(msg_id), id);
+    buf b = {0};
+    buf_printf(&b,
+               "{\"type\":\"response.output_text.delta\",\"item_id\":");
+    json_escape(&b, msg_id);
+    buf_printf(&b, ",\"output_index\":%d,\"content_index\":0,\"delta\":",
+               st->message_index);
+    json_escape_n(&b, text, len);
+    buf_putc(&b, '}');
+    bool ok = sse_event(fd, "response.output_text.delta", b.ptr);
+    buf_free(&b);
+    if (ok) st->sent_content = true;
+    return ok;
+}
+
+static void responses_tool_stream_clear(responses_tool_stream *ts) {
+    free(ts->name);
+    ts->name = NULL;
+    buf_free(&ts->args);
+    ts->args = (buf){0};
+}
+
+static bool responses_tool_stream_init(responses_tool_stream *ts, const char *raw,
+                                       size_t raw_len, size_t pos) {
+    memset(ts, 0, sizeof(*ts));
+    ts->active = true;
+    ts->state = RESP_TOOL_BETWEEN_INVOKES;
+    ts->parse_pos = pos;
+    if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
+        ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
+        ts->tool_calls_end = DS4_TOOL_CALLS_END;
+        ts->invoke_start = DS4_INVOKE_START;
+        ts->invoke_end = DS4_INVOKE_END;
+        ts->param_start = DS4_PARAM_START;
+        ts->param_end = DS4_PARAM_END;
+    } else if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START_SHORT)) {
+        ts->parse_pos += strlen(DS4_TOOL_CALLS_START_SHORT);
+        ts->tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
+        ts->invoke_start = DS4_INVOKE_START_SHORT;
+        ts->invoke_end = DS4_INVOKE_END_SHORT;
+        ts->param_start = DS4_PARAM_START_SHORT;
+        ts->param_end = DS4_PARAM_END_SHORT;
+    } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
+        ts->parse_pos += strlen("<tool_calls>");
+        ts->tool_calls_end = "</tool_calls>";
+        ts->invoke_start = "<invoke";
+        ts->invoke_end = "</invoke>";
+        ts->param_start = "<parameter";
+        ts->param_end = "</parameter>";
+    } else {
+        ts->active = false;
+        ts->state = RESP_TOOL_ERROR;
+        return false;
+    }
+    return true;
+}
+
+static bool responses_sse_function_call_added(int fd, const char *id,
+                                              responses_tool_stream *ts,
+                                              const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, ts->name);
+    char item_id[128];
+    char call_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+    responses_function_call_id(call_id, sizeof(call_id), id, ts->index);
+
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"response.output_item.added\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":{\"type\":\"function_call\",\"id\":",
+               ts->output_index);
+    json_escape(&b, item_id);
+    buf_puts(&b, ",\"call_id\":");
+    json_escape(&b, call_id);
+    buf_puts(&b, ",\"name\":");
+    json_escape(&b, order && order->wire_name ? order->wire_name : (ts->name ? ts->name : ""));
+    if (order && order->namespace) {
+        buf_puts(&b, ",\"namespace\":");
+        json_escape(&b, order->namespace);
+    }
+    buf_puts(&b, ",\"arguments\":\"\"}}");
+    bool ok = sse_event(fd, "response.output_item.added", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_function_arg_delta_n(int fd, const char *id,
+                                               const responses_tool_stream *ts,
+                                               const char *text, size_t len) {
+    if (len == 0) return true;
+    char item_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"response.function_call_arguments.delta\",\"response_id\":");
+    json_escape(&b, id);
+    buf_puts(&b, ",\"item_id\":");
+    json_escape(&b, item_id);
+    buf_printf(&b, ",\"output_index\":%d,\"delta\":", ts->output_index);
+    json_escape_n(&b, text, len);
+    buf_putc(&b, '}');
+    bool ok = sse_event(fd, "response.function_call_arguments.delta", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_tool_emit_args_fragment(int fd, const char *id,
+                                              responses_tool_stream *ts,
+                                              const char *text, size_t len) {
+    if (len == 0) return true;
+    buf_append(&ts->args, text, len);
+    if (responses_tool_name_is_tool_search(ts->name)) return true;
+    return responses_sse_function_arg_delta_n(fd, id, ts, text, len);
+}
+
+static bool responses_tool_emit_string_value(int fd, const char *id,
+                                             responses_tool_stream *ts,
+                                             const char *text, size_t len) {
+    if (len == 0) return true;
+    char *raw = xstrndup(text, len);
+    char *unescaped = dsml_unescape_text(raw);
+    buf frag = {0};
+    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    bool ok = responses_tool_emit_args_fragment(fd, id, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    free(unescaped);
+    free(raw);
+    return ok;
+}
+
+static bool responses_tool_emit_param_prefix(int fd, const char *id,
+                                             responses_tool_stream *ts,
+                                             const char *name, bool is_string) {
+    buf frag = {0};
+    if (ts->first_param) ts->first_param = false;
+    else buf_putc(&frag, ',');
+    json_escape(&frag, name ? name : "");
+    buf_putc(&frag, ':');
+    if (is_string) buf_putc(&frag, '"');
+    bool ok = responses_tool_emit_args_fragment(fd, id, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+static bool responses_tool_stream_fail(responses_tool_stream *ts) {
+    responses_tool_stream_clear(ts);
+    ts->active = false;
+    ts->state = RESP_TOOL_ERROR;
+    return true;
+}
+
+static bool responses_tool_start_invoke(int fd, const request *r, const char *id,
+                                        responses_stream *st,
+                                        const char *raw, size_t raw_len) {
+    responses_tool_stream *ts = &st->tool;
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    free(tag);
+    if (!name) return responses_tool_stream_fail(ts);
+
+    responses_tool_stream_clear(ts);
+    ts->name = name;
+    ts->output_index = st->next_output_index++;
+    bool ok = true;
+    if (!responses_tool_name_is_tool_search(ts->name)) {
+        ok = responses_sse_function_call_added(fd, id, ts, &r->tool_orders);
+    }
+    if (ok) ok = responses_tool_emit_args_fragment(fd, id, ts, "{", 1);
+    if (!ok) return false;
+
+    ts->emitted_any = true;
+    ts->args_open = true;
+    ts->first_param = true;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = RESP_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool responses_tool_start_param(int fd, const char *id,
+                                       responses_tool_stream *ts,
+                                       const char *raw, size_t raw_len) {
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    char *is_string = dsml_attr(tag, "string");
+    free(tag);
+    if (!name || !is_string) {
+        free(name);
+        free(is_string);
+        return responses_tool_stream_fail(ts);
+    }
+    bool string_value = !strcmp(is_string, "true");
+    bool ok = responses_tool_emit_param_prefix(fd, id, ts, name, string_value);
+    free(name);
+    free(is_string);
+    if (!ok) return false;
+
+    ts->param_is_string = string_value;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = RESP_TOOL_PARAM_VALUE;
+    return true;
+}
+
+static bool responses_tool_finish_param(int fd, const char *id,
+                                        responses_tool_stream *ts,
+                                        const char *raw, size_t value_end) {
+    if (value_end > ts->parse_pos) {
+        bool ok = ts->param_is_string ?
+            responses_tool_emit_string_value(fd, id, ts, raw + ts->parse_pos,
+                                             value_end - ts->parse_pos) :
+            responses_tool_emit_args_fragment(fd, id, ts, raw + ts->parse_pos,
+                                              value_end - ts->parse_pos);
+        if (!ok) return false;
+    }
+    if (ts->param_is_string &&
+        !responses_tool_emit_args_fragment(fd, id, ts, "\"", 1)) return false;
+    ts->parse_pos = value_end + strlen(ts->param_end);
+    ts->state = RESP_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool responses_sse_function_args_done(int fd, const char *id,
+                                             const responses_tool_stream *ts,
+                                             const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, ts->name);
+    char item_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"response.function_call_arguments.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_puts(&b, ",\"item_id\":");
+    json_escape(&b, item_id);
+    buf_printf(&b, ",\"output_index\":%d,\"name\":", ts->output_index);
+    json_escape(&b, order && order->wire_name ? order->wire_name : (ts->name ? ts->name : ""));
+    if (order && order->namespace) {
+        buf_puts(&b, ",\"namespace\":");
+        json_escape(&b, order->namespace);
+    }
+    buf_puts(&b, ",\"arguments\":");
+    json_escape(&b, ts->args.ptr ? ts->args.ptr : "{}");
+    buf_putc(&b, '}');
+    bool ok = sse_event(fd, "response.function_call_arguments.done", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_tool_search_item_done_live(int fd, const char *id,
+                                                     const responses_tool_stream *ts,
+                                                     const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, ts->name);
+    char item_id[128];
+    char call_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+    responses_function_call_id(call_id, sizeof(call_id), id, ts->index);
+
+    buf b = {0};
+    buf_printf(&b,
+               "{\"type\":\"response.output_item.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":{\"type\":\"tool_search_call\",\"id\":",
+               ts->output_index);
+    json_escape(&b, item_id);
+    buf_puts(&b, ",\"call_id\":");
+    json_escape(&b, call_id);
+    buf_puts(&b, ",\"status\":\"completed\",\"execution\":\"client\",\"arguments\":");
+    append_json_object_ordered_or_empty(&b, ts->args.ptr ? ts->args.ptr : "{}", order);
+    buf_puts(&b, "}}");
+    bool ok = sse_event(fd, "response.output_item.done", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_function_call_item_done_live(int fd, const char *id,
+                                                       const responses_tool_stream *ts,
+                                                       const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, ts->name);
+    char item_id[128];
+    char call_id[128];
+    responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
+    responses_function_call_id(call_id, sizeof(call_id), id, ts->index);
+
+    buf b = {0};
+    buf_printf(&b,
+               "{\"type\":\"response.output_item.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":{\"type\":\"function_call\",\"id\":",
+               ts->output_index);
+    json_escape(&b, item_id);
+    buf_puts(&b, ",\"call_id\":");
+    json_escape(&b, call_id);
+    buf_puts(&b, ",\"name\":");
+    json_escape(&b, order && order->wire_name ? order->wire_name : (ts->name ? ts->name : ""));
+    if (order && order->namespace) {
+        buf_puts(&b, ",\"namespace\":");
+        json_escape(&b, order->namespace);
+    }
+    buf_puts(&b, ",\"arguments\":");
+    json_escape(&b, ts->args.ptr ? ts->args.ptr : "{}");
+    buf_puts(&b, "}}");
+    bool ok = sse_event(fd, "response.output_item.done", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_tool_finish_invoke(int fd, const request *r, const char *id,
+                                         responses_stream *st,
+                                         responses_tool_stream *ts) {
+    if (ts->args_open &&
+        !responses_tool_emit_args_fragment(fd, id, ts, "}", 1)) return false;
+    ts->args_open = false;
+    if (responses_tool_name_is_tool_search(ts->name)) {
+        if (!responses_sse_tool_search_item_done_live(fd, id, ts, &r->tool_orders)) return false;
+    } else {
+        if (!responses_sse_function_args_done(fd, id, ts, &r->tool_orders)) return false;
+        if (!responses_sse_function_call_item_done_live(fd, id, ts, &r->tool_orders)) return false;
+    }
+    responses_tool_stream_clear(ts);
+    st->streamed_function_calls++;
+    ts->index++;
+    ts->state = RESP_TOOL_BETWEEN_INVOKES;
+    return true;
+}
+
+static bool responses_tool_stream_update(int fd, const request *r, const char *id,
+                                         responses_stream *st,
+                                         const char *raw, size_t raw_len) {
+    responses_tool_stream *ts = &st->tool;
+    while (ts->active && ts->parse_pos < raw_len) {
+        if (ts->state == RESP_TOOL_BETWEEN_INVOKES) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
+                ts->parse_pos += strlen(ts->tool_calls_end);
+                ts->active = false;
+                ts->state = RESP_TOOL_DONE;
+                return true;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
+                size_t before_pos = ts->parse_pos;
+                responses_tool_stream_state before_state = ts->state;
+                if (!responses_tool_start_invoke(fd, r, id, st, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return responses_tool_stream_fail(ts);
+        }
+
+        if (ts->state == RESP_TOOL_BETWEEN_PARAMS) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
+                ts->parse_pos += strlen(ts->invoke_end);
+                if (!responses_tool_finish_invoke(fd, r, id, st, ts)) return false;
+                continue;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->param_start)) {
+                size_t before_pos = ts->parse_pos;
+                responses_tool_stream_state before_state = ts->state;
+                if (!responses_tool_start_param(fd, id, ts, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return responses_tool_stream_fail(ts);
+        }
+
+        if (ts->state == RESP_TOOL_PARAM_VALUE) {
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               ts->param_end);
+            if (end) {
+                if (!responses_tool_finish_param(fd, id, ts, raw,
+                                                 (size_t)(end - raw))) return false;
+                continue;
+            }
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len, ts->param_end,
+                                                            ts->param_is_string);
+            if (limit > ts->parse_pos) {
+                bool ok = ts->param_is_string ?
+                    responses_tool_emit_string_value(fd, id, ts, raw + ts->parse_pos,
+                                                     limit - ts->parse_pos) :
+                    responses_tool_emit_args_fragment(fd, id, ts, raw + ts->parse_pos,
+                                                      limit - ts->parse_pos);
+                if (!ok) return false;
+                ts->parse_pos = limit;
+            }
+            return true;
+        }
+
+        return true;
+    }
+    return true;
+}
+
+static bool responses_sse_message_done(int fd, responses_stream *st, const char *id,
+                                       const char *content);
+
+static bool responses_sse_stream_update(int fd, const request *r, const char *id,
+                                        responses_stream *st,
+                                        const char *raw, size_t raw_len,
+                                        bool final) {
+    if (!st->active || !raw) return true;
+
+    if (st->mode == RESP_STREAM_THINKING) {
+        if (!st->checked_think_prefix) {
+            const char *open = "<think>";
+            const size_t open_len = strlen(open);
+            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
+                return true;
+            }
+            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
+                st->emit_pos = open_len;
+                st->message_content_start = open_len;
+            }
+            st->checked_think_prefix = true;
+        }
+
+        const char *close = strstr(raw + st->emit_pos, "</think>");
+        if (close) {
+            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->message_content_start = st->emit_pos;
+            st->mode = RESP_STREAM_TEXT;
+        } else if (final) {
+            st->mode = RESP_STREAM_SUPPRESS;
+            return true;
+        } else {
+            return true;
+        }
+    }
+
+    if (st->mode == RESP_STREAM_TEXT) {
+        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                              r->has_tools, final);
+
+        if (limit > st->emit_pos) {
+            if (!responses_sse_text_delta_n(fd, st, id,
+                                            raw + st->emit_pos,
+                                            limit - st->emit_pos)) return false;
+            st->emit_pos = limit;
+        }
+
+        if (tool) {
+            size_t tool_pos = (size_t)(tool - raw);
+            if (st->message_started && !st->message_done) {
+                size_t end = trim_tool_separator_ws(raw, st->message_content_start, tool_pos);
+                char *content = xstrndup(raw + st->message_content_start,
+                                         end - st->message_content_start);
+                bool ok = responses_sse_message_done(fd, st, id, content);
+                free(content);
+                if (!ok) return false;
+            }
+            st->emit_pos = tool_pos;
+            if (responses_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                st->mode = RESP_STREAM_TOOL;
+            } else {
+                st->mode = RESP_STREAM_SUPPRESS;
+            }
+        } else if (final) {
+            st->mode = RESP_STREAM_SUPPRESS;
+        }
+    }
+    if (st->mode == RESP_STREAM_TOOL) {
+        if (!responses_tool_stream_update(fd, r, id, st, raw, raw_len)) return false;
+        if (!st->tool.active) st->mode = RESP_STREAM_SUPPRESS;
+    }
+    return true;
+}
+
+static bool responses_sse_message_done(int fd, responses_stream *st, const char *id,
+                                       const char *content) {
+    if (st->message_done) return true;
+    if (!responses_sse_ensure_message(fd, st, id)) return false;
+    char msg_id[128];
+    responses_message_id(msg_id, sizeof(msg_id), id);
+
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"response.output_item.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":", st->message_index);
+    append_responses_message_item(&b, msg_id, content ? content : "");
+    buf_putc(&b, '}');
+    bool ok = sse_event(fd, "response.output_item.done", b.ptr);
+    buf_free(&b);
+    if (ok) st->message_done = true;
+    return ok;
+}
+
+static bool responses_sse_function_call_done(int fd, responses_stream *st, const request *r,
+                                             const char *id, const tool_call *tc, int i) {
+    int output_index = st->next_output_index++;
+    buf b = {0};
+    buf_printf(&b,
+               "{\"type\":\"response.output_item.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b,
+               ",\"output_index\":%d,"
+               "\"item\":",
+               output_index);
+    append_responses_function_call_item(&b, tc, id, i, &r->tool_orders);
+    buf_putc(&b, '}');
+    bool ok = sse_event(fd, "response.output_item.done", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_completed(int fd, const request *r, const char *id,
+                                    int prompt_tokens, int completion_tokens) {
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b,
+               "{\"type\":\"response.completed\",\"response\":{\"id\":\"%s\","
+               "\"object\":\"response\",\"created_at\":%ld,\"status\":\"completed\","
+               "\"model\":",
+               id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"usage\":");
+    append_responses_usage(&b, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}}");
+    bool ok = sse_event(fd, "response.completed", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_finish_live(int fd, const request *r, const char *id,
+                                      responses_stream *st, const char *raw,
+                                      size_t raw_len, const char *content,
+                                      const tool_calls *calls,
+                                      int prompt_tokens, int completion_tokens) {
+    if (!responses_sse_stream_update(fd, r, id, st, raw, raw_len, true)) return false;
+
+    if (st->message_started || (content && content[0]) || !calls || calls->len == 0) {
+        if (!responses_sse_message_done(fd, st, id, content ? content : "")) return false;
+    }
+    if (calls) {
+        for (int i = st->streamed_function_calls; i < calls->len; i++) {
+            if (!responses_sse_function_call_done(fd, st, r, id, &calls->v[i], i)) return false;
+        }
+    }
+    responses_tool_stream_clear(&st->tool);
+    return responses_sse_completed(fd, r, id, prompt_tokens, completion_tokens);
 }
 
 typedef enum {
@@ -5358,16 +7072,23 @@ static void generate_job(server *s, job *j) {
     }
     char id[96];
     snprintf(id, sizeof(id), "%s-%llu",
-             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+             j->req.api == API_RESPONSES ? "resp" :
+             (j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl"),
              (unsigned long long)++s->seq);
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
+    responses_stream responses_live = {0};
     const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     if (j->req.stream) {
         if (!sse_headers(j->fd)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+            return;
+        }
+        if (j->req.api == API_RESPONSES &&
+            !responses_sse_start_live(j->fd, &j->req, id, &responses_live)) {
+            server_log(DS4_LOG_GENERATION, "ds4-server: responses ctx=%s stream start failed", ctx_span);
             return;
         }
         if (j->req.api == API_ANTHROPIC &&
@@ -5501,6 +7222,16 @@ static void generate_job(server *s, job *j) {
             if (j->req.stream && j->req.api == API_ANTHROPIC &&
                 !anthropic_sse_stream_update(j->fd, &j->req, id,
                                              &anthropic_live, text.ptr, stream_len,
+                                             false)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                free(piece);
+                stop_decode = true;
+                break;
+            }
+            if (j->req.stream && j->req.api == API_RESPONSES &&
+                !responses_sse_stream_update(j->fd, &j->req, id,
+                                             &responses_live, text.ptr, stream_len,
                                              false)) {
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
@@ -5642,7 +7373,13 @@ static void generate_job(server *s, job *j) {
 
     if (j->req.stream) {
         bool response_ok = true;
-        if (j->req.api == API_ANTHROPIC) {
+        if (j->req.api == API_RESPONSES) {
+            response_ok = responses_sse_finish_live(j->fd, &j->req, id, &responses_live,
+                                                    text.ptr ? text.ptr : "", text.len,
+                                                    parsed_content ? parsed_content : "",
+                                                    &parsed_calls,
+                                                    j->req.prompt.len, completion);
+        } else if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
                                                     &parsed_calls, final_finish, completion);
@@ -5672,6 +7409,11 @@ static void generate_job(server *s, job *j) {
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
+                                 j->req.prompt.len, completion);
+    } else if (j->req.api == API_RESPONSES) {
+        responses_final_response(j->fd, &j->req, id,
+                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                 &parsed_calls,
                                  j->req.prompt.len, completion);
     } else {
         final_response(j->fd, &j->req, id,
@@ -5894,6 +7636,7 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
         "\"supported_parameters\":["
             "\"tools\","
             "\"tool_choice\","
+            "\"max_output_tokens\","
             "\"max_tokens\","
             "\"temperature\","
             "\"top_p\","
@@ -5969,6 +7712,9 @@ static void *client_main(void *arg) {
     const int ctx_size = ds4_session_ctx(s->session);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, hr.body, s->default_tokens,
+                                     ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
+        ok = parse_responses_request(s->engine, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, hr.body, s->default_tokens,
@@ -6206,7 +7952,7 @@ static void usage(FILE *fp) {
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
-        "  The server is Metal-only. Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  The server is Metal-only. Use /v1/chat/completions, /v1/completions, /v1/responses, or /v1/messages.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -6464,6 +8210,127 @@ static void test_tool_schema_order_from_openai_tools(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_tool_schema_order_from_responses_tools(void) {
+    const char *json =
+        "[{\"name\":\"bash\",\"description\":\"Run a command\",\"strict\":false,"
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"},"
+        "\"timeout\":{\"type\":\"number\"}}}}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"bash\""));
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "bash");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->len == 2);
+    TEST_ASSERT(order && !strcmp(order->prop[0], "command"));
+    TEST_ASSERT(order && !strcmp(order->prop[1], "timeout"));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_tool_schema_order_from_responses_tool_search(void) {
+    const char *json =
+        "[{\"type\":\"tool_search\",\"execution\":\"client\","
+        "\"description\":\"Search deferred tools\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"},"
+        "\"limit\":{\"type\":\"number\"}},\"required\":[\"query\"]}}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"tool_search\""));
+    TEST_ASSERT(schemas && strstr(schemas, "\"description\":\"Search deferred tools\""));
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "tool_search");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->len == 2);
+    TEST_ASSERT(order && !strcmp(order->prop[0], "query"));
+    TEST_ASSERT(order && !strcmp(order->prop[1], "limit"));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_responses_namespace_tool_schemas_restore_wire_namespace(void) {
+    const char *json =
+        "[{\"type\":\"namespace\",\"name\":\"mcp__perplexity__\","
+        "\"description\":\"Perplexity tools\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"perplexity_search\","
+        "\"description\":\"Search the web\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"},"
+        "\"recency\":{\"type\":\"number\"}}}}]}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"mcp__perplexity__perplexity_search\""));
+    TEST_ASSERT(schemas && strstr(schemas, "\"type\":\"namespace\"") == NULL);
+    const tool_schema_order *order =
+        tool_schema_orders_find(&orders, "mcp__perplexity__perplexity_search");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->namespace && !strcmp(order->namespace, "mcp__perplexity__"));
+    TEST_ASSERT(order && order->wire_name && !strcmp(order->wire_name, "perplexity_search"));
+    TEST_ASSERT(order && order->len == 2);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("mcp__perplexity__perplexity_search");
+    tc.arguments = xstrdup("{\"recency\":7,\"query\":\"deepseek v4 quants\"}");
+    tool_calls_push(&calls, tc);
+
+    buf out = {0};
+    append_responses_output(&out, "resp_ns", "", &calls, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"name\":\"perplexity_search\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"namespace\":\"mcp__perplexity__\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\\\"query\\\":") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\\\"recency\\\":") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "mcp__perplexity__perplexity_search") == NULL);
+
+    buf_free(&out);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_responses_namespace_tool_without_parameters_keeps_wire_metadata(void) {
+    const char *json =
+        "[{\"type\":\"namespace\",\"name\":\"mcp__awsdocs__\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"aws___list_services\","
+        "\"description\":\"List AWS services\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"mcp__awsdocs__aws___list_services\""));
+    const tool_schema_order *order =
+        tool_schema_orders_find(&orders, "mcp__awsdocs__aws___list_services");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->len == 0);
+    TEST_ASSERT(order && order->namespace && !strcmp(order->namespace, "mcp__awsdocs__"));
+    TEST_ASSERT(order && order->wire_name && !strcmp(order->wire_name, "aws___list_services"));
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("mcp__awsdocs__aws___list_services");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&calls, tc);
+
+    buf out = {0};
+    append_responses_output(&out, "resp_empty_ns", "", &calls, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"name\":\"aws___list_services\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"namespace\":\"mcp__awsdocs__\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "mcp__awsdocs__aws___list_services") == NULL);
+
+    buf_free(&out);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
 static tool_calls make_swapped_bash_call(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
@@ -6479,6 +8346,15 @@ static tool_schema_orders make_bash_order(void) {
         "{\"name\":\"bash\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
         "\"command\":{\"type\":\"string\"},"
         "\"description\":{\"type\":\"string\"}}}}");
+    return orders;
+}
+
+static tool_schema_orders make_tool_search_order(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"tool_search\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"},"
+        "\"limit\":{\"type\":\"number\"}}}}");
     return orders;
 }
 
@@ -6945,6 +8821,429 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
     TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
 
     free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_responses_input_renders_messages_and_tool_results(void) {
+    const char *json =
+        "["
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"inspect\"}]},"
+        "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"/tmp/ds4\"},"
+        "{\"type\":\"custom_tool_call\",\"call_id\":\"call_patch\",\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** End Patch\"},"
+        "{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_patch\",\"output\":{\"output\":\"patch ok\"}},"
+        "{\"type\":\"local_shell_call\",\"call_id\":\"call_local\",\"action\":{\"type\":\"exec\",\"command\":[\"pwd\"]}},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_local\",\"output\":[{\"type\":\"input_text\",\"text\":\"local ok\"}]},"
+        "{\"type\":\"tool_search_call\",\"call_id\":\"call_search\",\"arguments\":{\"query\":\"docs\"}},"
+        "{\"type\":\"tool_search_output\",\"call_id\":\"call_search\",\"status\":\"completed\",\"execution\":\"client\",\"tools\":[{\"name\":\"docs\"}]}"
+        "]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL));
+    TEST_ASSERT(msgs.len == 9);
+    TEST_ASSERT(msgs.v[1].calls.len == 1);
+    TEST_ASSERT(msgs.v[1].calls.v[0].id && !strcmp(msgs.v[1].calls.v[0].id, "call_1"));
+    TEST_ASSERT(msgs.v[3].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[3].calls.v[0].name, "apply_patch"));
+    TEST_ASSERT(strstr(msgs.v[3].calls.v[0].arguments, "*** Begin Patch") != NULL);
+    TEST_ASSERT(msgs.v[5].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[5].calls.v[0].name, "local_shell"));
+    TEST_ASSERT(strstr(msgs.v[5].calls.v[0].arguments, "\"command\":[\"pwd\"]") != NULL);
+    TEST_ASSERT(msgs.v[7].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[7].calls.v[0].name, "tool_search"));
+
+    tool_schema_orders orders = make_bash_order();
+    const char *tool_schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{},\"description\":{}}}}";
+    char *prompt = render_chat_prompt_text(&msgs, tool_schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜User｜>inspect") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜DSML｜invoke name=\"bash\">") != NULL);
+    TEST_ASSERT(strstr(prompt, "name=\"command\"") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>/tmp/ds4</tool_result>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜DSML｜invoke name=\"apply_patch\">") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>patch ok</tool_result>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜DSML｜invoke name=\"local_shell\">") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>local ok</tool_result>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜DSML｜invoke name=\"tool_search\">") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>[{\"name\":\"docs\"}]</tool_result>") != NULL);
+
+    free(prompt);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
+static void test_responses_input_loads_tool_search_output_tools(void) {
+    const char *json =
+        "["
+        "{\"type\":\"tool_search_call\",\"call_id\":\"call_search\","
+        "\"execution\":\"client\",\"arguments\":{\"query\":\"perplexity\"}},"
+        "{\"type\":\"tool_search_output\",\"call_id\":\"call_search\","
+        "\"status\":\"completed\",\"execution\":\"client\",\"tools\":["
+        "{\"type\":\"namespace\",\"name\":\"mcp__perplexity__\","
+        "\"description\":\"Perplexity tools\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"perplexity_search\","
+        "\"description\":\"Search with Perplexity\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"}}}}]}]}"
+        "]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(loaded.ptr && strstr(loaded.ptr, "\"name\":\"mcp__perplexity__perplexity_search\""));
+    const tool_schema_order *order =
+        tool_schema_orders_find(&orders, "mcp__perplexity__perplexity_search");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->namespace && !strcmp(order->namespace, "mcp__perplexity__"));
+    TEST_ASSERT(order && order->wire_name && !strcmp(order->wire_name, "perplexity_search"));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(msgs.v[0].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "tool_search"));
+    TEST_ASSERT(strstr(msgs.v[1].content, "mcp__perplexity__") != NULL);
+
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
+static void test_responses_input_function_call_namespace_round_trips_to_dsml(void) {
+    const char *tools_json =
+        "[{\"type\":\"namespace\",\"name\":\"mcp__perplexity__\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"perplexity_search\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"}}}}]}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
+
+    const char *input_json =
+        "[{\"type\":\"function_call\",\"call_id\":\"call_ns\","
+        "\"name\":\"perplexity_search\",\"namespace\":\"mcp__perplexity__\","
+        "\"arguments\":{\"query\":\"deepseek\"}}]";
+    const char *input_p = input_json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name,
+                        "mcp__perplexity__perplexity_search"));
+
+    char *prompt = render_chat_prompt_text(&msgs, schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<｜DSML｜invoke name=\"mcp__perplexity__perplexity_search\">") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜DSML｜invoke name=\"perplexity_search\">") == NULL);
+
+    buf out = {0};
+    append_responses_output(&out, "resp_ns_history", "", &msgs.v[0].calls, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"name\":\"perplexity_search\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"namespace\":\"mcp__perplexity__\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "mcp__perplexity__perplexity_search") == NULL);
+
+    buf_free(&out);
+    free(prompt);
+    chat_msgs_free(&msgs);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_responses_output_sends_tool_search_call_item(void) {
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("tool_search");
+    tc.arguments = xstrdup("{\"limit\":3,\"query\":\"perplexity\"}");
+    tool_calls_push(&calls, tc);
+    tool_schema_orders orders = make_tool_search_order();
+
+    buf out = {0};
+    append_responses_output(&out, "resp_search", "", &calls, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"tool_search_call\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"execution\":\"client\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"status\":\"completed\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"arguments\":{\"query\":\"perplexity\",\"limit\":3}") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") == NULL);
+
+    buf_free(&out);
+    tool_schema_orders_free(&orders);
+    tool_calls_free(&calls);
+}
+
+static void test_responses_live_stream_sends_codex_events(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    responses_stream st;
+    TEST_ASSERT(responses_sse_start_live(sv[0], &r, "resp_test", &st));
+    const char *raw1 = "<think>need a tool</think>Hello ";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_test", &st,
+                                            raw1, strlen(raw1), false));
+
+    const char *raw =
+        "<think>need a tool</think>Hello world\n\n"
+        DS4_TOOL_CALLS_START "\n";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_test", &st,
+                                            raw, strlen(raw), false));
+
+    tool_calls calls = make_swapped_bash_call();
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_test", &st,
+                                          raw, strlen(raw), "Hello world",
+                                          &calls, 10, 8));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *created = strstr(out, "event: response.created");
+    const char *added = strstr(out, "event: response.output_item.added");
+    const char *delta = strstr(out, "event: response.output_text.delta");
+    const char *msg_done = strstr(out, "\"text\":\"Hello world\"");
+    const char *tool = strstr(out, "\"type\":\"function_call\"");
+    const char *completed = strstr(out, "event: response.completed");
+    TEST_ASSERT(created != NULL);
+    TEST_ASSERT(added != NULL);
+    TEST_ASSERT(delta != NULL);
+    TEST_ASSERT(strstr(out, "\"delta\":\"Hello\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"delta\":\" world\"") != NULL);
+    TEST_ASSERT(msg_done != NULL);
+    TEST_ASSERT(tool != NULL);
+    TEST_ASSERT(completed != NULL);
+    TEST_ASSERT(strstr(out, "{\"type\":\"response.output_item.added\",\"response_id\":\"resp_test\",\"output_index\":0") != NULL);
+    TEST_ASSERT(strstr(out, "{\"type\":\"response.output_item.done\",\"response_id\":\"resp_test\",\"output_index\":0") != NULL);
+    TEST_ASSERT(created < added);
+    TEST_ASSERT(added < delta);
+    TEST_ASSERT(delta < msg_done);
+    TEST_ASSERT(msg_done < tool);
+    TEST_ASSERT(tool < completed);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") == NULL);
+
+    free(out);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_responses_live_stream_sends_function_call_argument_deltas(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    responses_stream st;
+    TEST_ASSERT(responses_sse_start_live(sv[0], &r, "resp_tools", &st));
+    const char *raw_partial =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_tools", &st,
+                                            raw_partial, strlen(raw_partial), false));
+
+    const char *raw_complete =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_tools", &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_tools", &st,
+                                          raw_complete, strlen(raw_complete), "",
+                                          &calls, 10, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *created = strstr(out, "event: response.created");
+    const char *added = strstr(out, "event: response.output_item.added");
+    const char *func_added = strstr(out, "\"item\":{\"type\":\"function_call\"");
+    const char *delta = strstr(out, "event: response.function_call_arguments.delta");
+    const char *partial = strstr(out, "\"delta\":\"echo partial\"");
+    const char *rest = strstr(out, "\"delta\":\" done\"");
+    const char *args_done = strstr(out, "event: response.function_call_arguments.done");
+    const char *item_done = strstr(out, "event: response.output_item.done");
+    const char *completed = strstr(out, "event: response.completed");
+    int added_count = 0;
+    int done_count = 0;
+    for (const char *p = out; (p = strstr(p, "event: response.output_item.added")) != NULL; p++) added_count++;
+    for (const char *p = out; (p = strstr(p, "event: response.output_item.done")) != NULL; p++) done_count++;
+
+    TEST_ASSERT(created != NULL);
+    TEST_ASSERT(added != NULL);
+    TEST_ASSERT(func_added != NULL);
+    TEST_ASSERT(delta != NULL);
+    TEST_ASSERT(partial != NULL);
+    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(args_done != NULL);
+    TEST_ASSERT(item_done != NULL);
+    TEST_ASSERT(completed != NULL);
+    TEST_ASSERT(strstr(out, "\"response_id\":\"resp_tools\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"item_id\":\"fc_resp_tools_0\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"{\\\"command\\\":\\\"echo partial done\\\"}\"") != NULL);
+    TEST_ASSERT(added_count == 1);
+    TEST_ASSERT(done_count == 1);
+    TEST_ASSERT(created < added);
+    TEST_ASSERT(added < delta);
+    TEST_ASSERT(delta < partial);
+    TEST_ASSERT(partial < rest);
+    TEST_ASSERT(rest < args_done);
+    TEST_ASSERT(args_done < item_done);
+    TEST_ASSERT(item_done < completed);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") == NULL);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_responses_live_stream_finishes_message_before_tool_item(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    responses_stream st;
+    TEST_ASSERT(responses_sse_start_live(sv[0], &r, "resp_mixed", &st));
+    const char *raw_complete =
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo live" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_mixed", &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_mixed", &st,
+                                          raw_complete, strlen(raw_complete),
+                                          parsed_content, &calls, 10, 6));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *delta = strstr(out, "\"delta\":\"Before.\"");
+    const char *msg_done = strstr(out,
+        "{\"type\":\"response.output_item.done\",\"response_id\":\"resp_mixed\","
+        "\"output_index\":0,\"item\":{\"id\":\"msg_resp_mixed\"");
+    const char *func_added = strstr(out, "\"item\":{\"type\":\"function_call\"");
+    const char *args_done = strstr(out, "event: response.function_call_arguments.done");
+    const char *completed = strstr(out, "event: response.completed");
+    int added_count = 0;
+    int done_count = 0;
+    for (const char *p = out; (p = strstr(p, "event: response.output_item.added")) != NULL; p++) added_count++;
+    for (const char *p = out; (p = strstr(p, "event: response.output_item.done")) != NULL; p++) done_count++;
+
+    TEST_ASSERT(delta != NULL);
+    TEST_ASSERT(msg_done != NULL);
+    TEST_ASSERT(func_added != NULL);
+    TEST_ASSERT(args_done != NULL);
+    TEST_ASSERT(completed != NULL);
+    TEST_ASSERT(added_count == 2);
+    TEST_ASSERT(done_count == 2);
+    TEST_ASSERT(delta < msg_done);
+    TEST_ASSERT(msg_done < func_added);
+    TEST_ASSERT(func_added < args_done);
+    TEST_ASSERT(args_done < completed);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_responses_live_stream_sends_tool_search_call_item(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_tool_search_order();
+
+    responses_stream st;
+    TEST_ASSERT(responses_sse_start_live(sv[0], &r, "resp_search_stream", &st));
+    const char *raw_complete =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"tool_search\">\n"
+        DS4_PARAM_START " name=\"query\" string=\"true\">perplexity" DS4_PARAM_END "\n"
+        DS4_PARAM_START " name=\"limit\" string=\"false\">3" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_search_stream", &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_search_stream", &st,
+                                          raw_complete, strlen(raw_complete), "",
+                                          &calls, 10, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "event: response.output_item.done") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"tool_search_call\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"execution\":\"client\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"status\":\"completed\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":{\"query\":\"perplexity\",\"limit\":3}") != NULL);
+    TEST_ASSERT(strstr(out, "event: response.function_call_arguments.delta") == NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"function_call\"") == NULL);
+    TEST_ASSERT(strstr(out, "event: response.completed") != NULL);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -7458,6 +9757,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     append_model_json_values(&b, 32768, 393216);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_output_tokens\"") != NULL);
     buf_free(&b);
 
     append_model_json_values(&b, 100000, 4096);
@@ -7629,6 +9929,10 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
+    test_tool_schema_order_from_responses_tools();
+    test_tool_schema_order_from_responses_tool_search();
+    test_responses_namespace_tool_schemas_restore_wire_namespace();
+    test_responses_namespace_tool_without_parameters_keeps_wire_metadata();
     test_dsml_tool_args_are_schema_ordered();
     test_openai_tool_args_are_schema_ordered();
     test_anthropic_thinking_and_tool_args_are_schema_ordered();
@@ -7641,6 +9945,14 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_holds_partial_dsml_entities();
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();
+    test_responses_input_renders_messages_and_tool_results();
+    test_responses_input_loads_tool_search_output_tools();
+    test_responses_input_function_call_namespace_round_trips_to_dsml();
+    test_responses_output_sends_tool_search_call_item();
+    test_responses_live_stream_sends_codex_events();
+    test_responses_live_stream_sends_function_call_argument_deltas();
+    test_responses_live_stream_finishes_message_before_tool_item();
+    test_responses_live_stream_sends_tool_search_call_item();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();

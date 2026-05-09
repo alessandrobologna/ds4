@@ -1281,7 +1281,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders, const c
         if (*p == ',') p++;
         json_ws(&p);
     }
-    if (order.name && order.len > 0) {
+    if (order.name) {
         if (namespace && namespace[0]) order.namespace = xstrdup(namespace);
         if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
         tool_schema_orders_push(orders, order);
@@ -2722,6 +2722,7 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs,
     char *role = NULL;
     char *content = NULL;
     char *name = NULL;
+    char *namespace = NULL;
     char *arguments = NULL;
     char *input = NULL;
     char *action = NULL;
@@ -2760,6 +2761,12 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs,
         } else if (!strcmp(key, "name")) {
             free(name);
             if (!json_string(p, &name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "namespace")) {
+            free(namespace);
+            if (!json_string(p, &namespace)) {
                 free(key);
                 goto bad;
             }
@@ -2831,6 +2838,7 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs,
     {
         const char *call_name = name;
         const char *call_args = arguments;
+        char *namespaced_name = NULL;
         if (!strcmp(type, "custom_tool_call")) {
             call_args = input ? input : "";
         } else if (!strcmp(type, "local_shell_call")) {
@@ -2839,6 +2847,12 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs,
         } else if (!strcmp(type, "tool_search_call")) {
             call_name = "tool_search";
             call_args = arguments ? arguments : "{}";
+        } else if (namespace && namespace[0] && name && name[0]) {
+            buf b = {0};
+            buf_puts(&b, namespace);
+            buf_puts(&b, name);
+            namespaced_name = buf_take(&b);
+            call_name = namespaced_name;
         }
         if (call_name && call_name[0]) {
             chat_msg msg = {0};
@@ -2851,6 +2865,7 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs,
             tool_calls_push(&msg.calls, tc);
             chat_msgs_push(msgs, msg);
         }
+        free(namespaced_name);
     } else if (!strcmp(type, "function_call_output") ||
                !strcmp(type, "mcp_tool_call_output") ||
                !strcmp(type, "custom_tool_call_output") ||
@@ -2880,6 +2895,7 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs,
     free(role);
     free(content);
     free(name);
+    free(namespace);
     free(arguments);
     free(input);
     free(action);
@@ -2892,6 +2908,7 @@ bad:
     free(role);
     free(content);
     free(name);
+    free(namespace);
     free(arguments);
     free(input);
     free(action);
@@ -8239,6 +8256,42 @@ static void test_responses_namespace_tool_schemas_restore_wire_namespace(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_responses_namespace_tool_without_parameters_keeps_wire_metadata(void) {
+    const char *json =
+        "[{\"type\":\"namespace\",\"name\":\"mcp__awsdocs__\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"aws___list_services\","
+        "\"description\":\"List AWS services\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"mcp__awsdocs__aws___list_services\""));
+    const tool_schema_order *order =
+        tool_schema_orders_find(&orders, "mcp__awsdocs__aws___list_services");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->len == 0);
+    TEST_ASSERT(order && order->namespace && !strcmp(order->namespace, "mcp__awsdocs__"));
+    TEST_ASSERT(order && order->wire_name && !strcmp(order->wire_name, "aws___list_services"));
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("mcp__awsdocs__aws___list_services");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&calls, tc);
+
+    buf out = {0};
+    append_responses_output(&out, "resp_empty_ns", "", &calls, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"name\":\"aws___list_services\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"namespace\":\"mcp__awsdocs__\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "mcp__awsdocs__aws___list_services") == NULL);
+
+    buf_free(&out);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
 static tool_calls make_swapped_bash_call(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
@@ -8817,6 +8870,48 @@ static void test_responses_input_loads_tool_search_output_tools(void) {
     buf_free(&loaded);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
+}
+
+static void test_responses_input_function_call_namespace_round_trips_to_dsml(void) {
+    const char *tools_json =
+        "[{\"type\":\"namespace\",\"name\":\"mcp__perplexity__\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"perplexity_search\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"}}}}]}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
+
+    const char *input_json =
+        "[{\"type\":\"function_call\",\"call_id\":\"call_ns\","
+        "\"name\":\"perplexity_search\",\"namespace\":\"mcp__perplexity__\","
+        "\"arguments\":{\"query\":\"deepseek\"}}]";
+    const char *input_p = input_json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name,
+                        "mcp__perplexity__perplexity_search"));
+
+    char *prompt = render_chat_prompt_text(&msgs, schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<｜DSML｜invoke name=\"mcp__perplexity__perplexity_search\">") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜DSML｜invoke name=\"perplexity_search\">") == NULL);
+
+    buf out = {0};
+    append_responses_output(&out, "resp_ns_history", "", &msgs.v[0].calls, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"name\":\"perplexity_search\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"namespace\":\"mcp__perplexity__\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "mcp__perplexity__perplexity_search") == NULL);
+
+    buf_free(&out);
+    free(prompt);
+    chat_msgs_free(&msgs);
+    free(schemas);
+    tool_schema_orders_free(&orders);
 }
 
 static void test_responses_output_sends_tool_search_call_item(void) {
@@ -9727,6 +9822,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_schema_order_from_responses_tools();
     test_tool_schema_order_from_responses_tool_search();
     test_responses_namespace_tool_schemas_restore_wire_namespace();
+    test_responses_namespace_tool_without_parameters_keeps_wire_metadata();
     test_dsml_tool_args_are_schema_ordered();
     test_openai_tool_args_are_schema_ordered();
     test_anthropic_thinking_and_tool_args_are_schema_ordered();
@@ -9741,6 +9837,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_responses_input_renders_messages_and_tool_results();
     test_responses_input_loads_tool_search_output_tools();
+    test_responses_input_function_call_namespace_round_trips_to_dsml();
     test_responses_output_sends_tool_search_call_item();
     test_responses_live_stream_sends_codex_events();
     test_responses_live_stream_sends_function_call_argument_deltas();

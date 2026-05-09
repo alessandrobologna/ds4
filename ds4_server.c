@@ -2023,12 +2023,21 @@ static void append_dsml_text_escaped(buf *b, const char *s) {
     }
 }
 
+static bool dsml_known_entity_at(const char *s) {
+    return !strncmp(s, "&amp;", 5) || !strncmp(s, "&lt;", 4) ||
+           !strncmp(s, "&gt;", 4) || !strncmp(s, "&quot;", 6) ||
+           !strncmp(s, "&apos;", 6);
+}
+
 static void append_dsml_parameter_text(buf *b, const char *s) {
     const char *end = "</｜DSML｜parameter>";
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
             buf_puts(b, "&lt;");
+            s++;
+        } else if (*s == '&' && dsml_known_entity_at(s)) {
+            buf_puts(b, "&amp;");
             s++;
         } else {
             buf_putc(b, *s++);
@@ -10861,6 +10870,26 @@ static void test_dsml_prompt_escapes_tool_supplied_text(void) {
     append_dsml_tool_calls_text(&b, &calls);
     TEST_ASSERT(strstr(b.ptr, "echo &lt;/｜DSML｜parameter>") != NULL);
     TEST_ASSERT(strstr(b.ptr, "echo </｜DSML｜parameter>") == NULL);
+    buf_free(&b);
+    tool_calls_free(&calls);
+
+    memset(&calls, 0, sizeof(calls));
+    memset(&tc, 0, sizeof(tc));
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"echo &lt;tag&gt; &amp; done\",\"count\":1}");
+    tool_calls_push(&calls, tc);
+
+    append_dsml_tool_calls_text(&b, &calls);
+    TEST_ASSERT(strstr(b.ptr, "echo &amp;lt;tag&amp;gt; &amp;amp; done") != NULL);
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls parsed = {0};
+    TEST_ASSERT(parse_generated_message(b.ptr, &content, &reasoning, &parsed));
+    TEST_ASSERT(parsed.len == 1);
+    TEST_ASSERT(strstr(parsed.v[0].arguments, "echo &lt;tag&gt; &amp; done") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&parsed);
     buf_free(&b);
     tool_calls_free(&calls);
 

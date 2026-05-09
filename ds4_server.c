@@ -4680,7 +4680,9 @@ typedef struct {
     bool active;
     bool checked_think_prefix;
     bool message_started;
+    bool message_done;
     bool sent_content;
+    size_t message_content_start;
     responses_tool_stream tool;
 } responses_stream;
 
@@ -5129,6 +5131,9 @@ static bool responses_tool_stream_update(int fd, const request *r, const char *i
     return true;
 }
 
+static bool responses_sse_message_done(int fd, responses_stream *st, const char *id,
+                                       const char *content);
+
 static bool responses_sse_stream_update(int fd, const request *r, const char *id,
                                         responses_stream *st,
                                         const char *raw, size_t raw_len,
@@ -5144,6 +5149,7 @@ static bool responses_sse_stream_update(int fd, const request *r, const char *id
             }
             if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
                 st->emit_pos = open_len;
+                st->message_content_start = open_len;
             }
             st->checked_think_prefix = true;
         }
@@ -5151,6 +5157,7 @@ static bool responses_sse_stream_update(int fd, const request *r, const char *id
         const char *close = strstr(raw + st->emit_pos, "</think>");
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->message_content_start = st->emit_pos;
             st->mode = RESP_STREAM_TEXT;
         } else if (final) {
             st->mode = RESP_STREAM_SUPPRESS;
@@ -5173,7 +5180,16 @@ static bool responses_sse_stream_update(int fd, const request *r, const char *id
         }
 
         if (tool) {
-            st->emit_pos = (size_t)(tool - raw);
+            size_t tool_pos = (size_t)(tool - raw);
+            if (st->message_started && !st->message_done) {
+                size_t end = trim_tool_separator_ws(raw, st->message_content_start, tool_pos);
+                char *content = xstrndup(raw + st->message_content_start,
+                                         end - st->message_content_start);
+                bool ok = responses_sse_message_done(fd, st, id, content);
+                free(content);
+                if (!ok) return false;
+            }
+            st->emit_pos = tool_pos;
             if (responses_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
                 st->mode = RESP_STREAM_TOOL;
             } else {
@@ -5192,6 +5208,7 @@ static bool responses_sse_stream_update(int fd, const request *r, const char *id
 
 static bool responses_sse_message_done(int fd, responses_stream *st, const char *id,
                                        const char *content) {
+    if (st->message_done) return true;
     if (!responses_sse_ensure_message(fd, st, id)) return false;
     char msg_id[128];
     responses_message_id(msg_id, sizeof(msg_id), id);
@@ -5204,6 +5221,7 @@ static bool responses_sse_message_done(int fd, responses_stream *st, const char 
     buf_putc(&b, '}');
     bool ok = sse_event(fd, "response.output_item.done", b.ptr);
     buf_free(&b);
+    if (ok) st->message_done = true;
     return ok;
 }
 
@@ -9108,6 +9126,75 @@ static void test_responses_live_stream_sends_function_call_argument_deltas(void)
     close(sv[1]);
 }
 
+static void test_responses_live_stream_finishes_message_before_tool_item(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    responses_stream st;
+    TEST_ASSERT(responses_sse_start_live(sv[0], &r, "resp_mixed", &st));
+    const char *raw_complete =
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo live" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_mixed", &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_mixed", &st,
+                                          raw_complete, strlen(raw_complete),
+                                          parsed_content, &calls, 10, 6));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *delta = strstr(out, "\"delta\":\"Before.\"");
+    const char *msg_done = strstr(out,
+        "{\"type\":\"response.output_item.done\",\"response_id\":\"resp_mixed\","
+        "\"output_index\":0,\"item\":{\"id\":\"msg_resp_mixed\"");
+    const char *func_added = strstr(out, "\"item\":{\"type\":\"function_call\"");
+    const char *args_done = strstr(out, "event: response.function_call_arguments.done");
+    const char *completed = strstr(out, "event: response.completed");
+    int added_count = 0;
+    int done_count = 0;
+    for (const char *p = out; (p = strstr(p, "event: response.output_item.added")) != NULL; p++) added_count++;
+    for (const char *p = out; (p = strstr(p, "event: response.output_item.done")) != NULL; p++) done_count++;
+
+    TEST_ASSERT(delta != NULL);
+    TEST_ASSERT(msg_done != NULL);
+    TEST_ASSERT(func_added != NULL);
+    TEST_ASSERT(args_done != NULL);
+    TEST_ASSERT(completed != NULL);
+    TEST_ASSERT(added_count == 2);
+    TEST_ASSERT(done_count == 2);
+    TEST_ASSERT(delta < msg_done);
+    TEST_ASSERT(msg_done < func_added);
+    TEST_ASSERT(func_added < args_done);
+    TEST_ASSERT(args_done < completed);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_responses_live_stream_sends_tool_search_call_item(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -9864,6 +9951,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_output_sends_tool_search_call_item();
     test_responses_live_stream_sends_codex_events();
     test_responses_live_stream_sends_function_call_argument_deltas();
+    test_responses_live_stream_finishes_message_before_tool_item();
     test_responses_live_stream_sends_tool_search_call_item();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();

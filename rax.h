@@ -31,6 +31,7 @@
 #ifndef RAX_H
 #define RAX_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Representation of a radix tree as implemented in this file, that contains

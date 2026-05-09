@@ -7055,6 +7055,19 @@ static bool id_list_contains(const stop_list *ids, const char *id) {
     return false;
 }
 
+static bool id_list_remove(stop_list *ids, const char *id) {
+    if (!ids || !id || !id[0]) return false;
+    for (int i = 0; i < ids->len; i++) {
+        if (!ids->v[i] || strcmp(ids->v[i], id)) continue;
+        free(ids->v[i]);
+        memmove(ids->v + i, ids->v + i + 1,
+                (size_t)(ids->len - i - 1) * sizeof(ids->v[0]));
+        ids->len--;
+        return true;
+    }
+    return false;
+}
+
 static void id_list_push_unique(stop_list *ids, const char *id) {
     if (!ids || !id || !id[0] || id_list_contains(ids, id)) return;
     stop_list_push(ids, xstrdup(id));
@@ -7255,7 +7268,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     return ok;
 }
 
-static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
+static int kv_tool_map_load_from_pos(server *s, FILE *fp, stop_list *wanted) {
     if (!s || s->disable_exact_dsml_tool_replay || !fp) return 0;
     uint8_t h[KV_TOOL_MAP_HEADER];
     size_t n = fread(h, 1, sizeof(h), fp);
@@ -7268,6 +7281,7 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
     if ((uint64_t)count > (uint64_t)tool_memory_max_entries(&s->tool_mem) * 4u) return 0;
     int loaded = 0;
     for (uint32_t i = 0; i < count; i++) {
+        if (wanted && wanted->len == 0) return loaded;
         uint8_t lens[8];
         if (fread(lens, 1, sizeof(lens), fp) != sizeof(lens)) return loaded;
         uint32_t id_len = le_get32(lens);
@@ -7282,6 +7296,7 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
         dsml[dsml_len] = '\0';
         if (ok && (!wanted || id_list_contains(wanted, id))) {
             tool_memory_put_source(s, id, dsml, TOOL_MEMORY_DISK);
+            if (wanted) id_list_remove(wanted, id);
             loaded++;
         }
         free(id);
@@ -7396,19 +7411,12 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
 
-    DIR *d = opendir(s->kv.dir);
-    if (!d) {
-        id_list_free(&wanted);
-        return;
-    }
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!sha_hex_name(de->d_name, sha)) continue;
-        (void)sha;
-        char *path = path_join(s->kv.dir, de->d_name);
-        FILE *fp = fopen(path, "rb");
-        free(path);
+    kv_disk_cache *kc = &s->kv;
+    if (kc->len == 0) kv_cache_refresh(kc);
+    for (int i = 0; i < kc->len && wanted.len > 0; i++) {
+        kv_entry *e = &kc->entry[i];
+        if (!(e->ext_flags & KV_EXT_TOOL_MAP) || !e->path) continue;
+        FILE *fp = fopen(e->path, "rb");
         if (!fp) continue;
 
         kv_entry hdr = {0};
@@ -7423,7 +7431,6 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         }
         fclose(fp);
     }
-    closedir(d);
     id_list_free(&wanted);
 }
 

@@ -5477,7 +5477,16 @@ static void responses_tool_stream_clear(responses_tool_stream *ts) {
     ts->args = (buf){0};
 }
 
-static const char *responses_stream_call_id(const char *id, responses_stream *st, int index) {
+static bool responses_stream_has_call_id(const responses_stream *st, const char *id, int upto) {
+    if (!st || !id || !id[0]) return false;
+    if (upto > st->call_ids_cap) upto = st->call_ids_cap;
+    for (int i = 0; i < upto; i++) {
+        if (st->call_ids[i] && !strcmp(st->call_ids[i], id)) return true;
+    }
+    return false;
+}
+
+static const char *responses_stream_call_id(server *s, responses_stream *st, int index) {
     if (!st || index < 0) return "";
     if (index >= st->call_ids_cap) {
         int old = st->call_ids_cap;
@@ -5488,9 +5497,13 @@ static const char *responses_stream_call_id(const char *id, responses_stream *st
         st->call_ids_cap = cap;
     }
     if (!st->call_ids[index]) {
-        char call_id[128];
-        responses_function_call_id(call_id, sizeof(call_id), id, index);
-        st->call_ids[index] = xstrdup(call_id);
+        char id[64];
+        for (;;) {
+            random_tool_id(id, sizeof(id), API_RESPONSES);
+            if (!responses_stream_has_call_id(st, id, index) &&
+                !tool_memory_has_id(s, id)) break;
+        }
+        st->call_ids[index] = xstrdup(id);
     }
     return st->call_ids[index];
 }
@@ -5539,13 +5552,13 @@ static bool responses_tool_stream_init(responses_tool_stream *ts, const char *ra
     return true;
 }
 
-static bool responses_sse_function_call_added(int fd, const char *id,
+static bool responses_sse_function_call_added(int fd, server *s, const char *id,
                                               responses_stream *st,
                                               const tool_schema_orders *orders) {
     responses_tool_stream *ts = &st->tool;
     const tool_schema_order *order = tool_schema_orders_find(orders, ts->name);
     char item_id[128];
-    const char *call_id = responses_stream_call_id(id, st, ts->index);
+    const char *call_id = responses_stream_call_id(s, st, ts->index);
     responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
 
     buf b = {0};
@@ -5633,7 +5646,7 @@ static bool responses_tool_stream_fail(responses_tool_stream *ts) {
     return true;
 }
 
-static bool responses_tool_start_invoke(int fd, const request *r, const char *id,
+static bool responses_tool_start_invoke(int fd, server *s, const request *r, const char *id,
                                         responses_stream *st,
                                         const char *raw, size_t raw_len) {
     responses_tool_stream *ts = &st->tool;
@@ -5649,7 +5662,7 @@ static bool responses_tool_start_invoke(int fd, const request *r, const char *id
     ts->output_index = st->next_output_index++;
     bool ok = true;
     if (!responses_tool_name_is_tool_search(ts->name)) {
-        ok = responses_sse_function_call_added(fd, id, st, &r->tool_orders);
+        ok = responses_sse_function_call_added(fd, s, id, st, &r->tool_orders);
     }
     if (ok) ok = responses_tool_emit_args_fragment(fd, id, ts, "{", 1);
     if (!ok) return false;
@@ -5732,13 +5745,13 @@ static bool responses_sse_function_args_done(int fd, const char *id,
     return ok;
 }
 
-static bool responses_sse_tool_search_item_done_live(int fd, const char *id,
+static bool responses_sse_tool_search_item_done_live(int fd, server *s, const char *id,
                                                      responses_stream *st,
                                                      const tool_schema_orders *orders) {
     responses_tool_stream *ts = &st->tool;
     const tool_schema_order *order = tool_schema_orders_find(orders, ts->name);
     char item_id[128];
-    const char *call_id = responses_stream_call_id(id, st, ts->index);
+    const char *call_id = responses_stream_call_id(s, st, ts->index);
     responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
 
     buf b = {0};
@@ -5758,13 +5771,13 @@ static bool responses_sse_tool_search_item_done_live(int fd, const char *id,
     return ok;
 }
 
-static bool responses_sse_function_call_item_done_live(int fd, const char *id,
+static bool responses_sse_function_call_item_done_live(int fd, server *s, const char *id,
                                                        responses_stream *st,
                                                        const tool_schema_orders *orders) {
     responses_tool_stream *ts = &st->tool;
     const tool_schema_order *order = tool_schema_orders_find(orders, ts->name);
     char item_id[128];
-    const char *call_id = responses_stream_call_id(id, st, ts->index);
+    const char *call_id = responses_stream_call_id(s, st, ts->index);
     responses_function_item_id(item_id, sizeof(item_id), id, ts->index);
 
     buf b = {0};
@@ -5790,17 +5803,17 @@ static bool responses_sse_function_call_item_done_live(int fd, const char *id,
     return ok;
 }
 
-static bool responses_tool_finish_invoke(int fd, const request *r, const char *id,
+static bool responses_tool_finish_invoke(int fd, server *s, const request *r, const char *id,
                                          responses_stream *st,
                                          responses_tool_stream *ts) {
     if (ts->args_open &&
         !responses_tool_emit_args_fragment(fd, id, ts, "}", 1)) return false;
     ts->args_open = false;
     if (responses_tool_name_is_tool_search(ts->name)) {
-        if (!responses_sse_tool_search_item_done_live(fd, id, st, &r->tool_orders)) return false;
+        if (!responses_sse_tool_search_item_done_live(fd, s, id, st, &r->tool_orders)) return false;
     } else {
         if (!responses_sse_function_args_done(fd, id, ts, &r->tool_orders)) return false;
-        if (!responses_sse_function_call_item_done_live(fd, id, st, &r->tool_orders)) return false;
+        if (!responses_sse_function_call_item_done_live(fd, s, id, st, &r->tool_orders)) return false;
     }
     responses_tool_stream_clear(ts);
     st->streamed_function_calls++;
@@ -5809,7 +5822,7 @@ static bool responses_tool_finish_invoke(int fd, const request *r, const char *i
     return true;
 }
 
-static bool responses_tool_stream_update(int fd, const request *r, const char *id,
+static bool responses_tool_stream_update(int fd, server *s, const request *r, const char *id,
                                          responses_stream *st,
                                          const char *raw, size_t raw_len) {
     responses_tool_stream *ts = &st->tool;
@@ -5827,7 +5840,7 @@ static bool responses_tool_stream_update(int fd, const request *r, const char *i
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
                 size_t before_pos = ts->parse_pos;
                 responses_tool_stream_state before_state = ts->state;
-                if (!responses_tool_start_invoke(fd, r, id, st, raw, raw_len)) return false;
+                if (!responses_tool_start_invoke(fd, s, r, id, st, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
@@ -5839,7 +5852,7 @@ static bool responses_tool_stream_update(int fd, const request *r, const char *i
             if (ts->parse_pos >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
                 ts->parse_pos += strlen(ts->invoke_end);
-                if (!responses_tool_finish_invoke(fd, r, id, st, ts)) return false;
+                if (!responses_tool_finish_invoke(fd, s, r, id, st, ts)) return false;
                 continue;
             }
             if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
@@ -5885,7 +5898,7 @@ static bool responses_tool_stream_update(int fd, const request *r, const char *i
 static bool responses_sse_message_done(int fd, responses_stream *st, const char *id,
                                        const char *content);
 
-static bool responses_sse_stream_update(int fd, const request *r, const char *id,
+static bool responses_sse_stream_update(int fd, server *s, const request *r, const char *id,
                                         responses_stream *st,
                                         const char *raw, size_t raw_len,
                                         bool final) {
@@ -5951,7 +5964,7 @@ static bool responses_sse_stream_update(int fd, const request *r, const char *id
         }
     }
     if (st->mode == RESP_STREAM_TOOL) {
-        if (!responses_tool_stream_update(fd, r, id, st, raw, raw_len)) return false;
+        if (!responses_tool_stream_update(fd, s, r, id, st, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = RESP_STREAM_SUPPRESS;
     }
     return true;
@@ -6012,12 +6025,12 @@ static bool responses_sse_completed(int fd, const request *r, const char *id,
     return ok;
 }
 
-static bool responses_sse_finish_live(int fd, const request *r, const char *id,
+static bool responses_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                       responses_stream *st, const char *raw,
                                       size_t raw_len, const char *content,
                                       const tool_calls *calls,
                                       int prompt_tokens, int completion_tokens) {
-    if (!responses_sse_stream_update(fd, r, id, st, raw, raw_len, true)) return false;
+    if (!responses_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     if (st->message_started || (content && content[0]) || !calls || calls->len == 0) {
         if (!responses_sse_message_done(fd, st, id, content ? content : "")) return false;
@@ -7758,8 +7771,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
 
     const uint64_t now = (uint64_t)time(NULL);
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    uint8_t ext_flags = tool_memory_count_dsml_in_text(s, text) > 0 ? KV_EXT_TOOL_MAP : 0;
-    kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), ext_flags,
+    kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), 0,
                    (uint32_t)store_tokens.len, 0,
                    (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
     uint8_t tb[4];
@@ -7770,8 +7782,15 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
               ds4_session_save_payload(s->session, fp, err, sizeof(err)) == 0 &&
-              kv_tool_map_write(s, fp, text, &tool_map_bytes) &&
-              fflush(fp) == 0;
+              kv_tool_map_write(s, fp, text, &tool_map_bytes);
+    if (ok && tool_map_bytes > 0) {
+        kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), KV_EXT_TOOL_MAP,
+                       (uint32_t)store_tokens.len, 0,
+                       (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
+        ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+             fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+    }
+    ok = ok && fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
@@ -8973,7 +8992,7 @@ static void generate_job(server *s, job *j) {
                 break;
             }
             if (j->req.stream && j->req.api == API_RESPONSES &&
-                !responses_sse_stream_update(j->fd, &j->req, id,
+                !responses_sse_stream_update(j->fd, s, &j->req, id,
                                              &responses_live, text.ptr, stream_len,
                                              false)) {
                 finish = "error";
@@ -9147,7 +9166,7 @@ static void generate_job(server *s, job *j) {
     if (j->req.stream) {
         bool response_ok = true;
         if (j->req.api == API_RESPONSES) {
-            response_ok = responses_sse_finish_live(j->fd, &j->req, id, &responses_live,
+            response_ok = responses_sse_finish_live(j->fd, s, &j->req, id, &responses_live,
                                                     text.ptr ? text.ptr : "", text.len,
                                                     parsed_content ? parsed_content : "",
                                                     &parsed_calls,
@@ -10797,17 +10816,17 @@ static void test_responses_live_stream_sends_codex_events(void) {
     responses_stream st;
     TEST_ASSERT(responses_sse_start_live(sv[0], &r, "resp_test", &st));
     const char *raw1 = "<think>need a tool</think>Hello ";
-    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_test", &st,
+    TEST_ASSERT(responses_sse_stream_update(sv[0], NULL, &r, "resp_test", &st,
                                             raw1, strlen(raw1), false));
 
     const char *raw =
         "<think>need a tool</think>Hello world\n\n"
         DS4_TOOL_CALLS_START "\n";
-    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_test", &st,
+    TEST_ASSERT(responses_sse_stream_update(sv[0], NULL, &r, "resp_test", &st,
                                             raw, strlen(raw), false));
 
     tool_calls calls = make_swapped_bash_call();
-    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_test", &st,
+    TEST_ASSERT(responses_sse_finish_live(sv[0], NULL, &r, "resp_test", &st,
                                           raw, strlen(raw), "Hello world",
                                           &calls, 10, 8));
     shutdown(sv[0], SHUT_WR);
@@ -10864,7 +10883,7 @@ static void test_responses_live_stream_sends_function_call_argument_deltas(void)
         DS4_TOOL_CALLS_START "\n"
         DS4_INVOKE_START " name=\"bash\">\n"
         DS4_PARAM_START " name=\"command\" string=\"true\">echo partial";
-    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_tools", &st,
+    TEST_ASSERT(responses_sse_stream_update(sv[0], NULL, &r, "resp_tools", &st,
                                             raw_partial, strlen(raw_partial), false));
 
     const char *raw_complete =
@@ -10873,7 +10892,7 @@ static void test_responses_live_stream_sends_function_call_argument_deltas(void)
         DS4_PARAM_START " name=\"command\" string=\"true\">echo partial done" DS4_PARAM_END "\n"
         DS4_INVOKE_END "\n"
         DS4_TOOL_CALLS_END;
-    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_tools", &st,
+    TEST_ASSERT(responses_sse_stream_update(sv[0], NULL, &r, "resp_tools", &st,
                                             raw_complete, strlen(raw_complete), false));
 
     char *parsed_content = NULL;
@@ -10882,8 +10901,9 @@ static void test_responses_live_stream_sends_function_call_argument_deltas(void)
     TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_responses_stream_tool_ids(&calls, &st);
-    TEST_ASSERT(calls.v[0].id && !strcmp(calls.v[0].id, "call_resp_tools_0"));
-    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_tools", &st,
+    TEST_ASSERT(calls.v[0].id && !strncmp(calls.v[0].id, "call_", 5));
+    TEST_ASSERT(!strstr(calls.v[0].id, "resp_tools"));
+    TEST_ASSERT(responses_sse_finish_live(sv[0], NULL, &r, "resp_tools", &st,
                                           raw_complete, strlen(raw_complete), "",
                                           &calls, 10, 4));
     shutdown(sv[0], SHUT_WR);
@@ -10914,7 +10934,11 @@ static void test_responses_live_stream_sends_function_call_argument_deltas(void)
     TEST_ASSERT(completed != NULL);
     TEST_ASSERT(strstr(out, "\"response_id\":\"resp_tools\"") != NULL);
     TEST_ASSERT(strstr(out, "\"item_id\":\"fc_resp_tools_0\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"call_id\":\"call_resp_tools_0\"") != NULL);
+    buf call_json = {0};
+    buf_puts(&call_json, "\"call_id\":");
+    json_escape(&call_json, calls.v[0].id);
+    TEST_ASSERT(strstr(out, call_json.ptr) != NULL);
+    buf_free(&call_json);
     TEST_ASSERT(strstr(out, "\"arguments\":\"{\\\"command\\\":\\\"echo partial done\\\"}\"") != NULL);
     TEST_ASSERT(added_count == 1);
     TEST_ASSERT(done_count == 1);
@@ -10960,7 +10984,7 @@ static void test_responses_live_stream_finishes_message_before_tool_item(void) {
         DS4_PARAM_START " name=\"command\" string=\"true\">echo live" DS4_PARAM_END "\n"
         DS4_INVOKE_END "\n"
         DS4_TOOL_CALLS_END;
-    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_mixed", &st,
+    TEST_ASSERT(responses_sse_stream_update(sv[0], NULL, &r, "resp_mixed", &st,
                                             raw_complete, strlen(raw_complete), false));
 
     char *parsed_content = NULL;
@@ -10969,8 +10993,9 @@ static void test_responses_live_stream_finishes_message_before_tool_item(void) {
     TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_responses_stream_tool_ids(&calls, &st);
-    TEST_ASSERT(calls.v[0].id && !strcmp(calls.v[0].id, "call_resp_mixed_0"));
-    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_mixed", &st,
+    TEST_ASSERT(calls.v[0].id && !strncmp(calls.v[0].id, "call_", 5));
+    TEST_ASSERT(!strstr(calls.v[0].id, "resp_mixed"));
+    TEST_ASSERT(responses_sse_finish_live(sv[0], NULL, &r, "resp_mixed", &st,
                                           raw_complete, strlen(raw_complete),
                                           parsed_content, &calls, 10, 6));
     shutdown(sv[0], SHUT_WR);
@@ -11032,7 +11057,7 @@ static void test_responses_live_stream_sends_tool_search_call_item(void) {
         DS4_PARAM_START " name=\"limit\" string=\"false\">3" DS4_PARAM_END "\n"
         DS4_INVOKE_END "\n"
         DS4_TOOL_CALLS_END;
-    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, "resp_search_stream", &st,
+    TEST_ASSERT(responses_sse_stream_update(sv[0], NULL, &r, "resp_search_stream", &st,
                                             raw_complete, strlen(raw_complete), false));
 
     char *parsed_content = NULL;
@@ -11041,8 +11066,9 @@ static void test_responses_live_stream_sends_tool_search_call_item(void) {
     TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_responses_stream_tool_ids(&calls, &st);
-    TEST_ASSERT(calls.v[0].id && !strcmp(calls.v[0].id, "call_resp_search_stream_0"));
-    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, "resp_search_stream", &st,
+    TEST_ASSERT(calls.v[0].id && !strncmp(calls.v[0].id, "call_", 5));
+    TEST_ASSERT(!strstr(calls.v[0].id, "resp_search_stream"));
+    TEST_ASSERT(responses_sse_finish_live(sv[0], NULL, &r, "resp_search_stream", &st,
                                           raw_complete, strlen(raw_complete), "",
                                           &calls, 10, 4));
     shutdown(sv[0], SHUT_WR);
@@ -11051,7 +11077,11 @@ static void test_responses_live_stream_sends_tool_search_call_item(void) {
     TEST_ASSERT(strstr(out, "event: response.output_item.done") != NULL);
     TEST_ASSERT(strstr(out, "\"type\":\"tool_search_call\"") != NULL);
     TEST_ASSERT(strstr(out, "\"execution\":\"client\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"call_id\":\"call_resp_search_stream_0\"") != NULL);
+    buf search_call_json = {0};
+    buf_puts(&search_call_json, "\"call_id\":");
+    json_escape(&search_call_json, calls.v[0].id);
+    TEST_ASSERT(strstr(out, search_call_json.ptr) != NULL);
+    buf_free(&search_call_json);
     TEST_ASSERT(strstr(out, "\"status\":\"completed\"") != NULL);
     TEST_ASSERT(strstr(out, "\"arguments\":{\"query\":\"perplexity\",\"limit\":3}") != NULL);
     TEST_ASSERT(strstr(out, "event: response.function_call_arguments.delta") == NULL);

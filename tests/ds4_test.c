@@ -13,6 +13,11 @@ static const char *test_model_path(void) {
     return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
 }
 
+static const char *test_mtp_path(void) {
+    const char *mtp_path = getenv("DS4_TEST_MTP");
+    return (mtp_path && mtp_path[0]) ? mtp_path : NULL;
+}
+
 static ds4_engine *test_get_engine(bool quality) {
     ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
     if (*slot) return *slot;
@@ -555,6 +560,109 @@ static void test_tool_call_quality(void) {
     test_close_engine(true);
 }
 
+static int test_generate_argmax_tokens(ds4_engine *engine,
+                                       const char *prompt_text,
+                                       int *out,
+                                       int cap) {
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &prompt);
+
+    ds4_session *session = NULL;
+    char err[160];
+    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    if (!session) {
+        ds4_tokens_free(&prompt);
+        return 0;
+    }
+    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+
+    int n = 0;
+    bool ok = true;
+    while (ok && n < cap) {
+        int token = ds4_session_argmax(session);
+        if (token == ds4_token_eos(engine)) break;
+
+        if (ds4_engine_mtp_draft_tokens(engine) > 1) {
+            int accepted[17];
+            int ntok = ds4_session_eval_speculative_argmax(session,
+                                                           token,
+                                                           cap - n,
+                                                           ds4_token_eos(engine),
+                                                           accepted,
+                                                           (int)(sizeof(accepted) / sizeof(accepted[0])),
+                                                           err,
+                                                           sizeof(err));
+            if (ntok < 0) {
+                ok = false;
+                break;
+            }
+            for (int i = 0; i < ntok && n < cap; i++) out[n++] = accepted[i];
+        } else {
+            if (ds4_session_eval_no_mtp_probe(session, token, err, sizeof(err)) != 0) {
+                ok = false;
+                break;
+            }
+            out[n++] = token;
+        }
+    }
+
+    TEST_ASSERT(ok);
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    return n;
+}
+
+static ds4_engine *test_open_mtp_engine(bool speed) {
+    const char *mtp_path = test_mtp_path();
+    if (!mtp_path) return NULL;
+    ds4_engine_options opt = {
+        .model_path = test_model_path(),
+        .mtp_path = mtp_path,
+        .backend = DS4_BACKEND_METAL,
+        .mtp_draft_tokens = 2,
+        .mtp_margin = 3.0f,
+        .mtp_speed = speed,
+    };
+    ds4_engine *engine = NULL;
+    TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
+    return engine;
+}
+
+static void test_mtp_oracle(void) {
+    if (!test_mtp_path()) {
+        fprintf(stderr, "ds4-test: mtp-oracle skipped; set DS4_TEST_MTP to enable\n");
+        return;
+    }
+
+    const char *prompt =
+        "Explain Redis Streams consumer groups, pending entries, and acknowledgements in two short paragraphs.";
+    enum { MAX_TOKENS = 32 };
+    int baseline[MAX_TOKENS];
+    int exact[MAX_TOKENS];
+    int speed[MAX_TOKENS];
+
+    ds4_engine *base_engine = test_get_engine(false);
+    int n_base = test_generate_argmax_tokens(base_engine, prompt, baseline, MAX_TOKENS);
+    TEST_ASSERT(n_base > 0);
+    test_close_engine(false);
+
+    setenv("DS4_MTP_ORACLE", "1", 1);
+    ds4_engine *exact_engine = test_open_mtp_engine(false);
+    int n_exact = exact_engine ? test_generate_argmax_tokens(exact_engine, prompt, exact, MAX_TOKENS) : 0;
+    ds4_engine_close(exact_engine);
+    unsetenv("DS4_MTP_ORACLE");
+
+    TEST_ASSERT(n_exact == n_base);
+    if (n_exact == n_base) {
+        TEST_ASSERT(memcmp(baseline, exact, (size_t)n_base * sizeof(baseline[0])) == 0);
+    }
+
+    ds4_engine *speed_engine = test_open_mtp_engine(true);
+    int n_speed = speed_engine ? test_generate_argmax_tokens(speed_engine, prompt, speed, MAX_TOKENS) : 0;
+    ds4_engine_close(speed_engine);
+    TEST_ASSERT(n_speed > 0);
+}
+
 #endif
 
 static void test_server_unit_group(void) {
@@ -574,6 +682,7 @@ static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_METAL
     {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
+    {"--mtp-oracle", "mtp-oracle", "optional exact/speed MTP oracle regression", test_mtp_oracle},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
 #endif
@@ -594,6 +703,7 @@ static void test_print_help(const char *prog) {
     puts("      Show this help.");
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
+    puts("  DS4_TEST_MTP=FILE          Optional MTP model path for --mtp-oracle.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context regression prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
 }

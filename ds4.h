@@ -61,6 +61,7 @@ typedef struct {
     int n_threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    bool mtp_speed;
     bool warm_weights;
     bool quality;
 } ds4_engine_options;
@@ -138,6 +139,8 @@ int ds4_session_argmax(ds4_session *s);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval_no_mtp_probe(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_mtp_verify_scale(ds4_session *s, int max_n, int repeats, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,

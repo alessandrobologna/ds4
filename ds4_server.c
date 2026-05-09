@@ -7150,10 +7150,11 @@ static void generate_job(server *s, job *j) {
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        const bool use_mtp_spec =
+            temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
-        {
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (use_mtp_spec) {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
                                                        max_tokens - completion,
@@ -7167,7 +7168,7 @@ static void generate_job(server *s, job *j) {
                 break;
             }
         } else {
-            if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
+            if (ds4_session_eval_no_mtp_probe(s->session, token, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
@@ -7894,9 +7895,11 @@ static void usage(FILE *fp) {
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1; exact mode caps at 2\n"
         "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "      Minimum recursive-draft confidence for speed-mode fallback. Default: 3\n"
+        "  --mtp-speed\n"
+        "      Allow the faster approximate MTP verifier; greedy output may differ.\n"
         "  -c, --ctx N\n"
         "      Context size allocated at startup. Default: 32768\n"
         "  -n, --tokens N\n"
@@ -7988,6 +7991,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--mtp-speed")) {
+            c.engine.mtp_speed = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {

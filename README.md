@@ -72,8 +72,8 @@ Hugging Face token cache are used when present.
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF. It can be used with both q2 and q4, but must be enabled explicitly with
 `--mtp`. The current MTP/speculative decoding path is still experimental: it is
-correctness-gated and currently provides at most a slight speedup, not a
-meaningful generation-speed win.
+correctness-gated by default. `--mtp-speed` opts into the faster approximate
+verifier, where greedy output may differ from the baseline stream.
 
 Then build:
 
@@ -126,9 +126,21 @@ and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
-path; it is useful only for greedy decoding, currently uses a confidence gate
-(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
-experimental slight-speedup path.
+path for greedy decoding. By default it verifies the drafted suffix against the
+target model and caps exact-mode draft depth at 2; add `--mtp-speed` to opt
+into the approximate fast verifier. Speed mode is an explicit throughput mode:
+it may trust MTP-drafted suffixes and can drift from the baseline greedy stream.
+For local throughput checks, `--mtp-speed --mtp-draft 6` is the current measured
+fast path. Set `DS4_MTP_SPEED_VALIDATE=1` to force the speed path back through
+suffix validation when comparing output quality. `DS4_MTP_EXACT_REPLAY=1` is a
+diagnostic path for testing deeper exact drafts by replaying accepted tokens
+through normal decode before commit. `DS4_MTP_EXACT_DEEP=1` enables the
+experimental exact N=3/N=4 verifier path; it is correctness-preserving in local
+tests but currently slower than the default exact N=2 path.
+For MTP diagnostics, `DS4_MTP_ORACLE=1` checks the exact N=2 path,
+`DS4_MTP_SPEED_AUDIT=1` audits approximate speed commits against sequential
+greedy logits, and `DS4_MTP_VERIFY_SCALE_DETAIL=1` adds mismatch details to
+`--mtp-verify-scale` for N=3/N=4 verifier work.
 
 ## Server
 
@@ -536,5 +548,18 @@ All project tests are driven by the C runner:
 ```sh
 make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
+DS4_TEST_MTP=gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf ./ds4_test --mtp-oracle
 ./ds4_test --server
 ```
+
+For local MTP measurements, `tools/mtp_benchmark.sh` interleaves baseline,
+MTP-disabled, exact MTP, and `--mtp-speed` runs and reports median generation
+TPS plus output hashes. Its default speed-mode depth is `--mtp-draft 6`; the
+exact path still caps itself at 2 unless `DS4_MTP_EXACT_DEEP=1` is set. The
+default prompt is a small greedy smoke case; use `--prompt`, `--tokens`,
+`--draft`, and `--margin` to probe harder quality cases.
+
+`./ds4 --mtp MTP.gguf --mtp-verify-scale -p "..."` runs a verifier-only scaling
+diagnostic after prompt prefill. It reports the sequential target budget,
+batch-verifier layer/output/readback timing for N=1/2/3/4/8, and the exact N=2
+verifier cost.

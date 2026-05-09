@@ -40,6 +40,9 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    bool mtp_verify_scale;
+    int mtp_verify_scale_max;
+    int mtp_verify_scale_repeats;
 } cli_generation_options;
 
 typedef struct {
@@ -82,9 +85,11 @@ static void usage(FILE *fp) {
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1; exact mode caps at 2\n"
         "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "      Minimum recursive-draft confidence for speed-mode fallback. Default: 3\n"
+        "  --mtp-speed\n"
+        "      Allow faster approximate MTP suffix commits; greedy output may differ.\n"
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
@@ -155,6 +160,12 @@ static void usage(FILE *fp) {
         "      Run the GPU-resident self-token graph across all layers.\n"
         "  --metal-graph-prompt-test\n"
         "      Compare CPU and GPU graph logits for the full prompt.\n"
+        "  --mtp-verify-scale\n"
+        "      Time target verifier suffixes after prompt prefill. Requires --mtp.\n"
+        "  --mtp-verify-scale-max N\n"
+        "      Largest verifier suffix depth to test, capped at 8. Default: 8\n"
+        "  --mtp-verify-scale-repeats N\n"
+        "      Repetitions per verifier depth. Default: 3\n"
         "\n"
         "Normal CLI commands:\n"
         "  ./ds4\n"
@@ -473,8 +484,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        const bool use_mtp_spec =
+            cfg->gen.temperature <= 0.0f &&
+            ds4_engine_mtp_draft_tokens(engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (use_mtp_spec) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -489,7 +503,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 return 1;
             }
         } else {
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            if (ds4_session_eval_no_mtp_probe(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
                 return 1;
@@ -658,7 +672,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         fputs("]}", fp);
 
         if (token == ds4_token_eos(engine)) break;
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (ds4_session_eval_no_mtp_probe(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4: decode failed while dumping logprobs: %s\n", err);
             free(scores);
             fclose(fp);
@@ -676,6 +690,38 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     free(scores);
     ds4_session_free(session);
     return 0;
+}
+
+static int run_mtp_verify_scale(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: --mtp-verify-scale requires the Metal session backend\n");
+        return 1;
+    }
+
+    char err[160];
+    cli_prefill_progress progress = {
+        .base_tokens = 0,
+        .input_tokens = prompt->len,
+        .use_color = ds4_log_is_tty(stderr),
+    };
+    ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(session, NULL, NULL);
+        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
+        ds4_session_free(session);
+        return 1;
+    }
+    ds4_session_set_progress(session, NULL, NULL);
+
+    int rc = ds4_session_mtp_verify_scale(session,
+                                          cfg->gen.mtp_verify_scale_max,
+                                          cfg->gen.mtp_verify_scale_repeats,
+                                          err,
+                                          sizeof(err));
+    if (rc != 0) fprintf(stderr, "ds4: verifier scaling failed: %s\n", err);
+    ds4_session_free(session);
+    return rc;
 }
 
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
@@ -700,6 +746,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     }
     if (cfg->gen.dump_logprobs_path) {
         rc = run_logprob_dump(engine, cfg, &prompt);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
+    if (cfg->gen.mtp_verify_scale) {
+        rc = run_mtp_verify_scale(engine, cfg, &prompt);
         ds4_tokens_free(&prompt);
         return rc;
     }
@@ -935,8 +986,11 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        const bool use_mtp_spec =
+            cfg->gen.temperature <= 0.0f &&
+            ds4_engine_mtp_draft_tokens(engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (use_mtp_spec) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
@@ -950,7 +1004,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 return 1;
             }
         } else {
-            if (ds4_session_eval(chat->session, token, err, sizeof(err)) != 0) {
+            if (ds4_session_eval_no_mtp_probe(chat->session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
@@ -1168,6 +1222,8 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = 1.0f,
             .dump_logprobs_top_k = 20,
             .think_mode = DS4_THINK_HIGH,
+            .mtp_verify_scale_max = 8,
+            .mtp_verify_scale_repeats = 3,
         },
     };
 
@@ -1199,6 +1255,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--mtp-speed")) {
+            c.engine.mtp_speed = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -1244,6 +1302,13 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mtp-verify-scale")) {
+            c.gen.mtp_verify_scale = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mtp-verify-scale-max")) {
+            c.gen.mtp_verify_scale_max = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-verify-scale-repeats")) {
+            c.gen.mtp_verify_scale_repeats = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);

@@ -7839,6 +7839,7 @@ typedef struct {
     uint32_t spec_prefix1_n_comp[DS4_N_LAYER];
     uint32_t spec_prefix1_n_index_comp[DS4_N_LAYER];
     bool spec_capture_prefix1;
+    bool spec_verify_mode;
     uint32_t raw_cap;
     uint32_t comp_cap;
 
@@ -9567,6 +9568,73 @@ static bool metal_graph_encode_output_head_batch(
     return ok;
 }
 
+static bool metal_graph_encode_output_head_batch_final(
+        ds4_metal_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint32_t               n_tokens,
+        uint64_t               vocab_dim) {
+    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint32_t row = n_tokens - 1;
+    ds4_metal_tensor *row_hc = NULL;
+    ds4_metal_tensor *logits = NULL;
+
+    row_hc = ds4_metal_tensor_view(g->batch_cur_hc,
+                                   (uint64_t)row * hc_dim * sizeof(float),
+                                   hc_dim * sizeof(float));
+    logits = ds4_metal_tensor_view(g->spec_logits,
+                                   (uint64_t)row * vocab_dim * sizeof(float),
+                                   vocab_dim * sizeof(float));
+    bool ok = row_hc && logits;
+
+    if (ok) ok = ds4_metal_rms_norm_plain_tensor(g->flat_hc,
+                                                 row_hc,
+                                                 (uint32_t)hc_dim,
+                                                 DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_metal_matmul_f16_tensor(g->output_pre,
+                                             model->map,
+                                             model->size,
+                                             weights->output_hc_fn->abs_offset,
+                                             hc_dim,
+                                             DS4_N_HC,
+                                             g->flat_hc,
+                                             1) != 0;
+    if (ok) ok = ds4_metal_output_hc_weights_tensor(g->output_weights,
+                                                    g->output_pre,
+                                                    model->map,
+                                                    model->size,
+                                                    weights->output_hc_scale->abs_offset,
+                                                    weights->output_hc_base->abs_offset,
+                                                    DS4_N_HC,
+                                                    DS4_HC_EPS) != 0;
+    if (ok) ok = ds4_metal_hc_weighted_sum_tensor(g->output_embd,
+                                                  row_hc,
+                                                  g->output_weights,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+    if (ok) ok = ds4_metal_rms_norm_weight_tensor(g->output_norm,
+                                                  g->output_embd,
+                                                  model->map,
+                                                  model->size,
+                                                  weights->output_norm->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_metal_matmul_q8_0_tensor(logits,
+                                              model->map,
+                                              model->size,
+                                              weights->output->abs_offset,
+                                              DS4_N_EMBD,
+                                              vocab_dim,
+                                              g->output_norm,
+                                              1) != 0;
+
+    ds4_metal_tensor_free(logits);
+    ds4_metal_tensor_free(row_hc);
+    return ok;
+}
+
 static bool metal_graph_matmul_plain_tensor(
         ds4_metal_tensor       *out,
         const ds4_model        *model,
@@ -11032,7 +11100,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                               pos0);
             }
         } else {
-            const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+            const bool aligned_chunk =
+                !g->spec_verify_mode && (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
             if (aligned_chunk) {
                 const uint32_t comp_before = g->layer_n_comp[il];
                 const uint32_t comp_chunk = n_tokens / ratio;
@@ -11338,7 +11407,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
             } else {
-                const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+                const bool aligned_chunk =
+                    !g->spec_verify_mode && (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
                 if (aligned_chunk) {
                     const uint32_t index_before = g->layer_n_index_comp[il];
                     const uint32_t index_chunk = n_tokens / ratio;
@@ -12846,6 +12916,15 @@ static bool metal_graph_prefill_chunked(
                                              progress_ud);
 }
 
+typedef struct {
+    double upload_sec;
+    double layer_sec;
+    double head_sec;
+    double top_read_sec;
+    double logits_read_sec;
+    double total_sec;
+} ds4_verify_suffix_profile;
+
 /* Layer-major speculative target verifier for tiny MTP suffixes.
  *
  * This is the first production-shaped verifier attempt: unlike repeated decode
@@ -12865,12 +12944,15 @@ static bool metal_graph_verify_suffix_tops(
         uint32_t               n_tokens,
         bool                   capture_prefix1,
         int                   *row_tops,
-        float                 *row_logits) {
+        float                 *row_logits,
+        ds4_verify_suffix_profile *profile) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
-    if (top_rows && !row_tops) return false;
+    const bool want_tops = top_rows != 0 && row_tops != NULL;
+    if (profile) memset(profile, 0, sizeof(*profile));
 
+    const double t0 = profile ? now_sec() : 0.0;
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                          g->prefill_tokens,
@@ -12879,11 +12961,16 @@ static bool metal_graph_verify_suffix_tops(
                                                          prompt,
                                                          start,
                                                          n_tokens);
+    const double t_upload_done = profile ? now_sec() : 0.0;
+    if (profile) profile->upload_sec = t_upload_done - t0;
     if (!ok) return false;
 
     const bool saved_capture = g->spec_capture_prefix1;
+    const bool saved_verify_mode = g->spec_verify_mode;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
+    g->spec_verify_mode = true;
 
+    const double t_layers0 = profile ? now_sec() : 0.0;
     ok = ds4_metal_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = metal_graph_encode_layer_batch(g,
@@ -12895,37 +12982,62 @@ static bool metal_graph_verify_suffix_tops(
     }
     if (ok) ok = ds4_metal_end_commands() != 0;
     else (void)ds4_metal_synchronize();
+    const double t_layers_done = profile ? now_sec() : 0.0;
+    if (profile) profile->layer_sec = t_layers_done - t_layers0;
     g->spec_capture_prefix1 = saved_capture;
+    g->spec_verify_mode = saved_verify_mode;
     if (!ok) return false;
 
+    const double t_head0 = profile ? now_sec() : 0.0;
     ok = ds4_metal_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_output_head_batch(g,
+    if (ok) {
+        if (want_tops || row_logits || getenv("DS4_MTP_SPEED_FULL_HEAD") != NULL) {
+            ok = metal_graph_encode_output_head_batch(g,
                                                       model,
                                                       weights,
                                                       n_tokens,
                                                       weights->output->dim[1]);
+        } else {
+            ok = metal_graph_encode_output_head_batch_final(g,
+                                                            model,
+                                                            weights,
+                                                            n_tokens,
+                                                            weights->output->dim[1]);
+        }
+    }
     if (ok) {
-        if (top_rows) {
+        if (want_tops) {
             ok = ds4_metal_indexer_topk_tensor(g->comp_selected,
                                                g->spec_logits,
                                                DS4_N_VOCAB,
-                                               1,
-                                               top_rows) != 0;
+                                               top_rows,
+                                               1) != 0;
         }
     }
     if (ok) ok = ds4_metal_end_commands() != 0;
     else (void)ds4_metal_synchronize();
-    if (ok && top_rows) {
+    const double t_head_done = profile ? now_sec() : 0.0;
+    if (profile) profile->head_sec = t_head_done - t_head0;
+    const double t_top_read0 = profile ? now_sec() : 0.0;
+    if (ok && want_tops) {
         ok = ds4_metal_tensor_read(g->comp_selected,
                                    0,
                                    row_tops,
                                    (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
     }
+    const double t_top_read_done = profile ? now_sec() : 0.0;
+    if (profile) profile->top_read_sec = t_top_read_done - t_top_read0;
+    const double t_logits_read0 = profile ? now_sec() : 0.0;
     if (ok && row_logits) {
         ok = ds4_metal_tensor_read(g->spec_logits,
                                    0,
                                    row_logits,
                                    (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
+    }
+    const double t_logits_read_done = profile ? now_sec() : 0.0;
+    if (profile) {
+        profile->logits_read_sec = t_logits_read_done - t_logits_read0;
+        profile->total_sec = t_logits_read_done - t0;
     }
     return ok;
 }
@@ -13053,7 +13165,7 @@ static bool metal_graph_verify_decode2_exact(
         }
     }
 
-    if (ok) {
+    if (ok && *top0 == token1) {
         g->cur_hc = cur1;
         ok = ds4_metal_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -13075,6 +13187,113 @@ static bool metal_graph_verify_decode2_exact(
     ds4_metal_tensor_free(next0);
     ds4_metal_tensor_free(cur1);
     ds4_metal_tensor_free(cur0);
+    return ok;
+}
+
+static bool metal_graph_verify_decode_exact_n(
+        ds4_metal_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const int             *tokens,
+        uint32_t               n_tokens,
+        uint32_t               start,
+        int                   *row_tops,
+        float                 *last_logits) {
+    if (!g || !tokens || n_tokens == 0 || n_tokens > 4 || !last_logits || g->raw_cap == 0) {
+        return false;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_metal_tensor *cur[4] = { NULL, NULL, NULL, NULL };
+    ds4_metal_tensor *next[4] = { NULL, NULL, NULL, NULL };
+    bool ok = true;
+    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+        cur[t] = metal_graph_tensor_row_view(g->batch_cur_hc, t, hc_dim);
+        next[t] = metal_graph_tensor_row_view(g->batch_next_hc, t, hc_dim);
+        ok = cur[t] != NULL && next[t] != NULL;
+    }
+
+    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+        ok = ds4_metal_embed_token_hc_tensor(cur[t],
+                                             model->map,
+                                             model->size,
+                                             weights->token_embd->abs_offset,
+                                             (uint32_t)weights->token_embd->dim[1],
+                                             (uint32_t)tokens[t],
+                                             DS4_N_EMBD,
+                                             DS4_N_HC) != 0;
+    }
+
+    ds4_metal_tensor *saved_cur = g->cur_hc;
+    ds4_metal_tensor *saved_after = g->after_ffn_hc;
+    const bool saved_capture = g->spec_capture_prefix1;
+    g->spec_capture_prefix1 = false;
+
+    if (ok) ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        for (uint32_t t = 0; ok && t < n_tokens; t++) {
+            const uint32_t pos = start + t;
+            g->cur_hc = cur[t];
+            g->after_ffn_hc = next[t];
+            ok = metal_graph_encode_decode_layer(g,
+                                                 model,
+                                                 &weights->layer[il],
+                                                 il,
+                                                 pos,
+                                                 g->layer_raw_cache[il],
+                                                 g->raw_cap,
+                                                 pos % g->raw_cap,
+                                                 metal_graph_raw_span_for_batch(g, pos, 1),
+                                                 tokens[t]);
+        }
+        for (uint32_t t = 0; ok && t < n_tokens; t++) {
+            ds4_metal_tensor *tmp = cur[t];
+            cur[t] = next[t];
+            next[t] = tmp;
+        }
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+
+    g->cur_hc = saved_cur;
+    g->after_ffn_hc = saved_after;
+    g->spec_capture_prefix1 = saved_capture;
+
+    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+        g->cur_hc = cur[t];
+        ok = ds4_metal_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        if (ok && t + 1u < n_tokens && row_tops) {
+            ok = ds4_metal_indexer_topk_tensor(g->comp_selected,
+                                               g->logits,
+                                               DS4_N_VOCAB,
+                                               1,
+                                               1) != 0;
+        }
+        if (ok) ok = ds4_metal_end_commands() != 0;
+        else (void)ds4_metal_synchronize();
+        g->cur_hc = saved_cur;
+        if (ok && t + 1u < n_tokens && row_tops) {
+            ok = ds4_metal_tensor_read(g->comp_selected,
+                                       0,
+                                       &row_tops[t],
+                                       sizeof(row_tops[t])) != 0;
+        }
+        if (ok && t + 1u == n_tokens) {
+            ok = ds4_metal_tensor_read(g->logits,
+                                       0,
+                                       last_logits,
+                                       (uint64_t)DS4_N_VOCAB * sizeof(last_logits[0])) != 0;
+        }
+    }
+
+    g->cur_hc = saved_cur;
+    g->after_ffn_hc = saved_after;
+    g->spec_capture_prefix1 = saved_capture;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        ds4_metal_tensor_free(next[t]);
+        ds4_metal_tensor_free(cur[t]);
+    }
     return ok;
 }
 
@@ -13538,6 +13757,7 @@ struct ds4_engine {
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
+    bool mtp_speed;
     bool quality;
     bool metal_ready;
     bool mtp_ready;
@@ -14767,6 +14987,9 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
+#define DS4_MTP_AUDIT_MAX_DEPTH 16
+#define DS4_MTP_AUDIT_MARGIN_BUCKETS 7
+
 struct ds4_session {
     ds4_engine *engine;
 #ifndef DS4_NO_METAL
@@ -14784,7 +15007,256 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    bool mtp_stats_enabled;
+    bool mtp_stats_print;
+    bool mtp_adaptive_enabled;
+    bool mtp_speed_audit_enabled;
+    bool mtp_oracle_reported;
+    bool mtp_draft_margin_valid;
+    float mtp_draft_margin;
+    struct {
+        uint64_t target_eval_count;
+        uint64_t mtp_probe_count;
+        uint64_t mtp_spec_steps;
+        uint64_t mtp_first_miss;
+        uint64_t mtp_margin_skip;
+        uint64_t mtp_micro;
+        uint64_t mtp_decode2;
+        uint64_t mtp_seq;
+        uint64_t mtp_suffix_drafted;
+        uint64_t mtp_suffix_committed;
+        uint64_t mtp_full_accept;
+        uint64_t mtp_partial_accept;
+        uint64_t mtp_adaptive_skip;
+        double target_eval_sec;
+        double mtp_probe_sec;
+        double mtp_draft_sec;
+        double mtp_verify_sec;
+        double mtp_prefix_sec;
+        double mtp_replay_sec;
+        double mtp_total_sec;
+    } mtp_stats;
+    struct {
+        uint64_t steps;
+        uint64_t trusted_tokens;
+        uint64_t exact_matches;
+        uint64_t exact_mismatches;
+        uint64_t steps_with_mismatch;
+        uint64_t steps_without_mismatch;
+        uint64_t tokens_before_first_mismatch_sum;
+        uint64_t position_total[DS4_MTP_AUDIT_MAX_DEPTH];
+        uint64_t position_match[DS4_MTP_AUDIT_MAX_DEPTH];
+        uint64_t depth_total[DS4_MTP_AUDIT_MAX_DEPTH + 1];
+        uint64_t depth_match[DS4_MTP_AUDIT_MAX_DEPTH + 1];
+        uint64_t target_margin_total[DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        uint64_t target_margin_match[DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        uint64_t mtp_margin_total[DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        uint64_t mtp_margin_match[DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        double exact_audit_sec;
+    } mtp_speed_audit;
+    int mtp_probe_skip;
 };
+
+typedef enum ds4_mtp_stats_path {
+    DS4_MTP_STATS_FIRST_MISS,
+    DS4_MTP_STATS_MARGIN_SKIP,
+    DS4_MTP_STATS_MICRO,
+    DS4_MTP_STATS_DECODE2,
+    DS4_MTP_STATS_SEQ,
+} ds4_mtp_stats_path;
+
+static void ds4_mtp_stats_record_step(ds4_session *s,
+                                      ds4_mtp_stats_path path,
+                                      int drafted,
+                                      int committed,
+                                      double draft_sec,
+                                      double verify_sec,
+                                      double prefix_sec,
+                                      double replay_sec,
+                                      double total_sec) {
+    if (!s || !s->mtp_stats_enabled) return;
+    s->mtp_stats.mtp_spec_steps++;
+    if (drafted > 0) s->mtp_stats.mtp_suffix_drafted += (uint64_t)drafted;
+    if (committed > 0) s->mtp_stats.mtp_suffix_committed += (uint64_t)committed;
+    if (drafted > 0 && committed == drafted) s->mtp_stats.mtp_full_accept++;
+    else if (committed > 0) s->mtp_stats.mtp_partial_accept++;
+    s->mtp_stats.mtp_draft_sec += draft_sec;
+    s->mtp_stats.mtp_verify_sec += verify_sec;
+    s->mtp_stats.mtp_prefix_sec += prefix_sec;
+    s->mtp_stats.mtp_replay_sec += replay_sec;
+    s->mtp_stats.mtp_total_sec += total_sec;
+    switch (path) {
+    case DS4_MTP_STATS_FIRST_MISS:  s->mtp_stats.mtp_first_miss++; break;
+    case DS4_MTP_STATS_MARGIN_SKIP: s->mtp_stats.mtp_margin_skip++; break;
+    case DS4_MTP_STATS_MICRO:       s->mtp_stats.mtp_micro++; break;
+    case DS4_MTP_STATS_DECODE2:     s->mtp_stats.mtp_decode2++; break;
+    case DS4_MTP_STATS_SEQ:         s->mtp_stats.mtp_seq++; break;
+    }
+    if (s->mtp_adaptive_enabled) {
+        const double target_avg =
+            s->mtp_stats.target_eval_count ?
+            s->mtp_stats.target_eval_sec / (double)s->mtp_stats.target_eval_count : 0.0;
+        const double probe_avg =
+            s->mtp_stats.mtp_probe_count ?
+            s->mtp_stats.mtp_probe_sec / (double)s->mtp_stats.mtp_probe_count : 0.0;
+        const double saved = (double)committed * target_avg;
+        const double extra = total_sec + probe_avg;
+        if (committed <= 0 || committed < drafted || saved <= extra) {
+            if (s->mtp_probe_skip < 2) s->mtp_probe_skip = 2;
+        }
+    }
+}
+
+static void ds4_mtp_stats_print(ds4_session *s) {
+    if (!s || !s->mtp_stats_print) return;
+    const double target_ms =
+        s->mtp_stats.target_eval_count ?
+        (s->mtp_stats.target_eval_sec * 1000.0) / (double)s->mtp_stats.target_eval_count : 0.0;
+    const double probe_ms =
+        s->mtp_stats.mtp_probe_count ?
+        (s->mtp_stats.mtp_probe_sec * 1000.0) / (double)s->mtp_stats.mtp_probe_count : 0.0;
+    const double saved_ms = (double)s->mtp_stats.mtp_suffix_committed * target_ms;
+    const double extra_ms = (s->mtp_stats.mtp_probe_sec +
+                             s->mtp_stats.mtp_total_sec) * 1000.0;
+    fprintf(stderr,
+            "ds4: mtp stats target_eval=%llu target_avg=%.3fms "
+            "probe=%llu probe_avg=%.3fms steps=%llu first_miss=%llu "
+            "margin_skip=%llu micro=%llu decode2=%llu seq=%llu "
+            "drafted=%llu committed=%llu full=%llu partial=%llu adaptive_skip=%llu "
+            "draft=%.3fms verify=%.3fms prefix=%.3fms replay=%.3fms total=%.3fms "
+            "est_saved=%.3fms est_extra=%.3fms est_net=%.3fms\n",
+            (unsigned long long)s->mtp_stats.target_eval_count,
+            target_ms,
+            (unsigned long long)s->mtp_stats.mtp_probe_count,
+            probe_ms,
+            (unsigned long long)s->mtp_stats.mtp_spec_steps,
+            (unsigned long long)s->mtp_stats.mtp_first_miss,
+            (unsigned long long)s->mtp_stats.mtp_margin_skip,
+            (unsigned long long)s->mtp_stats.mtp_micro,
+            (unsigned long long)s->mtp_stats.mtp_decode2,
+            (unsigned long long)s->mtp_stats.mtp_seq,
+            (unsigned long long)s->mtp_stats.mtp_suffix_drafted,
+            (unsigned long long)s->mtp_stats.mtp_suffix_committed,
+            (unsigned long long)s->mtp_stats.mtp_full_accept,
+            (unsigned long long)s->mtp_stats.mtp_partial_accept,
+            (unsigned long long)s->mtp_stats.mtp_adaptive_skip,
+            s->mtp_stats.mtp_draft_sec * 1000.0,
+            s->mtp_stats.mtp_verify_sec * 1000.0,
+            s->mtp_stats.mtp_prefix_sec * 1000.0,
+            s->mtp_stats.mtp_replay_sec * 1000.0,
+            s->mtp_stats.mtp_total_sec * 1000.0,
+            saved_ms,
+            extra_ms,
+            saved_ms - extra_ms);
+}
+
+static int ds4_mtp_audit_margin_bucket(float margin) {
+    if (!isfinite(margin) || margin < 0.0f) return 0;
+    if (margin < 0.1f) return 1;
+    if (margin < 0.5f) return 2;
+    if (margin < 1.0f) return 3;
+    if (margin < 2.0f) return 4;
+    if (margin < 5.0f) return 5;
+    return 6;
+}
+
+static const char *ds4_mtp_audit_margin_bucket_name(int bucket) {
+    switch (bucket) {
+    case 0: return "unknown";
+    case 1: return "<0.1";
+    case 2: return "<0.5";
+    case 3: return "<1";
+    case 4: return "<2";
+    case 5: return "<5";
+    default: return ">=5";
+    }
+}
+
+static void ds4_mtp_speed_audit_print(ds4_session *s) {
+    if (!s || !s->mtp_speed_audit_enabled || s->mtp_speed_audit.steps == 0) return;
+    const uint64_t checked =
+        s->mtp_speed_audit.exact_matches + s->mtp_speed_audit.exact_mismatches;
+    const double match_rate =
+        checked ? (100.0 * (double)s->mtp_speed_audit.exact_matches) / (double)checked : 0.0;
+    const double avg_before_mismatch =
+        s->mtp_speed_audit.steps ?
+        (double)s->mtp_speed_audit.tokens_before_first_mismatch_sum /
+            (double)s->mtp_speed_audit.steps : 0.0;
+    const double avg_audit_ms =
+        s->mtp_speed_audit.steps ?
+        (s->mtp_speed_audit.exact_audit_sec * 1000.0) /
+            (double)s->mtp_speed_audit.steps : 0.0;
+    fprintf(stderr,
+            "ds4: mtp speed-audit steps=%llu trusted=%llu exact_match=%llu/%llu "
+            "match_rate=%.2f%% mismatch_steps=%llu clean_steps=%llu "
+            "avg_tokens_before_mismatch=%.2f exact_audit=%.3fms avg=%.3fms\n",
+            (unsigned long long)s->mtp_speed_audit.steps,
+            (unsigned long long)s->mtp_speed_audit.trusted_tokens,
+            (unsigned long long)s->mtp_speed_audit.exact_matches,
+            (unsigned long long)checked,
+            match_rate,
+            (unsigned long long)s->mtp_speed_audit.steps_with_mismatch,
+            (unsigned long long)s->mtp_speed_audit.steps_without_mismatch,
+            avg_before_mismatch,
+            s->mtp_speed_audit.exact_audit_sec * 1000.0,
+            avg_audit_ms);
+
+    fprintf(stderr, "ds4: mtp speed-audit by-position");
+    for (int i = 0; i < DS4_MTP_AUDIT_MAX_DEPTH; i++) {
+        const uint64_t total = s->mtp_speed_audit.position_total[i];
+        if (!total) continue;
+        const uint64_t match = s->mtp_speed_audit.position_match[i];
+        fprintf(stderr,
+                " p%d=%llu/%llu(%.1f%%)",
+                i,
+                (unsigned long long)match,
+                (unsigned long long)total,
+                (100.0 * (double)match) / (double)total);
+    }
+    fputc('\n', stderr);
+
+    fprintf(stderr, "ds4: mtp speed-audit by-draft-depth");
+    for (int i = 1; i <= DS4_MTP_AUDIT_MAX_DEPTH; i++) {
+        const uint64_t total = s->mtp_speed_audit.depth_total[i];
+        if (!total) continue;
+        const uint64_t match = s->mtp_speed_audit.depth_match[i];
+        fprintf(stderr,
+                " d%d=%llu/%llu(%.1f%%)",
+                i,
+                (unsigned long long)match,
+                (unsigned long long)total,
+                (100.0 * (double)match) / (double)total);
+    }
+    fputc('\n', stderr);
+
+    fprintf(stderr, "ds4: mtp speed-audit by-target-margin");
+    for (int i = 0; i < DS4_MTP_AUDIT_MARGIN_BUCKETS; i++) {
+        const uint64_t total = s->mtp_speed_audit.target_margin_total[i];
+        if (!total) continue;
+        const uint64_t match = s->mtp_speed_audit.target_margin_match[i];
+        fprintf(stderr,
+                " %s=%llu/%llu(%.1f%%)",
+                ds4_mtp_audit_margin_bucket_name(i),
+                (unsigned long long)match,
+                (unsigned long long)total,
+                (100.0 * (double)match) / (double)total);
+    }
+    fputc('\n', stderr);
+
+    fprintf(stderr, "ds4: mtp speed-audit by-mtp-margin");
+    for (int i = 0; i < DS4_MTP_AUDIT_MARGIN_BUCKETS; i++) {
+        const uint64_t total = s->mtp_speed_audit.mtp_margin_total[i];
+        if (!total) continue;
+        const uint64_t match = s->mtp_speed_audit.mtp_margin_match[i];
+        fprintf(stderr,
+                " %s=%llu/%llu(%.1f%%)",
+                ds4_mtp_audit_margin_bucket_name(i),
+                (unsigned long long)match,
+                (unsigned long long)total,
+                (100.0 * (double)match) / (double)total);
+    }
+    fputc('\n', stderr);
+}
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -15104,6 +15576,259 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
     if (ok) ok = ds4_metal_end_commands() != 0;
     else (void)ds4_metal_synchronize();
     return ok;
+}
+
+static void ds4_mtp_speed_audit_check(ds4_session *s,
+                                      const int *drafts,
+                                      const float *mtp_margins,
+                                      int draft_n,
+                                      int trusted_n,
+                                      uint32_t start) {
+    if (!s || !s->engine || !s->mtp_speed_audit_enabled) return;
+    if (!drafts || draft_n <= 0 || trusted_n <= 0) return;
+    if (trusted_n > draft_n) trusted_n = draft_n;
+    if (trusted_n > DS4_MTP_AUDIT_MAX_DEPTH) trusted_n = DS4_MTP_AUDIT_MAX_DEPTH;
+
+    ds4_engine *e = s->engine;
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    const int saved_len = s->checkpoint.len;
+    const bool saved_valid = s->checkpoint_valid;
+    bool ok = spec_frontier_snapshot(&frontier, s);
+    if (!ok) {
+        fprintf(stderr, "ds4: mtp speed-audit failed to snapshot state\n");
+        return;
+    }
+
+    float *saved_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    memcpy(saved_logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+
+    const double t0 = now_sec();
+    uint64_t matches = 0;
+    int first_mismatch = -1;
+    int checked_n = 0;
+    const int depth_bucket =
+        draft_n <= DS4_MTP_AUDIT_MAX_DEPTH ? draft_n : DS4_MTP_AUDIT_MAX_DEPTH;
+
+    for (int i = 0; i < trusted_n; i++) {
+        int target_top = -1;
+        float target_v0 = 0.0f;
+        float target_v1 = 0.0f;
+        logits_top2(s->logits,
+                    DS4_N_VOCAB,
+                    &target_top,
+                    &target_v0,
+                    NULL,
+                    &target_v1);
+        const bool match = target_top == drafts[i];
+        if (match) matches++;
+        else if (first_mismatch < 0) first_mismatch = i;
+        checked_n++;
+
+        s->mtp_speed_audit.position_total[i]++;
+        if (match) s->mtp_speed_audit.position_match[i]++;
+        s->mtp_speed_audit.depth_total[depth_bucket]++;
+        if (match) s->mtp_speed_audit.depth_match[depth_bucket]++;
+
+        const int target_bucket =
+            ds4_mtp_audit_margin_bucket(target_v0 - target_v1);
+        s->mtp_speed_audit.target_margin_total[target_bucket]++;
+        if (match) s->mtp_speed_audit.target_margin_match[target_bucket]++;
+
+        const float mtp_margin = mtp_margins ? mtp_margins[i] : -1.0f;
+        const int mtp_bucket = ds4_mtp_audit_margin_bucket(mtp_margin);
+        s->mtp_speed_audit.mtp_margin_total[mtp_bucket]++;
+        if (match) s->mtp_speed_audit.mtp_margin_match[mtp_bucket]++;
+
+        if (i + 1 < trusted_n) {
+            ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                drafts[i],
+                                                start + (uint32_t)i,
+                                                s->logits);
+            if (!ok) {
+                fprintf(stderr, "ds4: mtp speed-audit exact decode failed at position %d\n", i);
+                break;
+            }
+            token_vec_push(&s->checkpoint, drafts[i]);
+        }
+    }
+
+    s->mtp_speed_audit.steps++;
+    s->mtp_speed_audit.trusted_tokens += (uint64_t)checked_n;
+    s->mtp_speed_audit.exact_matches += matches;
+    s->mtp_speed_audit.exact_mismatches += (uint64_t)checked_n - matches;
+    if (first_mismatch >= 0) {
+        s->mtp_speed_audit.steps_with_mismatch++;
+        s->mtp_speed_audit.tokens_before_first_mismatch_sum += (uint64_t)first_mismatch;
+    } else {
+        s->mtp_speed_audit.steps_without_mismatch++;
+        s->mtp_speed_audit.tokens_before_first_mismatch_sum += (uint64_t)checked_n;
+    }
+    s->mtp_speed_audit.exact_audit_sec += now_sec() - t0;
+
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (!spec_frontier_restore(&frontier, s)) {
+        fprintf(stderr, "ds4: mtp speed-audit failed to restore state\n");
+        s->checkpoint_valid = false;
+    }
+    spec_frontier_free(&frontier);
+    free(saved_logits);
+}
+
+static void ds4_mtp_oracle_check_decode2(ds4_session *s,
+                                         const int drafts[2],
+                                         uint32_t start) {
+    if (!s || !s->engine || s->mtp_oracle_reported) return;
+    ds4_engine *e = s->engine;
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    const int saved_len = s->checkpoint.len;
+    bool ok = spec_frontier_snapshot(&frontier, s);
+    if (!ok) {
+        fprintf(stderr, "ds4: mtp oracle failed to snapshot state\n");
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    float *saved_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    float *seq0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(seq0_logits[0]));
+    float *seq1_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(seq1_logits[0]));
+    float *exact0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(exact0_logits[0]));
+    float *exact1_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(exact1_logits[0]));
+    float *fast_logits = xmalloc((size_t)2 * DS4_N_VOCAB * sizeof(fast_logits[0]));
+    memcpy(saved_logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+
+    bool seq_ok = false, exact_ok = false, fast_ok = false;
+    int exact_top0 = -1;
+    int fast_tops[2] = { -1, -1 };
+    int seq_top0 = -1, seq_top1 = -1;
+    int exact_logits_top0 = -1, exact_logits_top1 = -1;
+    int fast_logits_top0 = -1, fast_logits_top1 = -1;
+
+    seq_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            drafts[0],
+                                            start,
+                                            seq0_logits);
+    if (seq_ok) {
+        seq_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                drafts[1],
+                                                start + 1u,
+                                                seq1_logits);
+    }
+    if (seq_ok) {
+        seq_top0 = sample_argmax(seq0_logits, DS4_N_VOCAB);
+        seq_top1 = sample_argmax(seq1_logits, DS4_N_VOCAB);
+    }
+
+    s->checkpoint.len = saved_len;
+    ok = spec_frontier_restore(&frontier, s);
+    if (!ok) goto done;
+
+    exact_ok = metal_graph_verify_decode2_exact(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                drafts[0],
+                                                drafts[1],
+                                                start,
+                                                &exact_top0,
+                                                exact0_logits,
+                                                exact1_logits);
+    if (exact_ok) {
+        exact_logits_top0 = sample_argmax(exact0_logits, DS4_N_VOCAB);
+        if (exact_top0 == drafts[1]) {
+            exact_logits_top1 = sample_argmax(exact1_logits, DS4_N_VOCAB);
+        }
+    }
+
+    s->checkpoint.len = saved_len;
+    ok = spec_frontier_restore(&frontier, s);
+    if (!ok) goto done;
+
+    token_vec_push(&s->checkpoint, drafts[0]);
+    token_vec_push(&s->checkpoint, drafts[1]);
+    fast_ok = metal_graph_verify_suffix_tops(&s->graph,
+                                             &e->model,
+                                             &e->weights,
+                                             &s->checkpoint,
+                                             start,
+                                             2,
+                                             true,
+                                             fast_tops,
+                                             fast_logits,
+                                             NULL);
+    s->checkpoint.len = saved_len;
+    if (fast_ok) {
+        fast_logits_top0 = sample_argmax(fast_logits, DS4_N_VOCAB);
+        fast_logits_top1 = sample_argmax(fast_logits + DS4_N_VOCAB, DS4_N_VOCAB);
+    }
+
+    ok = spec_frontier_restore(&frontier, s);
+    if (!ok) goto done;
+
+    const bool diverged =
+        !seq_ok || !exact_ok || !fast_ok ||
+        exact_top0 != seq_top0 ||
+        exact_logits_top0 != seq_top0 ||
+        fast_tops[0] != seq_top0 ||
+        fast_logits_top0 != seq_top0 ||
+        fast_logits_top1 != seq_top1 ||
+        (exact_top0 == drafts[1] && exact_logits_top1 != seq_top1);
+    if (diverged || getenv("DS4_MTP_ORACLE_LOG_OK") != NULL) {
+        const float fast0_delta = fast_ok && seq_ok ?
+            max_abs_diff(seq0_logits, fast_logits, DS4_N_VOCAB) : -1.0f;
+        const float fast1_delta = fast_ok && seq_ok ?
+            max_abs_diff(seq1_logits, fast_logits + DS4_N_VOCAB, DS4_N_VOCAB) : -1.0f;
+        const float exact0_delta = exact_ok && seq_ok ?
+            max_abs_diff(seq0_logits, exact0_logits, DS4_N_VOCAB) : -1.0f;
+        const float exact1_delta = (exact_ok && seq_ok && exact_top0 == drafts[1]) ?
+            max_abs_diff(seq1_logits, exact1_logits, DS4_N_VOCAB) : -1.0f;
+        fprintf(stderr,
+                "ds4: mtp oracle %s pos=%u draft0=%d draft1=%d "
+                "seq_ok=%d exact_ok=%d fast_ok=%d "
+                "seq_top0=%d exact_top0=%d exact_logits_top0=%d fast_top0=%d fast_logits_top0=%d "
+                "seq_top1=%d exact_logits_top1=%d fast_logits_top1=%d "
+                "delta_exact0=%.6g delta_exact1=%.6g delta_fast0=%.6g delta_fast1=%.6g\n",
+                diverged ? "divergence" : "ok",
+                start,
+                drafts[0],
+                drafts[1],
+                seq_ok ? 1 : 0,
+                exact_ok ? 1 : 0,
+                fast_ok ? 1 : 0,
+                seq_top0,
+                exact_top0,
+                exact_logits_top0,
+                fast_tops[0],
+                fast_logits_top0,
+                seq_top1,
+                exact_logits_top1,
+                fast_logits_top1,
+                exact0_delta,
+                exact1_delta,
+                fast0_delta,
+                fast1_delta);
+        if (diverged) s->mtp_oracle_reported = true;
+    }
+
+done:
+    s->checkpoint.len = saved_len;
+    (void)spec_frontier_restore(&frontier, s);
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    free(fast_logits);
+    free(exact1_logits);
+    free(exact0_logits);
+    free(seq1_logits);
+    free(seq0_logits);
+    free(saved_logits);
+    spec_frontier_free(&frontier);
 }
 #endif
 
@@ -15449,6 +16174,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+    s->mtp_draft_margin_valid = false;
     g->mtp_n_raw = 0;
     return 0;
 #endif
@@ -15682,9 +16408,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    e->mtp_speed = opt->mtp_speed;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
+    if (e->mtp_speed) {
+        fprintf(stderr,
+                "ds4: warning: --mtp-speed is approximate and may change or degrade output; "
+                "use --mtp without --mtp-speed for correctness-preserving generation\n");
+    }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
@@ -15783,6 +16515,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->engine = e;
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
+    s->mtp_stats_print = getenv("DS4_MTP_STATS") != NULL;
+    s->mtp_adaptive_enabled = getenv("DS4_MTP_ADAPTIVE") != NULL;
+    s->mtp_speed_audit_enabled = getenv("DS4_MTP_SPEED_AUDIT") != NULL;
+    s->mtp_stats_enabled =
+        s->mtp_stats_print || s->mtp_adaptive_enabled || s->mtp_speed_audit_enabled;
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
@@ -15803,6 +16540,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    ds4_mtp_stats_print(s);
+    ds4_mtp_speed_audit_print(s);
 #ifndef DS4_NO_METAL
     metal_graph_free(&s->graph);
 #endif
@@ -15833,6 +16572,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
         for (int i = 0; i < current; i++) token_vec_push(&p->session->checkpoint, p->prompt->v[i]);
         p->session->checkpoint_valid = true;
         p->session->mtp_draft_valid = false;
+        p->session->mtp_draft_margin_valid = false;
     }
     if (p->user) p->user(p->user_ud, event, current, total);
 }
@@ -15870,6 +16610,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ds4_tokens_starts_with(prompt, &s->checkpoint))
     {
         s->mtp_draft_valid = false;
+        s->mtp_draft_margin_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
         if (suffix > 0 && (uint32_t)suffix >= resume_min) {
@@ -15941,6 +16682,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     ds4_tokens_copy(&s->checkpoint, prompt);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+    s->mtp_draft_margin_valid = false;
     s->graph.mtp_n_raw = 0;
     return 0;
 #endif
@@ -16010,8 +16752,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
+    bool mtp_skip_probe = false;
+    if (probe_mtp && s->mtp_adaptive_enabled && s->mtp_probe_skip > 0) {
+        mtp_skip_probe = true;
+        s->mtp_probe_skip--;
+        if (s->mtp_stats_enabled) s->mtp_stats.mtp_adaptive_skip++;
+    }
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
+        !mtp_skip_probe &&
         (e->mtp_draft_tokens > 1 || mtp_probe_log);
     if (probe_mtp && s->mtp_draft_valid) {
         if (mtp_probe_log) {
@@ -16025,7 +16774,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                     (unsigned long long)s->mtp_probe_total);
         }
         s->mtp_draft_valid = false;
+        s->mtp_draft_margin_valid = false;
     }
+    const bool mtp_collect_stats = s->mtp_stats_enabled;
+    const double target_t0 = mtp_collect_stats ? now_sec() : 0.0;
     if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
                                         (uint32_t)s->checkpoint.len,
@@ -16035,19 +16787,44 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         s->checkpoint_valid = false;
         return 1;
     }
+    if (mtp_collect_stats) {
+        s->mtp_stats.target_eval_count++;
+        s->mtp_stats.target_eval_sec += now_sec() - target_t0;
+    }
     token_vec_push(&s->checkpoint, token);
     if (mtp_should_draft) {
         int mtp_top = -1;
-        if (metal_graph_eval_mtp_draft(&s->graph,
-                                       &e->model,
-                                       &e->weights,
-                                       &e->mtp_model,
-                                       &e->mtp_weights,
-                                       token,
-                                       (uint32_t)(s->checkpoint.len - 1),
-                                       getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
-                                       &mtp_top)) {
-            s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+        const bool mtp_probe_need_logits =
+            getenv("DS4_MTP_FULL_LOGITS") != NULL ||
+            getenv("DS4_MTP_MIN_MARGIN") != NULL ||
+            s->mtp_speed_audit_enabled ||
+            (e->mtp_speed && e->mtp_margin > 0.0f);
+        const double probe_t0 = mtp_collect_stats ? now_sec() : 0.0;
+        bool probe_ok = metal_graph_eval_mtp_draft(&s->graph,
+                                                   &e->model,
+                                                   &e->weights,
+                                                   &e->mtp_model,
+                                                   &e->mtp_weights,
+                                                   token,
+                                                   (uint32_t)(s->checkpoint.len - 1),
+                                                   mtp_probe_need_logits ? s->mtp_logits : NULL,
+                                                   &mtp_top);
+        if (mtp_collect_stats) {
+            s->mtp_stats.mtp_probe_count++;
+            s->mtp_stats.mtp_probe_sec += now_sec() - probe_t0;
+        }
+        if (probe_ok) {
+            if (mtp_probe_need_logits) {
+                int top0 = -1;
+                float v0 = 0.0f, v1 = 0.0f;
+                logits_top2(s->mtp_logits, DS4_N_VOCAB, &top0, &v0, NULL, &v1);
+                s->mtp_draft_token = mtp_top >= 0 ? mtp_top : top0;
+                s->mtp_draft_margin = v0 - v1;
+                s->mtp_draft_margin_valid = true;
+            } else {
+                s->mtp_draft_token = mtp_top;
+                s->mtp_draft_margin_valid = false;
+            }
             s->mtp_draft_valid = true;
         } else if (getenv("DS4_MTP_PROBE")) {
             fprintf(stderr, "ds4: mtp probe draft failed\n");
@@ -16059,6 +16836,412 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
+}
+
+int ds4_session_eval_no_mtp_probe(ds4_session *s, int token, char *err, size_t errlen) {
+    return ds4_session_eval_internal(s, token, false, err, errlen);
+}
+
+#ifndef DS4_NO_METAL
+static void ds4_verify_profile_add(ds4_verify_suffix_profile *dst,
+                                   const ds4_verify_suffix_profile *src) {
+    dst->upload_sec += src->upload_sec;
+    dst->layer_sec += src->layer_sec;
+    dst->head_sec += src->head_sec;
+    dst->top_read_sec += src->top_read_sec;
+    dst->logits_read_sec += src->logits_read_sec;
+    dst->total_sec += src->total_sec;
+}
+#endif
+
+int ds4_session_mtp_verify_scale(ds4_session *s, int max_n, int repeats, char *err, size_t errlen) {
+#ifdef DS4_NO_METAL
+    (void)s; (void)max_n; (void)repeats;
+    snprintf(err, errlen, "Metal support is not compiled in");
+    return 1;
+#else
+    if (!s || !s->engine) {
+        snprintf(err, errlen, "invalid session");
+        return 1;
+    }
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0) {
+        snprintf(err, errlen, "session must be synced before verifier scaling");
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    ds4_metal_graph *g = &s->graph;
+    if (!g->spec_logits) {
+        snprintf(err, errlen, "--mtp-verify-scale requires --mtp so speculative scratch buffers are allocated");
+        return 1;
+    }
+    if (max_n <= 0) max_n = 8;
+    if (max_n > 8) max_n = 8;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (room <= 1) {
+        snprintf(err, errlen, "not enough context room for verifier scaling");
+        return 1;
+    }
+    if (max_n > room - 1) max_n = room - 1;
+    if (max_n <= 0) {
+        snprintf(err, errlen, "not enough context room for verifier scaling");
+        return 1;
+    }
+    if (repeats <= 0) repeats = 3;
+    if (repeats > 1000) repeats = 1000;
+
+    const int saved_len = s->checkpoint.len;
+    int rc = 0;
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    float *saved_logits = NULL;
+    float *full_logits = NULL;
+    double *seq_cum = NULL;
+    int *drafts = NULL;
+    float *seq_margin = NULL;
+    int *seq_runner = NULL;
+    bool have_frontier = false;
+
+#define DS4_VERIFY_SCALE_FAIL(...) do { \
+        if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
+        rc = 1; \
+        goto done; \
+    } while (0)
+
+    const int seq_cap = max_n < room - 1 ? max_n + 1 : max_n;
+
+    saved_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    full_logits = xmalloc((size_t)max_n * DS4_N_VOCAB * sizeof(full_logits[0]));
+    seq_cum = xcalloc((size_t)seq_cap + 1u, sizeof(seq_cum[0]));
+    drafts = xmalloc((size_t)seq_cap * sizeof(drafts[0]));
+    seq_margin = xmalloc((size_t)seq_cap * sizeof(seq_margin[0]));
+    seq_runner = xmalloc((size_t)seq_cap * sizeof(seq_runner[0]));
+    memcpy(saved_logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+
+    have_frontier = spec_frontier_snapshot(&frontier, s);
+    if (!have_frontier) DS4_VERIFY_SCALE_FAIL("failed to snapshot verifier baseline");
+
+    for (int i = 0; i < seq_cap; i++) {
+        int top0 = -1, top1 = -1;
+        float v0 = 0.0f, v1 = 0.0f;
+        logits_top2(s->logits, DS4_N_VOCAB, &top0, &v0, &top1, &v1);
+        drafts[i] = top0;
+        seq_runner[i] = top1;
+        seq_margin[i] = v0 - v1;
+        const double t0 = now_sec();
+        bool ok = metal_graph_eval_token_raw_swa(g,
+                                                 &e->model,
+                                                 &e->weights,
+                                                 drafts[i],
+                                                 (uint32_t)(saved_len + i),
+                                                 s->logits);
+        const double t1 = now_sec();
+        if (!ok) DS4_VERIFY_SCALE_FAIL("Metal decode failed while collecting verifier-scale baseline");
+        seq_cum[i + 1] = seq_cum[i] + (t1 - t0);
+        token_vec_push(&s->checkpoint, drafts[i]);
+    }
+
+    s->checkpoint.len = saved_len;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (!spec_frontier_restore(&frontier, s)) {
+        DS4_VERIFY_SCALE_FAIL("failed to restore verifier baseline");
+    }
+
+    fprintf(stderr,
+            "ds4: mtp verify-scale pos=%d max_n=%d repeats=%d target_avg=%.3fms drafts=",
+            saved_len,
+            max_n,
+            repeats,
+            seq_cum[max_n] > 0.0 ? (seq_cum[max_n] * 1000.0) / (double)max_n : 0.0);
+    for (int i = 0; i < max_n; i++) {
+        fprintf(stderr, "%s%d", i ? "," : "", drafts[i]);
+    }
+    if (seq_cap > max_n) fprintf(stderr, " next=%d", drafts[max_n]);
+    fputc('\n', stderr);
+
+    const int ns[] = { 1, 2, 3, 4, 8 };
+    for (size_t ni = 0; ni < sizeof(ns) / sizeof(ns[0]); ni++) {
+        const int n = ns[ni];
+        if (n > max_n) continue;
+        ds4_verify_suffix_profile sum;
+        memset(&sum, 0, sizeof(sum));
+        double final_row_sec = 0.0;
+        double full_logits_read_sec = 0.0;
+        double restore_sec = 0.0;
+        double prefix_sec = 0.0;
+        double exact2_sec = 0.0;
+        int exact2_mismatches = 0;
+        int top_mismatches = 0;
+        int top_checks = (n > 1 ? n - 1 : 0) * repeats;
+        int final_mismatches = 0;
+        int final_checks = n < seq_cap ? repeats : 0;
+        int state_next_mismatches = 0;
+        int state_next_checks = (n > 2 && n + 1 < seq_cap) ? repeats : 0;
+
+        for (int r = 0; r < repeats; r++) {
+            int row_tops[16];
+            memset(row_tops, 0, sizeof(row_tops));
+
+            s->checkpoint.len = saved_len;
+            memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+            const double restore0 = now_sec();
+            bool ok = spec_frontier_restore(&frontier, s);
+            const double restore1 = now_sec();
+            restore_sec += restore1 - restore0;
+            if (!ok) DS4_VERIFY_SCALE_FAIL("failed to restore verifier baseline");
+
+            if (n == 2) {
+                int exact_top0 = -1;
+                const double exact0 = now_sec();
+                ok = metal_graph_verify_decode2_exact(g,
+                                                       &e->model,
+                                                       &e->weights,
+                                                       drafts[0],
+                                                       drafts[1],
+                                                       (uint32_t)saved_len,
+                                                       &exact_top0,
+                                                       full_logits,
+                                                       full_logits + DS4_N_VOCAB);
+                const double exact1 = now_sec();
+                exact2_sec += exact1 - exact0;
+                if (!ok) DS4_VERIFY_SCALE_FAIL("exact N=2 verifier failed");
+                if (exact_top0 != drafts[1]) exact2_mismatches++;
+                s->checkpoint.len = saved_len;
+                memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+                if (!spec_frontier_restore(&frontier, s)) {
+                    DS4_VERIFY_SCALE_FAIL("failed to restore verifier baseline");
+                }
+            }
+
+            for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+
+            ds4_verify_suffix_profile prof;
+            memset(&prof, 0, sizeof(prof));
+            ok = metal_graph_verify_suffix_tops(g,
+                                                &e->model,
+                                                &e->weights,
+                                                &s->checkpoint,
+                                                (uint32_t)saved_len,
+                                                (uint32_t)n,
+                                                n == 2,
+                                                row_tops,
+                                                NULL,
+                                                &prof);
+            if (!ok) DS4_VERIFY_SCALE_FAIL("suffix verifier failed at n=%d", n);
+            ds4_verify_profile_add(&sum, &prof);
+
+            for (int i = 1; i < n; i++) {
+                if (row_tops[i - 1] != drafts[i]) top_mismatches++;
+            }
+
+            const double final0 = now_sec();
+            ok = metal_graph_read_spec_logits_row(g, (uint32_t)(n - 1), s->logits);
+            const double final1 = now_sec();
+            final_row_sec += final1 - final0;
+            if (!ok) DS4_VERIFY_SCALE_FAIL("failed to read final verifier logits at n=%d", n);
+            if (n < seq_cap) {
+                const int final_top = sample_argmax(s->logits, DS4_N_VOCAB);
+                if (final_top != drafts[n]) {
+                    final_mismatches++;
+                    if (getenv("DS4_MTP_VERIFY_SCALE_DETAIL") != NULL && r == 0) {
+                        int fast_top0 = -1, fast_top1 = -1;
+                        float fast_v0 = 0.0f, fast_v1 = 0.0f;
+                        logits_top2(s->logits,
+                                    DS4_N_VOCAB,
+                                    &fast_top0,
+                                    &fast_v0,
+                                    &fast_top1,
+                                    &fast_v1);
+                        const int expected = drafts[n];
+                        const float candidate_logit =
+                            expected >= 0 && expected < (int)DS4_N_VOCAB ?
+                            s->logits[expected] : DS4_NEG_INF;
+                        fprintf(stderr,
+                                "ds4: mtp verify-detail n=%d final_row=%d next_pos=%d "
+                                "expected_next=%d fast_top=%d fast_runner=%d exact_runner=%d "
+                                "exact_margin=%.6f fast_margin=%.6f "
+                                "candidate_gap=%.6f candidate_logit=%.6f fast_top_logit=%.6f\n",
+                                n,
+                                n - 1,
+                                saved_len + n,
+                                expected,
+                                fast_top0,
+                                fast_top1,
+                                seq_runner[n],
+                                seq_margin[n],
+                                fast_v0 - fast_v1,
+                                candidate_logit - fast_v0,
+                                candidate_logit,
+                                fast_v0);
+                    }
+                }
+            }
+
+            const double full0 = now_sec();
+            ok = ds4_metal_tensor_read(g->spec_logits,
+                                       0,
+                                       full_logits,
+                                       (uint64_t)n * DS4_N_VOCAB * sizeof(full_logits[0])) != 0;
+            const double full1 = now_sec();
+            full_logits_read_sec += full1 - full0;
+            if (!ok) DS4_VERIFY_SCALE_FAIL("failed to read verifier logits at n=%d", n);
+
+            if (getenv("DS4_MTP_VERIFY_SCALE_DETAIL") != NULL && r == 0) {
+                for (int i = 1; i < n; i++) {
+                    if (row_tops[i - 1] == drafts[i]) continue;
+                    const float *row =
+                        full_logits + (size_t)(i - 1) * (size_t)DS4_N_VOCAB;
+                    int fast_top0 = -1, fast_top1 = -1;
+                    float fast_v0 = 0.0f, fast_v1 = 0.0f;
+                    logits_top2(row,
+                                DS4_N_VOCAB,
+                                &fast_top0,
+                                &fast_v0,
+                                &fast_top1,
+                                &fast_v1);
+                    const int expected = drafts[i];
+                    const float candidate_logit =
+                        expected >= 0 && expected < (int)DS4_N_VOCAB ?
+                        row[expected] : DS4_NEG_INF;
+                    fprintf(stderr,
+                            "ds4: mtp verify-detail n=%d row=%d pos=%d "
+                            "expected=%d fast_top=%d fast_runner=%d exact_runner=%d "
+                            "exact_margin=%.6f fast_margin=%.6f "
+                            "candidate_gap=%.6f candidate_logit=%.6f fast_top_logit=%.6f\n",
+                            n,
+                            i - 1,
+                            saved_len + i,
+                            expected,
+                            fast_top0,
+                            fast_top1,
+                            seq_runner[i],
+                            seq_margin[i],
+                            fast_v0 - fast_v1,
+                            candidate_logit - fast_v0,
+                            candidate_logit,
+                            fast_v0);
+                }
+            }
+
+            if (n > 2 && n + 1 < seq_cap) {
+                ok = metal_graph_eval_token_raw_swa(g,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    drafts[n],
+                                                    (uint32_t)(saved_len + n),
+                                                    s->logits);
+                if (!ok) DS4_VERIFY_SCALE_FAIL("state-next decode failed at n=%d", n);
+                const int state_next_top = sample_argmax(s->logits, DS4_N_VOCAB);
+                if (state_next_top != drafts[n + 1]) {
+                    state_next_mismatches++;
+                    if (getenv("DS4_MTP_VERIFY_SCALE_DETAIL") != NULL && r == 0) {
+                        int state_top0 = -1, state_top1 = -1;
+                        float state_v0 = 0.0f, state_v1 = 0.0f;
+                        logits_top2(s->logits,
+                                    DS4_N_VOCAB,
+                                    &state_top0,
+                                    &state_v0,
+                                    &state_top1,
+                                    &state_v1);
+                        const int expected = drafts[n + 1];
+                        const float candidate_logit =
+                            expected >= 0 && expected < (int)DS4_N_VOCAB ?
+                            s->logits[expected] : DS4_NEG_INF;
+                        fprintf(stderr,
+                                "ds4: mtp verify-detail n=%d state_next_pos=%d "
+                                "fed=%d expected_next=%d state_top=%d state_runner=%d exact_runner=%d "
+                                "exact_margin=%.6f state_margin=%.6f "
+                                "candidate_gap=%.6f candidate_logit=%.6f state_top_logit=%.6f\n",
+                                n,
+                                saved_len + n + 1,
+                                drafts[n],
+                                expected,
+                                state_top0,
+                                state_top1,
+                                seq_runner[n + 1],
+                                seq_margin[n + 1],
+                                state_v0 - state_v1,
+                                candidate_logit - state_v0,
+                                candidate_logit,
+                                state_v0);
+                    }
+                }
+            }
+
+            if (n == 2) {
+                const double prefix0 = now_sec();
+                ok = spec_frontier_commit_prefix1(s);
+                const double prefix1 = now_sec();
+                prefix_sec += prefix1 - prefix0;
+                if (!ok) DS4_VERIFY_SCALE_FAIL("failed to commit prefix1 state");
+            }
+        }
+
+        const double inv = 1000.0 / (double)repeats;
+        const double seq_ms = seq_cum[n] * 1000.0;
+        const double verify_top_ms = sum.total_sec * inv;
+        const double final_row_ms = final_row_sec * inv;
+        const double verify_plus_final_ms = verify_top_ms + final_row_ms;
+        const double budget_1p5_ms = seq_ms / 1.5;
+        const double speedup_ceiling =
+            verify_plus_final_ms > 0.0 ? seq_ms / verify_plus_final_ms : 0.0;
+        fprintf(stderr,
+                "ds4: mtp verify-scale n=%d seq=%.3fms budget_1p5=%.3fms "
+                "verify_top=%.3fms upload=%.3fms layers=%.3fms head_topk=%.3fms "
+                "top_read=%.3fms final_row=%.3fms full_logits_read=%.3fms "
+                "prefix1=%.3fms restore=%.3fms speedup_ceiling=%.3fx "
+                "top_mismatch=%d/%d final_mismatch=%d/%d state_next_mismatch=%d/%d\n",
+                n,
+                seq_ms,
+                budget_1p5_ms,
+                verify_top_ms,
+                sum.upload_sec * inv,
+                sum.layer_sec * inv,
+                sum.head_sec * inv,
+                sum.top_read_sec * inv,
+                final_row_ms,
+                full_logits_read_sec * inv,
+                prefix_sec * inv,
+                restore_sec * inv,
+                speedup_ceiling,
+                top_mismatches,
+                top_checks,
+                final_mismatches,
+                final_checks,
+                state_next_mismatches,
+                state_next_checks);
+        if (n == 2) {
+            const double exact2_ms = exact2_sec * inv;
+            fprintf(stderr,
+                    "ds4: mtp verify-scale exact2 n=2 seq=%.3fms exact2=%.3fms "
+                    "speedup_ceiling=%.3fx top_mismatch=%d/%d\n",
+                    seq_ms,
+                    exact2_ms,
+                    exact2_ms > 0.0 ? seq_ms / exact2_ms : 0.0,
+                    exact2_mismatches,
+                    repeats);
+        }
+    }
+
+done:
+    s->checkpoint.len = saved_len;
+    if (saved_logits) memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (have_frontier && !spec_frontier_restore(&frontier, s) && rc == 0) {
+        if (err && errlen) snprintf(err, errlen, "failed to restore verifier baseline");
+        rc = 1;
+    }
+    s->checkpoint_valid = rc == 0;
+    s->mtp_draft_valid = false;
+    s->mtp_draft_margin_valid = false;
+    spec_frontier_free(&frontier);
+    free(seq_runner);
+    free(seq_margin);
+    free(drafts);
+    free(seq_cum);
+    free(full_logits);
+    free(saved_logits);
+#undef DS4_VERIFY_SCALE_FAIL
+    return rc;
+#endif
 }
 
 /* Speculative decode state machine:
@@ -16097,6 +17280,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
     int draft_cap = e->mtp_draft_tokens;
+    if (!e->mtp_speed) {
+        const int exact_cap = getenv("DS4_MTP_EXACT_DEEP") != NULL ? 4 : 2;
+        if (draft_cap > exact_cap) draft_cap = exact_cap;
+    }
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
     if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
     int room = s->ctx_size - s->checkpoint.len;
@@ -16104,10 +17291,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (draft_cap <= 0) return n_accept;
 
     int drafts[16];
+    float mtp_margins[16];
+    for (int i = 0; i < 16; i++) mtp_margins[i] = -1.0f;
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
+    if (s->mtp_draft_margin_valid) mtp_margins[0] = s->mtp_draft_margin;
     s->mtp_draft_valid = false;
-    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
+    s->mtp_draft_margin_valid = false;
+    const bool strict_mtp =
+        !e->mtp_speed || e->quality || getenv("DS4_MTP_STRICT") != NULL;
     float mtp_margin_threshold = e->mtp_margin;
     const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
     if (mtp_margin_env && mtp_margin_env[0]) {
@@ -16116,11 +17308,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
     }
     const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
+    const bool mtp_collect_stats = s->mtp_stats_enabled;
+    const bool mtp_measure = mtp_timing || mtp_collect_stats;
     const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
     const bool mtp_need_logits = mtp_conf_log ||
+        s->mtp_speed_audit_enabled ||
         getenv("DS4_MTP_FULL_LOGITS") != NULL ||
         (!strict_mtp && mtp_margin_threshold > 0.0f);
-    const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
+    const double mtp_t0 = mtp_measure ? now_sec() : 0.0;
     double mtp_t_after_draft = mtp_t0;
     float mtp_last_margin = 0.0f;
     int mtp_last_top0 = -1, mtp_last_top1 = -1;
@@ -16129,13 +17324,48 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * The first proposed token is verified for free: ds4_session_eval() just
      * produced the base logits for the committed prefix.  If MTP disagrees at
      * this point there is no suffix to verify, so the exact behavior is to emit
-     * only first_token and skip all speculative work.
+     * only first_token and skip all speculative work.  Speed mode is explicitly
+     * approximate and may trust this first MTP token as part of the drafted suffix.
      */
-    if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
+    const bool speed_validate_all = getenv("DS4_MTP_SPEED_VALIDATE") != NULL;
+    bool speed_trust_first =
+        !strict_mtp &&
+        !speed_validate_all &&
+        getenv("DS4_MTP_SPEED_VALIDATE_FIRST") == NULL;
+    const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
+    bool speed_trust_suffix =
+        !strict_mtp &&
+        !exact_replay_debug &&
+        !speed_validate_all &&
+        getenv("DS4_MTP_SPEED_VALIDATE_SUFFIX") == NULL;
+    if (speed_trust_first &&
+        mtp_margin_threshold > 0.0f &&
+        mtp_margins[0] >= 0.0f &&
+        mtp_margins[0] < mtp_margin_threshold)
+    {
+        speed_trust_first = false;
+    }
+    const int target_first = sample_argmax(s->logits, DS4_N_VOCAB);
+    if (target_first != drafts[0] && !speed_trust_first) {
+        ds4_mtp_stats_record_step(s,
+                                  DS4_MTP_STATS_FIRST_MISS,
+                                  1,
+                                  0,
+                                  0.0,
+                                  0.0,
+                                  0.0,
+                                  0.0,
+                                  mtp_measure ? now_sec() - mtp_t0 : 0.0);
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
         }
         return n_accept;
+    }
+    if (target_first != drafts[0] && getenv("DS4_MTP_SPEC_LOG")) {
+        fprintf(stderr,
+                "ds4: mtp speed trusting first draft=%d target=%d\n",
+                drafts[0],
+                target_first);
     }
     if (drafts[0] == eos_token) draft_cap = 1;
     const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
@@ -16169,7 +17399,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         {
             return n_accept;
         }
-        drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+        if (mtp_need_logits) {
+            int top0 = -1, top1 = -1;
+            float v0 = 0.0f, v1 = 0.0f;
+            logits_top2(s->mtp_logits, DS4_N_VOCAB, &top0, &v0, &top1, &v1);
+            drafts[draft_n] = mtp_top >= 0 ? mtp_top : top0;
+            mtp_margins[draft_n] = v0 - v1;
+            mtp_last_top0 = top0;
+            mtp_last_top1 = top1;
+            mtp_last_margin = v0 - v1;
+        } else {
+            drafts[draft_n] = mtp_top;
+        }
         if (drafts[draft_n] == eos_token) {
             draft_n++;
             break;
@@ -16180,7 +17421,19 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_last_top0, &v0, &mtp_last_top1, &v1);
         mtp_last_margin = v0 - v1;
     }
-    if (mtp_timing) mtp_t_after_draft = now_sec();
+    if (mtp_measure) mtp_t_after_draft = now_sec();
+    if (draft_n == 2 && getenv("DS4_MTP_ORACLE") != NULL) {
+        ds4_mtp_oracle_check_decode2(s, drafts, (uint32_t)s->checkpoint.len);
+    }
+
+    if (speed_trust_suffix && mtp_margin_threshold > 0.0f) {
+        for (int i = 0; i < draft_n; i++) {
+            if (mtp_margins[i] < mtp_margin_threshold) {
+                speed_trust_suffix = false;
+                break;
+            }
+        }
+    }
 
     if (!strict_mtp && draft_n == 2 && mtp_margin_threshold > 0.0f) {
         if (!mtp_conf_log) {
@@ -16191,7 +17444,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (mtp_last_margin < mtp_margin_threshold) {
             float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
             const int start = s->checkpoint.len;
-            const double verify_t0 = mtp_timing ? now_sec() : 0.0;
+            const double verify_t0 = mtp_measure ? now_sec() : 0.0;
             bool ok = metal_graph_eval_token_raw_swa(&s->graph,
                                                      &e->model,
                                                      &e->weights,
@@ -16211,8 +17464,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             DS4_MTP_KEEP_ACCEPTED(1);
+            const double done = mtp_measure ? now_sec() : 0.0;
+            ds4_mtp_stats_record_step(s,
+                                      DS4_MTP_STATS_MARGIN_SKIP,
+                                      2,
+                                      1,
+                                      mtp_t_after_draft - mtp_t0,
+                                      done - verify_t0,
+                                      0.0,
+                                      0.0,
+                                      done - mtp_t0);
             if (mtp_timing) {
-                const double done = now_sec();
                 fprintf(stderr,
                         "ds4: mtp timing margin-skip drafted=2 committed=1 margin=%.3f threshold=%.3f draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
                         mtp_last_margin,
@@ -16225,13 +17487,137 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
     }
 
+    if (s->mtp_speed_audit_enabled && !strict_mtp) {
+        const int audit_trusted =
+            speed_trust_suffix ? draft_n : (speed_trust_first ? 1 : 0);
+        if (audit_trusted > 0) {
+            ds4_mtp_speed_audit_check(s,
+                                      drafts,
+                                      mtp_margins,
+                                      draft_n,
+                                      audit_trusted,
+                                      (uint32_t)s->checkpoint.len);
+        }
+    }
+
+    const bool use_decode_n_exact =
+        draft_n > 2 && strict_mtp && getenv("DS4_MTP_BATCH_VERIFY") == NULL;
+    if (use_decode_n_exact) {
+        ds4_spec_frontier frontier;
+        memset(&frontier, 0, sizeof(frontier));
+        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        int row_tops[4] = { -1, -1, -1, -1 };
+        const int start = s->checkpoint.len;
+        const double snapshot_t0 = mtp_measure ? now_sec() : 0.0;
+        bool have_frontier = spec_frontier_snapshot(&frontier, s);
+        const double snapshot_done = mtp_measure ? now_sec() : 0.0;
+        bool ok = have_frontier;
+        if (ok) {
+            ok = metal_graph_verify_decode_exact_n(&s->graph,
+                                                   &e->model,
+                                                   &e->weights,
+                                                   drafts,
+                                                   (uint32_t)draft_n,
+                                                   (uint32_t)start,
+                                                   row_tops,
+                                                   row_logits);
+        }
+        const double verify_done = mtp_measure ? now_sec() : 0.0;
+        if (ok) {
+            int commit_drafts = 1;
+            for (int i = 1; i < draft_n; i++) {
+                if (row_tops[i - 1] != drafts[i]) break;
+                commit_drafts++;
+            }
+
+            if (commit_drafts == draft_n) {
+                memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+                    token_vec_push(&s->checkpoint, drafts[i]);
+                    accepted[n_accept++] = drafts[i];
+                    if (drafts[i] == eos_token) break;
+                }
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                DS4_MTP_KEEP_ACCEPTED(draft_n);
+                const double done = mtp_measure ? now_sec() : 0.0;
+                ds4_mtp_stats_record_step(s,
+                                          DS4_MTP_STATS_MICRO,
+                                          draft_n,
+                                          draft_n,
+                                          mtp_t_after_draft - mtp_t0,
+                                          verify_done - snapshot_done,
+                                          snapshot_done - snapshot_t0,
+                                          0.0,
+                                          done - mtp_t0);
+                if (mtp_timing) {
+                    fprintf(stderr,
+                            "ds4: mtp timing exactn drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                            draft_n,
+                            draft_n,
+                            (mtp_t_after_draft - mtp_t0) * 1000.0,
+                            (snapshot_done - snapshot_t0) * 1000.0,
+                            (verify_done - snapshot_done) * 1000.0,
+                            (done - mtp_t0) * 1000.0);
+                }
+                spec_frontier_free(&frontier);
+                free(row_logits);
+                return n_accept;
+            }
+
+            s->checkpoint.len = start;
+            ok = spec_frontier_restore(&frontier, s);
+            if (ok) {
+                int replayed = 0;
+                for (; replayed < commit_drafts && ok; replayed++) {
+                    ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                        &e->model,
+                                                        &e->weights,
+                                                        drafts[replayed],
+                                                        (uint32_t)(start + replayed),
+                                                        row_logits);
+                    if (ok) token_vec_push(&s->checkpoint, drafts[replayed]);
+                }
+                if (ok) {
+                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                    for (int i = 0; i < replayed && n_accept < accepted_cap; i++) {
+                        accepted[n_accept++] = drafts[i];
+                        if (drafts[i] == eos_token) break;
+                    }
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    DS4_MTP_KEEP_ACCEPTED(replayed);
+                    const double replay_done = mtp_measure ? now_sec() : 0.0;
+                    ds4_mtp_stats_record_step(s,
+                                              DS4_MTP_STATS_MICRO,
+                                              draft_n,
+                                              replayed,
+                                              mtp_t_after_draft - mtp_t0,
+                                              verify_done - snapshot_done,
+                                              snapshot_done - snapshot_t0,
+                                              replay_done - verify_done,
+                                              replay_done - mtp_t0);
+                    spec_frontier_free(&frontier);
+                    free(row_logits);
+                    return n_accept;
+                }
+            }
+        }
+        s->checkpoint.len = start;
+        if (have_frontier) (void)spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        free(row_logits);
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr, "ds4: mtp exactn verifier failed, falling back to sequential\n");
+        }
+    }
+
     /*
-     * The useful N=2 verifier is the tiny batch path: it verifies two target
+     * The speed-mode N=2 verifier is the tiny batch path: it verifies two target
      * positions in one layer-major pass and commits prefix-1 directly on a
-     * partial accept.  Like the rest of the non-quality Metal path, it may pick
-     * a different greedy token when batched reductions perturb nearly-tied
-     * logits.  --quality / DS4_MTP_STRICT selects the exact decode verifier,
-     * which preserves the one-token target stream but is not a speed win.
+     * partial accept.  It can pick a different greedy token when batched
+     * reductions perturb nearly-tied logits, so the normal --mtp path uses the
+     * exact decode verifier unless --mtp-speed opts into this approximate path.
      */
     const bool use_decode2_exact =
         draft_n == 2 && strict_mtp && getenv("DS4_MTP_BATCH_VERIFY") == NULL;
@@ -16242,9 +17628,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
         const int start = s->checkpoint.len;
         int row0_top = -1;
-        const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
+        const double snapshot_t0 = mtp_measure ? now_sec() : 0.0;
         bool have_frontier = spec_frontier_snapshot(&frontier, s);
-        const double snapshot_done = mtp_timing ? now_sec() : 0.0;
+        const double snapshot_done = mtp_measure ? now_sec() : 0.0;
         bool ok = have_frontier;
         if (ok) {
             ok = metal_graph_verify_decode2_exact(&s->graph,
@@ -16257,7 +17643,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                   row0_logits,
                                                   row_logits);
         }
-        const double verify_done = mtp_timing ? now_sec() : 0.0;
+        const double verify_done = mtp_measure ? now_sec() : 0.0;
         if (ok && row0_top == drafts[1]) {
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
             token_vec_push(&s->checkpoint, drafts[0]);
@@ -16267,13 +17653,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             DS4_MTP_KEEP_ACCEPTED(2);
+            const double done = mtp_measure ? now_sec() : 0.0;
+            ds4_mtp_stats_record_step(s,
+                                      DS4_MTP_STATS_DECODE2,
+                                      2,
+                                      2,
+                                      mtp_t_after_draft - mtp_t0,
+                                      verify_done - snapshot_done,
+                                      snapshot_done - snapshot_t0,
+                                      0.0,
+                                      done - mtp_t0);
             if (mtp_timing) {
                 fprintf(stderr,
                         "ds4: mtp timing decode2 drafted=2 committed=2 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
                         (mtp_t_after_draft - mtp_t0) * 1000.0,
                         (snapshot_done - snapshot_t0) * 1000.0,
                         (verify_done - snapshot_done) * 1000.0,
-                        (now_sec() - mtp_t0) * 1000.0);
+                        (done - mtp_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
             free(row0_logits);
@@ -16292,8 +17688,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             DS4_MTP_KEEP_ACCEPTED(1);
+            const double replay_done = mtp_measure ? now_sec() : 0.0;
+            ds4_mtp_stats_record_step(s,
+                                      DS4_MTP_STATS_DECODE2,
+                                      2,
+                                      1,
+                                      mtp_t_after_draft - mtp_t0,
+                                      verify_done - snapshot_done,
+                                      snapshot_done - snapshot_t0,
+                                      replay_done - verify_done,
+                                      replay_done - mtp_t0);
             if (mtp_timing) {
-                const double replay_done = now_sec();
                 fprintf(stderr,
                         "ds4: mtp timing decode2 drafted=2 committed=1 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms\n",
                         (mtp_t_after_draft - mtp_t0) * 1000.0,
@@ -16327,29 +17732,30 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
         const int start = s->checkpoint.len;
         /*
-         * The production MTP depth is two.  Prefix-1 capture makes partial
-         * accepts cheap, but it copies per-layer compressor frontiers even when
-         * both draft tokens are accepted.  Full accepts are the path that makes
-         * MTP worthwhile, so by default we snapshot before the verifier and
-         * replay one token on partial accept.  DS4_MTP_CAPTURE_PREFIX1 restores
-         * the older no-replay partial path for measurement.
+         * Strict mode keeps a rollback point and only commits the verifier-matched
+         * prefix.  Explicit speed mode is an approximate generation mode: unless
+         * DS4_MTP_SPEED_VALIDATE is set, it trusts the drafted suffix after the
+         * batch verifier has built continuation state for those tokens.
          */
         const bool capture_prefix1 =
-            draft_n == 2 && (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
-        const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
+            !speed_trust_suffix &&
+            draft_n == 2 &&
+            (getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL ||
+             (!strict_mtp && getenv("DS4_MTP_NO_CAPTURE_PREFIX1") == NULL));
         const bool snapshot_required =
-            draft_n > 2 ||
-            (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
-            getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL;
+            getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL ||
+            (!speed_trust_suffix &&
+             (draft_n > 2 ||
+              (draft_n == 2 && (!capture_prefix1 || exact_replay_debug))));
         bool have_frontier = false;
         bool ok = true;
         bool verifier_may_have_mutated = false;
-        const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
+        const double snapshot_t0 = mtp_measure ? now_sec() : 0.0;
         if (snapshot_required) {
             have_frontier = spec_frontier_snapshot(&frontier, s);
             ok = have_frontier;
         }
-        const double snapshot_done = mtp_timing ? now_sec() : 0.0;
+        const double snapshot_done = mtp_measure ? now_sec() : 0.0;
         if (ok) {
             for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
             verifier_may_have_mutated = true;
@@ -16360,26 +17766,37 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 (uint32_t)start,
                                                 (uint32_t)draft_n,
                                                 capture_prefix1,
-                                                row_tops,
+                                                speed_trust_suffix ? NULL : row_tops,
+                                                NULL,
                                                 NULL);
         }
-        const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
+        const double micro_verify_done = mtp_measure ? now_sec() : 0.0;
         if (ok) {
             int commit_drafts = 1;
-            for (int i = 1; i < draft_n; i++) {
-                if (row_tops[i - 1] != drafts[i]) break;
-                commit_drafts++;
+            int verifier_mismatches = 0;
+            if (speed_trust_suffix) {
+                commit_drafts = draft_n;
+            } else {
+                for (int i = 1; i < draft_n; i++) {
+                    if (row_tops[i - 1] != drafts[i]) {
+                        verifier_mismatches++;
+                        break;
+                    }
+                    commit_drafts++;
+                }
             }
             if (mtp_conf_log) {
                 fprintf(stderr,
-                        "ds4: mtp conf drafted=%d committed=%d mtp_top=%d runner=%d margin=%.6f target_next=%d draft_next=%d\n",
+                        "ds4: mtp conf drafted=%d committed=%d mtp_top=%d runner=%d margin=%.6f target_next=%d draft_next=%d trust=%d mismatches=%d\n",
                         draft_n,
                         commit_drafts,
                         mtp_last_top0,
                         mtp_last_top1,
                         mtp_last_margin,
-                        draft_n > 1 ? row_tops[0] : -1,
-                        draft_n > 1 ? drafts[1] : -1);
+                        (!speed_trust_suffix && draft_n > 1) ? row_tops[0] : -1,
+                        draft_n > 1 ? drafts[1] : -1,
+                        speed_trust_suffix,
+                        verifier_mismatches);
             }
             if (exact_replay_debug && have_frontier) {
                 s->checkpoint.len = start;
@@ -16404,6 +17821,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         s->checkpoint_valid = true;
                         s->mtp_draft_valid = false;
                         DS4_MTP_KEEP_ACCEPTED(replayed);
+                        const double replay_done = mtp_measure ? now_sec() : 0.0;
+                        ds4_mtp_stats_record_step(s,
+                                                  DS4_MTP_STATS_MICRO,
+                                                  draft_n,
+                                                  replayed,
+                                                  mtp_t_after_draft - mtp_t0,
+                                                  micro_verify_done - snapshot_done,
+                                                  snapshot_done - snapshot_t0,
+                                                  replay_done - micro_verify_done,
+                                                  replay_done - mtp_t0);
                         spec_frontier_free(&frontier);
                         free(row_logits);
                         free(row_tops);
@@ -16425,15 +17852,27 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     DS4_MTP_KEEP_ACCEPTED(draft_n);
+                    const double done = mtp_measure ? now_sec() : 0.0;
+                    ds4_mtp_stats_record_step(s,
+                                              DS4_MTP_STATS_MICRO,
+                                              draft_n,
+                                              draft_n,
+                                              mtp_t_after_draft - mtp_t0,
+                                              micro_verify_done - snapshot_done,
+                                              snapshot_done - snapshot_t0,
+                                              0.0,
+                                              done - mtp_t0);
                     if (mtp_timing) {
                         fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms trust=%d mismatches=%d\n",
                                 draft_n,
                                 draft_n,
                                 (mtp_t_after_draft - mtp_t0) * 1000.0,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
-                                (now_sec() - mtp_t0) * 1000.0);
+                                (done - mtp_t0) * 1000.0,
+                                speed_trust_suffix,
+                                verifier_mismatches);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
@@ -16444,9 +17883,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 
             if (draft_n == 2 && commit_drafts == 1 && capture_prefix1) {
                 s->checkpoint.len = start;
-                const double prefix_t0 = mtp_timing ? now_sec() : 0.0;
+                const double prefix_t0 = mtp_measure ? now_sec() : 0.0;
                 ok = spec_frontier_commit_prefix1(s);
-                const double prefix_done = mtp_timing ? now_sec() : 0.0;
+                const double prefix_done = mtp_measure ? now_sec() : 0.0;
                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
                 if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -16455,6 +17894,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     s->mtp_draft_valid = false;
                     DS4_MTP_KEEP_ACCEPTED(1);
                     token_vec_push(&s->checkpoint, drafts[0]);
+                    const double done = mtp_measure ? now_sec() : 0.0;
+                    ds4_mtp_stats_record_step(s,
+                                              DS4_MTP_STATS_MICRO,
+                                              draft_n,
+                                              commit_drafts,
+                                              mtp_t_after_draft - mtp_t0,
+                                              micro_verify_done - snapshot_done,
+                                              (snapshot_done - snapshot_t0) + (prefix_done - prefix_t0),
+                                              0.0,
+                                              done - mtp_t0);
                     if (mtp_timing) {
                         fprintf(stderr,
                                 "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms noreplay=1\n",
@@ -16464,7 +17913,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (snapshot_done - snapshot_t0) * 1000.0,
                                 (micro_verify_done - snapshot_done) * 1000.0,
                                 (prefix_done - prefix_t0) * 1000.0,
-                                (now_sec() - mtp_t0) * 1000.0);
+                                (done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
@@ -16475,7 +17924,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 s->checkpoint.len = start;
                 ok = have_frontier && spec_frontier_restore(&frontier, s);
             }
-            if (ok && draft_n == 2 && commit_drafts == 1) {
+            if (ok && commit_drafts == 1) {
                 ok = metal_graph_eval_token_raw_swa(&s->graph,
                                                     &e->model,
                                                     &e->weights,
@@ -16489,8 +17938,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     s->mtp_draft_valid = false;
                     DS4_MTP_KEEP_ACCEPTED(1);
                     token_vec_push(&s->checkpoint, drafts[0]);
+                    const double replay_done = mtp_measure ? now_sec() : 0.0;
+                    ds4_mtp_stats_record_step(s,
+                                              DS4_MTP_STATS_MICRO,
+                                              draft_n,
+                                              commit_drafts,
+                                              mtp_t_after_draft - mtp_t0,
+                                              micro_verify_done - snapshot_done,
+                                              snapshot_done - snapshot_t0,
+                                              replay_done - micro_verify_done,
+                                              replay_done - mtp_t0);
                     if (mtp_timing) {
-                        const double replay_done = now_sec();
                         fprintf(stderr,
                                 "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms exact_replay=%.3f ms total=%.3f ms\n",
                                 draft_n,
@@ -16507,6 +17965,57 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     return n_accept;
                 }
             }
+            if (ok && strict_mtp && commit_drafts == 2) {
+                int row0_top = -1;
+                float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
+                ok = metal_graph_verify_decode2_exact(&s->graph,
+                                                      &e->model,
+                                                      &e->weights,
+                                                      drafts[0],
+                                                      drafts[1],
+                                                      (uint32_t)start,
+                                                      &row0_top,
+                                                      row0_logits,
+                                                      row_logits);
+                if (ok && row0_top != drafts[1]) ok = false;
+                if (ok) {
+                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                    token_vec_push(&s->checkpoint, drafts[0]);
+                    token_vec_push(&s->checkpoint, drafts[1]);
+                    accepted[n_accept++] = drafts[0];
+                    if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    DS4_MTP_KEEP_ACCEPTED(2);
+                    const double replay_done = mtp_measure ? now_sec() : 0.0;
+                    ds4_mtp_stats_record_step(s,
+                                              DS4_MTP_STATS_DECODE2,
+                                              draft_n,
+                                              commit_drafts,
+                                              mtp_t_after_draft - mtp_t0,
+                                              micro_verify_done - snapshot_done,
+                                              snapshot_done - snapshot_t0,
+                                              replay_done - micro_verify_done,
+                                              replay_done - mtp_t0);
+                    if (mtp_timing) {
+                        fprintf(stderr,
+                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms exact2_replay=%.3f ms total=%.3f ms\n",
+                                draft_n,
+                                commit_drafts,
+                                (mtp_t_after_draft - mtp_t0) * 1000.0,
+                                (snapshot_done - snapshot_t0) * 1000.0,
+                                (micro_verify_done - snapshot_done) * 1000.0,
+                                (replay_done - micro_verify_done) * 1000.0,
+                                (replay_done - mtp_t0) * 1000.0);
+                    }
+                    free(row0_logits);
+                    spec_frontier_free(&frontier);
+                    free(row_logits);
+                    free(row_tops);
+                    return n_accept;
+                }
+                free(row0_logits);
+            }
             if (ok) {
                 for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
                 ok = metal_graph_verify_suffix_tops(&s->graph,
@@ -16517,6 +18026,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     (uint32_t)commit_drafts,
                                                     false,
                                                     row_tops,
+                                                    NULL,
                                                     NULL);
                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
                                                               (uint32_t)(commit_drafts - 1),
@@ -16530,8 +18040,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     DS4_MTP_KEEP_ACCEPTED(commit_drafts);
+                    const double replay_done = mtp_measure ? now_sec() : 0.0;
+                    ds4_mtp_stats_record_step(s,
+                                              DS4_MTP_STATS_MICRO,
+                                              draft_n,
+                                              commit_drafts,
+                                              mtp_t_after_draft - mtp_t0,
+                                              micro_verify_done - snapshot_done,
+                                              snapshot_done - snapshot_t0,
+                                              replay_done - micro_verify_done,
+                                              replay_done - mtp_t0);
                     if (mtp_timing) {
-                        const double replay_done = now_sec();
                         fprintf(stderr,
                                 "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms replay=%.3f ms total=%.3f ms\n",
                                 draft_n,
@@ -16581,7 +18100,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int verified = 0;
     int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
     bool logits_on_host = true;
-    const double seq_t0 = mtp_timing ? now_sec() : 0.0;
+    const double seq_t0 = mtp_measure ? now_sec() : 0.0;
     for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
         if (target_top != drafts[i]) {
             if (getenv("DS4_MTP_SPEC_LOG")) {
@@ -16628,14 +18147,24 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     (void)logits_on_host;
     DS4_MTP_KEEP_ACCEPTED(verified);
 #undef DS4_MTP_KEEP_ACCEPTED
+    const double seq_done = mtp_measure ? now_sec() : 0.0;
+    ds4_mtp_stats_record_step(s,
+                              DS4_MTP_STATS_SEQ,
+                              draft_n,
+                              verified,
+                              mtp_t_after_draft - mtp_t0,
+                              seq_done - seq_t0,
+                              0.0,
+                              0.0,
+                              seq_done - mtp_t0);
     if (mtp_timing) {
         fprintf(stderr,
                 "ds4: mtp timing seq drafted=%d verified=%d draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
                 draft_n,
                 verified,
                 (mtp_t_after_draft - mtp_t0) * 1000.0,
-                (now_sec() - seq_t0) * 1000.0,
-                (now_sec() - mtp_t0) * 1000.0);
+                (seq_done - seq_t0) * 1000.0,
+                (seq_done - mtp_t0) * 1000.0);
     }
     if (getenv("DS4_MTP_SPEC_LOG")) {
         if (verified == draft_n) {
@@ -16659,6 +18188,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    s->mtp_draft_margin_valid = false;
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
@@ -16666,6 +18196,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+    s->mtp_draft_margin_valid = false;
 }
 
 int ds4_session_pos(ds4_session *s) {

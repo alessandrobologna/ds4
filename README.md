@@ -465,10 +465,11 @@ The file is intentionally written with ordinary `read`/`write` I/O, not
 `mmap`, so restoring cache entries does not add more VM mappings to a process
 that already maps the model.
 
-Tool calls also keep a small exact-DSML replay map keyed by unguessable tool
-IDs, so client JSON history can be rendered back to the exact sampled text. Use
-`--disable-exact-dsml-tool-replay` to disable this and fall back to canonical
-JSON-to-DSML rendering.
+Tool calls also keep a bounded exact-DSML replay map keyed by unguessable tool
+IDs, so client JSON history can be rendered back to the exact sampled text. The
+RAM map keeps up to 100000 IDs by default; tune it with `--tool-memory-max-ids`.
+Use `--disable-exact-dsml-tool-replay` to disable this and fall back to
+canonical JSON-to-DSML rendering.
 
 On disk, a cache file is:
 
@@ -511,6 +512,27 @@ exact DSML block the model sampled. Only mappings whose DSML block is present
 in the rendered cached text are stored. This lets restarted servers render
 later client history byte-for-byte like the original model output, even if the
 client reorders JSON arguments.
+
+The current tool-id map section is:
+
+```text
+0   u8[3]  magic = "KTM"
+3   u8     version = 1
+4   u32    entry count
+
+For each entry:
+0   u32    tool id byte length
+4   u32    sampled DSML byte length
+8   bytes  tool id
+... bytes  exact sampled DSML block
+```
+
+The section is auxiliary replay memory, not model state. A cache hit restores
+the session payload first, then loads the map if present. Before rendering a
+request, the server can also scan cache files for the tool IDs present in the
+client history and load just those mappings, so an exact DSML replay can survive
+server restarts even when the matching KV snapshot is not the one ultimately
+used for the token-prefix hit.
 
 The DS4 session payload starts with thirteen little-endian `u32` fields:
 
@@ -572,6 +594,8 @@ trim 32 tail tokens, and align to 2048-token chunks. The important knobs are:
 - `--kv-cache-continued-interval-tokens`
 - `--kv-cache-boundary-trim-tokens`
 - `--kv-cache-boundary-align-tokens`
+- `--tool-memory-max-ids`
+- `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
 variants if the token prefix matches. Use `--kv-cache-reject-different-quant`

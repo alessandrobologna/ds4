@@ -610,6 +610,16 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
     orders->v[orders->len++] = order;
 }
 
+static void tool_schema_orders_append_move(tool_schema_orders *dst, tool_schema_orders *src) {
+    for (int i = 0; i < src->len; i++) {
+        tool_schema_order order = src->v[i];
+        memset(&src->v[i], 0, sizeof(src->v[i]));
+        tool_schema_orders_push(dst, order);
+    }
+    free(src->v);
+    memset(src, 0, sizeof(*src));
+}
+
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
@@ -3003,6 +3013,8 @@ static bool parse_responses_request(ds4_engine *e, const char *body, int def_tok
     char *instructions = NULL;
     char *tool_schemas = NULL;
     buf loaded_tool_schemas = {0};
+    tool_schema_orders top_tool_orders = {0};
+    tool_schema_orders input_tool_orders = {0};
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -3021,7 +3033,8 @@ static bool parse_responses_request(ds4_engine *e, const char *body, int def_tok
             chat_msgs_free(&msgs);
             buf_free(&loaded_tool_schemas);
             loaded_tool_schemas = (buf){0};
-            if (!parse_responses_input(&p, &msgs, &loaded_tool_schemas, &r->tool_orders)) {
+            tool_schema_orders_free(&input_tool_orders);
+            if (!parse_responses_input(&p, &msgs, &loaded_tool_schemas, &input_tool_orders)) {
                 free(key);
                 goto bad;
             }
@@ -3035,7 +3048,8 @@ static bool parse_responses_request(ds4_engine *e, const char *body, int def_tok
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+            tool_schema_orders_free(&top_tool_orders);
+            if (!parse_tools_value(&p, &tool_schemas, &top_tool_orders)) {
                 free(key);
                 goto bad;
             }
@@ -3130,6 +3144,8 @@ static bool parse_responses_request(ds4_engine *e, const char *body, int def_tok
         free(instructions);
         free(tool_schemas);
         buf_free(&loaded_tool_schemas);
+        tool_schema_orders_free(&top_tool_orders);
+        tool_schema_orders_free(&input_tool_orders);
         request_free(r);
         return false;
     }
@@ -3148,6 +3164,9 @@ static bool parse_responses_request(ds4_engine *e, const char *body, int def_tok
     }
     const char *effective_tool_schemas = combined_tool_schemas.ptr ?
         combined_tool_schemas.ptr : "";
+    tool_schema_orders_free(&r->tool_orders);
+    tool_schema_orders_append_move(&r->tool_orders, &top_tool_orders);
+    tool_schema_orders_append_move(&r->tool_orders, &input_tool_orders);
     r->has_tools = effective_tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -3161,12 +3180,16 @@ static bool parse_responses_request(ds4_engine *e, const char *body, int def_tok
     free(instructions);
     free(tool_schemas);
     buf_free(&loaded_tool_schemas);
+    tool_schema_orders_free(&top_tool_orders);
+    tool_schema_orders_free(&input_tool_orders);
     return true;
 bad:
     chat_msgs_free(&msgs);
     free(instructions);
     free(tool_schemas);
     buf_free(&loaded_tool_schemas);
+    tool_schema_orders_free(&top_tool_orders);
+    tool_schema_orders_free(&input_tool_orders);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
@@ -4689,10 +4712,9 @@ static bool responses_sse_ensure_message(int fd, responses_stream *st, const cha
     st->message_index = st->next_output_index++;
 
     buf b = {0};
-    buf_printf(&b,
-               "{\"type\":\"response.output_item.added\",\"output_index\":%d,"
-               "\"item\":{\"id\":",
-               st->message_index);
+    buf_puts(&b, "{\"type\":\"response.output_item.added\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":{\"id\":", st->message_index);
     json_escape(&b, msg_id);
     buf_puts(&b, ",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}");
     bool ok = sse_event(fd, "response.output_item.added", b.ptr);
@@ -5175,10 +5197,9 @@ static bool responses_sse_message_done(int fd, responses_stream *st, const char 
     responses_message_id(msg_id, sizeof(msg_id), id);
 
     buf b = {0};
-    buf_printf(&b,
-               "{\"type\":\"response.output_item.done\",\"output_index\":%d,"
-               "\"item\":",
-               st->message_index);
+    buf_puts(&b, "{\"type\":\"response.output_item.done\",\"response_id\":");
+    json_escape(&b, id);
+    buf_printf(&b, ",\"output_index\":%d,\"item\":", st->message_index);
     append_responses_message_item(&b, msg_id, content ? content : "");
     buf_putc(&b, '}');
     bool ok = sse_event(fd, "response.output_item.done", b.ptr);
@@ -8981,6 +9002,8 @@ static void test_responses_live_stream_sends_codex_events(void) {
     TEST_ASSERT(msg_done != NULL);
     TEST_ASSERT(tool != NULL);
     TEST_ASSERT(completed != NULL);
+    TEST_ASSERT(strstr(out, "{\"type\":\"response.output_item.added\",\"response_id\":\"resp_test\",\"output_index\":0") != NULL);
+    TEST_ASSERT(strstr(out, "{\"type\":\"response.output_item.done\",\"response_id\":\"resp_test\",\"output_index\":0") != NULL);
     TEST_ASSERT(created < added);
     TEST_ASSERT(added < delta);
     TEST_ASSERT(delta < msg_done);

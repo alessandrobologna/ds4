@@ -477,6 +477,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool use_mtp_spec =
+        cfg->gen.temperature <= 0.0f &&
+        ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
+        getenv("DS4_MTP_NO_SPECULATE") == NULL;
+    const bool mtp_stop_direct = getenv("DS4_MTP_ADAPTIVE_STOP_DIRECT") != NULL;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
@@ -484,11 +490,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        const bool use_mtp_spec =
-            cfg->gen.temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
-        if (use_mtp_spec) {
+        if (use_mtp_spec && (!mtp_stop_direct || !ds4_session_mtp_stopped(session))) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -694,10 +696,21 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
 
 static int run_mtp_verify_scale(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
+    bool set_spec_rows_env = false;
+    if (getenv("DS4_MTP_SPEC_LOGITS_ROWS") == NULL) {
+        int spec_rows = cfg->gen.mtp_verify_scale_max;
+        if (spec_rows <= 0) spec_rows = 8;
+        if (spec_rows > 16) spec_rows = 16;
+        char rows_buf[16];
+        snprintf(rows_buf, sizeof(rows_buf), "%d", spec_rows);
+        set_spec_rows_env = setenv("DS4_MTP_SPEC_LOGITS_ROWS", rows_buf, 1) == 0;
+    }
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        if (set_spec_rows_env) unsetenv("DS4_MTP_SPEC_LOGITS_ROWS");
         fprintf(stderr, "ds4: --mtp-verify-scale requires the Metal session backend\n");
         return 1;
     }
+    if (set_spec_rows_env) unsetenv("DS4_MTP_SPEC_LOGITS_ROWS");
 
     char err[160];
     cli_prefill_progress progress = {
@@ -974,6 +987,12 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool use_mtp_spec =
+        cfg->gen.temperature <= 0.0f &&
+        ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
+        getenv("DS4_MTP_NO_SPECULATE") == NULL;
+    const bool mtp_stop_direct = getenv("DS4_MTP_ADAPTIVE_STOP_DIRECT") != NULL;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(chat->session,
@@ -986,11 +1005,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        const bool use_mtp_spec =
-            cfg->gen.temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
-        if (use_mtp_spec) {
+        if (use_mtp_spec && (!mtp_stop_direct || !ds4_session_mtp_stopped(chat->session))) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,

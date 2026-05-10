@@ -5193,6 +5193,97 @@ int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
     return 1;
 }
 
+int ds4_metal_shared_gate_up_swiglu_q8_0_rows_tensor(
+        ds4_metal_tensor       *gate,
+        ds4_metal_tensor       *up,
+        ds4_metal_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint64_t                n_tok) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!gate || !up || !mid || !x || !model_map ||
+        (in_dim & 31u) != 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_tok == 0 || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
+        id<MTLBuffer> gatebuf = ds4_metal_tensor_buffer(gate);
+        id<MTLBuffer> upbuf = ds4_metal_tensor_buffer(up);
+        id<MTLBuffer> midbuf = ds4_metal_tensor_buffer(mid);
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        if (!xbuf || !gatebuf || !upbuf || !midbuf ||
+            ds4_metal_tensor_bytes(x) < x_bytes ||
+            ds4_metal_tensor_bytes(gate) < out_bytes ||
+            ds4_metal_tensor_bytes(up) < out_bytes ||
+            ds4_metal_tensor_bytes(mid) < out_bytes) {
+            fprintf(stderr, "ds4: Metal shared expert fused rows gate/up received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t blocks = in_dim / 32;
+        const uint64_t row_bytes = blocks * 34;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (gate_offset > model_size || weight_bytes > model_size - gate_offset ||
+            up_offset > model_size || weight_bytes > model_size - up_offset) {
+            fprintf(stderr, "ds4: Metal shared expert fused rows gate/up range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t gate_inner = 0;
+        uint64_t up_inner = 0;
+        id<MTLBuffer> gate_wbuf =
+            ds4_metal_wrap_model_range(model_map, model_size, gate_offset, weight_bytes, &gate_inner);
+        id<MTLBuffer> up_wbuf =
+            ds4_metal_wrap_model_range(model_map, model_size, up_offset, weight_bytes, &up_inner);
+        if (!gate_wbuf || !up_wbuf) return 0;
+
+        ds4_metal_q8_0_matvec_args args = ds4_metal_make_q8_0_mv_args(in_dim, out_dim);
+        ds4_metal_mv_args_set_rows(&args, in_dim, n_tok);
+        ds4_metal_mv_dispatch mv_dispatch = ds4_metal_make_q8_0_mv_dispatch();
+        args.nr0 = mv_dispatch.nr0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_metal_get_mul_mv_pipeline("kernel_dsv4_shared_gate_up_swiglu_q8_0",
+                                          mv_dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:gate_wbuf offset:(NSUInteger)gate_inner atIndex:1];
+        [enc setBuffer:up_wbuf offset:(NSUInteger)up_inner atIndex:2];
+        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:3];
+        [enc setBuffer:gatebuf offset:ds4_metal_tensor_offset(gate) atIndex:4];
+        [enc setBuffer:upbuf offset:ds4_metal_tensor_offset(up) atIndex:5];
+        [enc setBuffer:midbuf offset:ds4_metal_tensor_offset(mid) atIndex:6];
+        [enc setThreadgroupMemoryLength:2u * mv_dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                                  (NSUInteger)mv_dispatch.nr0,
+                                              (NSUInteger)n_tok,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "shared expert fused rows gate/up")) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 int ds4_metal_matmul_f16_tensor(
         ds4_metal_tensor       *out,
         const void             *model_map,
@@ -5836,13 +5927,14 @@ int ds4_metal_head_rms_norm_tensor(
     return 1;
 }
 
-int ds4_metal_rope_tail_tensor(
+int ds4_metal_rope_tail_tensor_step(
         ds4_metal_tensor *x,
         uint32_t          n_tok,
         uint32_t          n_head,
         uint32_t          head_dim,
         uint32_t          n_rot,
         uint32_t          pos0,
+        uint32_t          pos_step,
         uint32_t          n_ctx_orig,
         bool              inverse,
         float             freq_base,
@@ -5881,7 +5973,7 @@ int ds4_metal_rope_tail_tensor(
                                                 n_head,
                                                 head_dim,
                                                 pos0,
-                                                1)) {
+                                                pos_step)) {
             return 0;
         }
 
@@ -5889,6 +5981,38 @@ int ds4_metal_rope_tail_tensor(
     }
 
     return 1;
+}
+
+int ds4_metal_rope_tail_tensor(
+        ds4_metal_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow) {
+    return ds4_metal_rope_tail_tensor_step(x,
+                                           n_tok,
+                                           n_head,
+                                           head_dim,
+                                           n_rot,
+                                           pos0,
+                                           1,
+                                           n_ctx_orig,
+                                           inverse,
+                                           freq_base,
+                                           freq_scale,
+                                           ext_factor,
+                                           attn_factor,
+                                           beta_fast,
+                                           beta_slow);
 }
 
 int ds4_metal_dsv4_fp8_kv_quantize_tensor(
@@ -13265,7 +13389,11 @@ int ds4_metal_routed_moe_batch_tensor(
             ds4_metal_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
-        const bool use_mm_id = n_tokens >= 32u && ds4_metal_mul_mm_id_map0_name(n_expert) != NULL;
+        const bool force_tiny_mm_id =
+            getenv("DS4_METAL_ROUTED_BATCH_FORCE_MM_ID") != NULL;
+        const bool use_mm_id =
+            (n_tokens >= 32u || force_tiny_mm_id) &&
+            ds4_metal_mul_mm_id_map0_name(n_expert) != NULL;
         /*
          * MTP verification is neither normal decode nor large prefill: the
          * target model must verify a tiny suffix (usually 2 tokens) in one
@@ -13276,12 +13404,25 @@ int ds4_metal_routed_moe_batch_tensor(
          * tiny batches so ordinary prefill keeps using the higher-throughput
          * grouped matmul path.
          */
+        id<MTLComputePipelineState> tiny_pair_pipeline = nil;
+        id<MTLComputePipelineState> tiny_pair_swiglu_pipeline = nil;
+        if (gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
+            tiny_pair_pipeline = g_moe_mul_mv_id_iq2_xxs_pair_pipeline;
+            tiny_pair_swiglu_pipeline = g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
+        } else if (gate_type == DS4_METAL_TENSOR_Q4_K) {
+            tiny_pair_pipeline = g_moe_mul_mv_id_q4_k_pair_pipeline;
+            tiny_pair_swiglu_pipeline = g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
+        }
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
             n_tokens <= 4u &&
             !use_mm_id &&
-            ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && g_moe_mul_mv_id_iq2_xxs_pair_pipeline) ||
-             (gate_type == DS4_METAL_TENSOR_Q4_K && g_moe_mul_mv_id_q4_k_pair_pipeline));
+            tiny_pair_pipeline != nil;
+        const bool use_tiny_pair_swiglu =
+            use_tiny_pair_mv &&
+            getenv("DS4_METAL_ENABLE_ROUTED_BATCH_PAIR_SWIGLU") != NULL &&
+            getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+            tiny_pair_swiglu_pipeline != nil;
         ds4_metal_mul_mm_id_map_args gate_map_args = { 0 };
         ds4_metal_mul_mm_id_args gate_mm_args = { 0 };
         ds4_metal_mul_mm_id_args down_mm_args = { 0 };
@@ -13404,13 +13545,43 @@ int ds4_metal_routed_moe_batch_tensor(
                                                    ds4_metal_tensor_offset(up));
                 DS4_METAL_PROFILE_MOE_STAGE("up");
             }
+        } else if (use_tiny_pair_swiglu) {
+            ds4_metal_dsv4_moe_swiglu_weight_args act_args = {
+                .width = expert_mid_dim,
+                .rows = pair_rows,
+                .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .weight_stride = sizeof(float),
+                .write_clamped = 0,
+                .clamp_value = clamp,
+            };
+            ok = ds4_metal_encode_mul_mv_id_pair_swiglu(cb,
+                                                        tiny_pair_swiglu_pipeline,
+                                                        &gate_args,
+                                                        &act_args,
+                                                        gate_buf,
+                                                        (NSUInteger)gate_inner,
+                                                        up_buf,
+                                                        (NSUInteger)up_inner,
+                                                        xbuf,
+                                                        ds4_metal_tensor_offset(x),
+                                                        gatebuf,
+                                                        ds4_metal_tensor_offset(gate),
+                                                        upbuf,
+                                                        ds4_metal_tensor_offset(up),
+                                                        midbuf,
+                                                        ds4_metal_tensor_offset(mid),
+                                                        selectedbuf,
+                                                        ds4_metal_tensor_offset(selected),
+                                                        weightsbuf,
+                                                        ds4_metal_tensor_offset(weights),
+                                                        gate_smem,
+                                                        2,
+                                                        false);
         } else if (use_tiny_pair_mv) {
-            id<MTLComputePipelineState> pair_pipeline =
-                gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
-                    g_moe_mul_mv_id_iq2_xxs_pair_pipeline :
-                    g_moe_mul_mv_id_q4_k_pair_pipeline;
             ok = ds4_metal_encode_mul_mv_id_pair(cb,
-                                                 pair_pipeline,
+                                                 tiny_pair_pipeline,
                                                  &gate_args,
                                                  gate_buf,
                                                  (NSUInteger)gate_inner,
@@ -13463,7 +13634,7 @@ int ds4_metal_routed_moe_batch_tensor(
             use_mm_id &&
             use_fused_activation &&
             request_mid_f16;
-        if (ok && use_fused_activation) {
+        if (ok && use_fused_activation && !use_tiny_pair_swiglu) {
             ok = ds4_metal_encode_moe_swiglu_weight(cb,
                                                     gatebuf,
                                                     ds4_metal_tensor_offset(gate),

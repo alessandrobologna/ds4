@@ -157,6 +157,19 @@ int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_metal_tensor *x);
 
+int ds4_metal_shared_gate_up_swiglu_q8_0_rows_tensor(
+        ds4_metal_tensor       *gate,
+        ds4_metal_tensor       *up,
+        ds4_metal_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_metal_matmul_f16_tensor(
         ds4_metal_tensor       *out,
         const void             *model_map,
@@ -271,6 +284,23 @@ int ds4_metal_rope_tail_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot,
         uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
+int ds4_metal_rope_tail_tensor_step(
+        ds4_metal_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          pos_step,
         uint32_t          n_ctx_orig,
         bool              inverse,
         float             freq_base,

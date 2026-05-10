@@ -7823,8 +7823,8 @@ typedef struct {
 
     /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
      * if the target verifier can either commit it or restore the saved
-     * frontiers.  The prefix1 buffers are the cheap partial-accept state for the
-     * common N=2 case. */
+     * frontiers.  The prefix buffers are the cheap partial-accept state for the
+     * common N=2 case and opt-in deeper exact diagnostics. */
     ds4_metal_tensor *spec_attn_state_kv[DS4_N_LAYER];
     ds4_metal_tensor *spec_attn_state_score[DS4_N_LAYER];
     ds4_metal_tensor *spec_index_state_kv[DS4_N_LAYER];
@@ -7833,12 +7833,20 @@ typedef struct {
     ds4_metal_tensor *spec_prefix1_attn_state_score[DS4_N_LAYER];
     ds4_metal_tensor *spec_prefix1_index_state_kv[DS4_N_LAYER];
     ds4_metal_tensor *spec_prefix1_index_state_score[DS4_N_LAYER];
+    ds4_metal_tensor *spec_prefix2_attn_state_kv[DS4_N_LAYER];
+    ds4_metal_tensor *spec_prefix2_attn_state_score[DS4_N_LAYER];
+    ds4_metal_tensor *spec_prefix2_index_state_kv[DS4_N_LAYER];
+    ds4_metal_tensor *spec_prefix2_index_state_score[DS4_N_LAYER];
     ds4_metal_tensor *spec_logits;
+    uint32_t spec_logits_rows;
     uint32_t layer_n_comp[DS4_N_LAYER];
     uint32_t layer_n_index_comp[DS4_N_LAYER];
     uint32_t spec_prefix1_n_comp[DS4_N_LAYER];
     uint32_t spec_prefix1_n_index_comp[DS4_N_LAYER];
+    uint32_t spec_prefix2_n_comp[DS4_N_LAYER];
+    uint32_t spec_prefix2_n_index_comp[DS4_N_LAYER];
     bool spec_capture_prefix1;
+    bool spec_capture_prefix2;
     bool spec_verify_mode;
     bool spec_exact_rows;
     uint32_t raw_cap;
@@ -8061,6 +8069,10 @@ static void metal_graph_free(ds4_metal_graph *g) {
         ds4_metal_tensor_free(g->spec_prefix1_attn_state_score[il]);
         ds4_metal_tensor_free(g->spec_prefix1_index_state_kv[il]);
         ds4_metal_tensor_free(g->spec_prefix1_index_state_score[il]);
+        ds4_metal_tensor_free(g->spec_prefix2_attn_state_kv[il]);
+        ds4_metal_tensor_free(g->spec_prefix2_attn_state_score[il]);
+        ds4_metal_tensor_free(g->spec_prefix2_index_state_kv[il]);
+        ds4_metal_tensor_free(g->spec_prefix2_index_state_score[il]);
     }
     ds4_metal_tensor_free(g->kv);
     ds4_metal_tensor_free(g->kv_raw);
@@ -8290,9 +8302,15 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        bool                    enable_mtp,
+        uint32_t                spec_logits_rows) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    if (enable_mtp) {
+        if (spec_logits_rows == 0) spec_logits_rows = 16;
+        if (spec_logits_rows > 16) spec_logits_rows = 16;
+        g->spec_logits_rows = spec_logits_rows;
+    }
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -8348,6 +8366,7 @@ static bool metal_graph_alloc_raw_cap(
     g->kv_raw = ds4_metal_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_metal_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
+    const bool enable_mtp_prefix2 = enable_mtp && getenv("DS4_MTP_EXACT_PREFIX2") != NULL;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = ds4_metal_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -8359,10 +8378,12 @@ static bool metal_graph_alloc_raw_cap(
             g->layer_attn_state_kv[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
             if (enable_mtp) {
-                g->spec_attn_state_kv[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_attn_state_score[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_kv[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_score[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                if (enable_mtp_prefix2) {
+                    g->spec_prefix2_attn_state_kv[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                    g->spec_prefix2_attn_state_score[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                }
             }
             if (g->layer_attn_state_kv[il]) {
                 state_init_ok = state_init_ok &&
@@ -8380,10 +8401,12 @@ static bool metal_graph_alloc_raw_cap(
                 g->layer_index_state_kv[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
                 if (enable_mtp) {
-                    g->spec_index_state_kv[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_index_state_score[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_kv[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_score[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
+                    if (enable_mtp_prefix2) {
+                        g->spec_prefix2_index_state_kv[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
+                        g->spec_prefix2_index_state_score[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
+                    }
                 }
                 if (g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&
@@ -8446,7 +8469,7 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_state_hc = ds4_metal_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_next_hc = ds4_metal_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_raw_cache = ds4_metal_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_metal_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
+        g->spec_logits = ds4_metal_tensor_alloc((uint64_t)g->spec_logits_rows * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
 
@@ -8498,20 +8521,22 @@ static bool metal_graph_alloc_raw_cap(
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
                              (!enable_mtp ||
-                              (g->spec_attn_state_kv[il] != NULL &&
-                               g->spec_attn_state_score[il] != NULL &&
-                               g->spec_prefix1_attn_state_kv[il] != NULL &&
-                               g->spec_prefix1_attn_state_score[il] != NULL));
+                              (g->spec_prefix1_attn_state_kv[il] != NULL &&
+                               g->spec_prefix1_attn_state_score[il] != NULL &&
+                               (!enable_mtp_prefix2 ||
+                                (g->spec_prefix2_attn_state_kv[il] != NULL &&
+                                 g->spec_prefix2_attn_state_score[il] != NULL))));
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
                              g->layer_index_state_kv[il] != NULL &&
                              g->layer_index_state_score[il] != NULL &&
                              (!enable_mtp ||
-                              (g->spec_index_state_kv[il] != NULL &&
-                               g->spec_index_state_score[il] != NULL &&
-                               g->spec_prefix1_index_state_kv[il] != NULL &&
-                               g->spec_prefix1_index_state_score[il] != NULL));
+                              (g->spec_prefix1_index_state_kv[il] != NULL &&
+                               g->spec_prefix1_index_state_score[il] != NULL &&
+                               (!enable_mtp_prefix2 ||
+                                (g->spec_prefix2_index_state_kv[il] != NULL &&
+                                 g->spec_prefix2_index_state_score[il] != NULL))));
         }
     }
 
@@ -8564,14 +8589,15 @@ static bool metal_graph_alloc(
         ds4_metal_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, 0);
 }
 
-static uint32_t metal_graph_raw_span_for_batch(
+static uint32_t metal_graph_raw_span_for_batch_cap(
         const ds4_metal_graph *g,
+        uint32_t               raw_cap,
         uint32_t               pos0,
         uint32_t               n_tokens) {
-    if (!g || g->raw_cap == 0 || n_tokens == 0) return 0;
+    if (!g || raw_cap == 0 || n_tokens == 0) return 0;
 
     const uint32_t window = g->raw_window ? g->raw_window : DS4_N_SWA;
     const uint32_t last_pos = pos0 + n_tokens - 1u;
@@ -8581,17 +8607,32 @@ static uint32_t metal_graph_raw_span_for_batch(
     }
     uint64_t available = (uint64_t)last_pos + 1u;
     if (needed > available) needed = available;
-    if (needed > g->raw_cap) needed = g->raw_cap;
+    if (needed > raw_cap) needed = raw_cap;
     return (uint32_t)needed;
+}
+
+static uint32_t metal_graph_raw_span_for_batch(
+        const ds4_metal_graph *g,
+        uint32_t               pos0,
+        uint32_t               n_tokens) {
+    return metal_graph_raw_span_for_batch_cap(g, g ? g->raw_cap : 0, pos0, n_tokens);
+}
+
+static uint32_t metal_graph_raw_start_for_span_cap(
+        const ds4_metal_graph *g,
+        uint32_t               raw_cap,
+        uint32_t               last_pos,
+        uint32_t               n_raw) {
+    if (!g || raw_cap == 0 || n_raw == 0) return 0;
+    const uint32_t first_raw_pos = last_pos + 1u - n_raw;
+    return first_raw_pos % raw_cap;
 }
 
 static uint32_t metal_graph_raw_start_for_span(
         const ds4_metal_graph *g,
         uint32_t               last_pos,
         uint32_t               n_raw) {
-    if (!g || g->raw_cap == 0 || n_raw == 0) return 0;
-    const uint32_t first_raw_pos = last_pos + 1u - n_raw;
-    return first_raw_pos % g->raw_cap;
+    return metal_graph_raw_start_for_span_cap(g, g ? g->raw_cap : 0, last_pos, n_raw);
 }
 
 /* Capture the verifier prefix after the first speculative token.
@@ -8626,6 +8667,58 @@ static bool metal_graph_capture_prefix1_index_state(ds4_metal_graph *g, uint32_t
                                  g->layer_index_state_kv[il], 0, bytes) != 0 &&
            ds4_metal_tensor_copy(g->spec_prefix1_index_state_score[il], 0,
                                  g->layer_index_state_score[il], 0, bytes) != 0;
+}
+
+static bool metal_graph_capture_prefix2_attn_state(ds4_metal_graph *g, uint32_t il) {
+    if (!g->spec_capture_prefix2 || !g->spec_prefix2_attn_state_kv[il]) return true;
+    const uint64_t bytes = ds4_metal_tensor_bytes(g->layer_attn_state_kv[il]);
+    g->spec_prefix2_n_comp[il] = g->layer_n_comp[il];
+    return ds4_metal_tensor_copy(g->spec_prefix2_attn_state_kv[il], 0,
+                                 g->layer_attn_state_kv[il], 0, bytes) != 0 &&
+           ds4_metal_tensor_copy(g->spec_prefix2_attn_state_score[il], 0,
+                                 g->layer_attn_state_score[il], 0, bytes) != 0;
+}
+
+static bool metal_graph_capture_prefix2_index_state(ds4_metal_graph *g, uint32_t il) {
+    if (!g->spec_capture_prefix2 || !g->spec_prefix2_index_state_kv[il]) return true;
+    const uint64_t bytes = ds4_metal_tensor_bytes(g->layer_index_state_kv[il]);
+    g->spec_prefix2_n_index_comp[il] = g->layer_n_index_comp[il];
+    return ds4_metal_tensor_copy(g->spec_prefix2_index_state_kv[il], 0,
+                                 g->layer_index_state_kv[il], 0, bytes) != 0 &&
+           ds4_metal_tensor_copy(g->spec_prefix2_index_state_score[il], 0,
+                                 g->layer_index_state_score[il], 0, bytes) != 0;
+}
+
+static bool metal_graph_ensure_spec_frontier_buffers(ds4_metal_graph *g) {
+    if (!g || !g->mtp_enabled) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
+        const uint64_t attn_rows = (uint64_t)coff * ratio;
+        if (!g->spec_attn_state_kv[il]) {
+            g->spec_attn_state_kv[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
+        }
+        if (!g->spec_attn_state_score[il]) {
+            g->spec_attn_state_score[il] = ds4_metal_tensor_alloc(attn_width * attn_rows * sizeof(float));
+        }
+        if (!g->spec_attn_state_kv[il] || !g->spec_attn_state_score[il]) return false;
+
+        if (ratio == 4) {
+            const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
+            const uint64_t index_rows = (uint64_t)coff * ratio;
+            if (!g->spec_index_state_kv[il]) {
+                g->spec_index_state_kv[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
+            }
+            if (!g->spec_index_state_score[il]) {
+                g->spec_index_state_score[il] = ds4_metal_tensor_alloc(index_width * index_rows * sizeof(float));
+            }
+            if (!g->spec_index_state_kv[il] || !g->spec_index_state_score[il]) return false;
+        }
+    }
+    return true;
 }
 
 static uint32_t metal_graph_decode_indexer_top_k(const ds4_metal_graph *g) {
@@ -9221,7 +9314,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
     if (ok) {
-        const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+        const uint32_t raw_start = metal_graph_raw_start_for_span_cap(g, raw_cap, pos, n_raw);
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = ds4_metal_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
@@ -9594,7 +9687,10 @@ static bool metal_graph_encode_output_head_batch(
         const ds4_weights     *weights,
         uint32_t               n_tokens,
         uint64_t               vocab_dim) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits ||
+        n_tokens > g->spec_logits_rows) {
+        return false;
+    }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     ds4_metal_tensor *output_pre = NULL;
@@ -9679,7 +9775,10 @@ static bool metal_graph_encode_output_head_batch_row(
         uint32_t               n_tokens,
         uint32_t               row,
         uint64_t               vocab_dim) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits ||
+        n_tokens > g->spec_logits_rows) {
+        return false;
+    }
     if (row >= n_tokens) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -10438,13 +10537,25 @@ static bool metal_graph_encode_token_raw_swa(
         int                    token,
         uint32_t               pos,
         bool                   need_logits,
-        bool                   allow_split_flush) {
-    if (g->raw_cap == 0) {
+        bool                   allow_split_flush);
+
+static bool metal_graph_encode_token_raw_swa_with_raw_cache(
+        ds4_metal_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        int                    token,
+        uint32_t               pos,
+        bool                   need_logits,
+        bool                   allow_split_flush,
+        ds4_metal_tensor     **raw_cache_override,
+        uint32_t               raw_cap_override) {
+    const uint32_t raw_cap = raw_cache_override ? raw_cap_override : g->raw_cap;
+    if (raw_cap == 0) {
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
         return false;
     }
-    const uint32_t raw_row = pos % g->raw_cap;
-    const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+    const uint32_t raw_row = pos % raw_cap;
+    const uint32_t n_raw = metal_graph_raw_span_for_batch_cap(g, raw_cap, pos, 1);
 
     bool ok = ds4_metal_embed_token_hc_tensor(g->cur_hc,
                                               model->map,
@@ -10471,13 +10582,19 @@ static bool metal_graph_encode_token_raw_swa(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ds4_metal_tensor *raw_cache = raw_cache_override ?
+            raw_cache_override[il] : g->layer_raw_cache[il];
+        if (!raw_cache) {
+            ok = false;
+            break;
+        }
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
                                              il,
                                              pos,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
+                                             raw_cache,
+                                             raw_cap,
                                              raw_row,
                                              n_raw,
                                              token);
@@ -10493,6 +10610,25 @@ static bool metal_graph_encode_token_raw_swa(
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     }
     return ok;
+}
+
+static bool metal_graph_encode_token_raw_swa(
+        ds4_metal_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        int                    token,
+        uint32_t               pos,
+        bool                   need_logits,
+        bool                   allow_split_flush) {
+    return metal_graph_encode_token_raw_swa_with_raw_cache(g,
+                                                           model,
+                                                           weights,
+                                                           token,
+                                                           pos,
+                                                           need_logits,
+                                                           allow_split_flush,
+                                                           NULL,
+                                                           0);
 }
 
 static ds4_metal_tensor *metal_graph_tensor_row_view(
@@ -10805,6 +10941,127 @@ static bool metal_graph_router_select_maybe_rows(
     return ok;
 }
 
+static bool metal_graph_shared_gate_up_swiglu_q8_maybe_rows(
+        const ds4_metal_graph  *g,
+        ds4_metal_tensor       *gate,
+        ds4_metal_tensor       *up,
+        ds4_metal_tensor       *mid,
+        const ds4_model        *model,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint32_t                n_tokens) {
+    const bool use_fused_rows =
+        metal_graph_use_exact_verify_rows(g) &&
+        getenv("DS4_MTP_VERIFY_FAST_BATCH") == NULL &&
+        getenv("DS4_MTP_VERIFY_FUSED_SHARED_GATE_UP") != NULL &&
+        n_tokens > 1;
+    if (!use_fused_rows)
+    {
+        bool ok = metal_graph_matmul_q8_0_maybe_rows(g,
+                                                     gate,
+                                                     model,
+                                                     gate_offset,
+                                                     in_dim,
+                                                     out_dim,
+                                                     x,
+                                                     n_tokens);
+        if (ok) ok = metal_graph_matmul_q8_0_maybe_rows(g,
+                                                        up,
+                                                        model,
+                                                        up_offset,
+                                                        in_dim,
+                                                        out_dim,
+                                                        x,
+                                                        n_tokens);
+        if (ok) ok = ds4_metal_swiglu_tensor(mid,
+                                             gate,
+                                             up,
+                                             (uint32_t)((uint64_t)n_tokens * out_dim),
+                                             0.0f,
+                                             1.0f) != 0;
+        return ok;
+    }
+
+    return ds4_metal_shared_gate_up_swiglu_q8_0_rows_tensor(gate,
+                                                            up,
+                                                            mid,
+                                                            model->map,
+                                                            model->size,
+                                                            gate_offset,
+                                                            up_offset,
+                                                            in_dim,
+                                                            out_dim,
+                                                            x,
+                                                            n_tokens) != 0;
+}
+
+static bool metal_graph_shared_down_hc_q8_maybe_rows(
+        const ds4_metal_graph  *g,
+        ds4_metal_tensor       *out_hc,
+        ds4_metal_tensor       *shared_out,
+        const ds4_model        *model,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *shared_mid,
+        const ds4_metal_tensor *routed_out,
+        const ds4_metal_tensor *residual_hc,
+        const ds4_metal_tensor *split,
+        uint32_t                n_tokens) {
+    const bool use_fused_rows =
+        metal_graph_use_exact_verify_rows(g) &&
+        getenv("DS4_MTP_VERIFY_FAST_BATCH") == NULL &&
+        getenv("DS4_MTP_VERIFY_FUSED_SHARED_DOWN_HC") != NULL &&
+        n_tokens > 1;
+    if (!use_fused_rows) {
+        return metal_graph_matmul_q8_0_maybe_rows(g,
+                                                  shared_out,
+                                                  model,
+                                                  weight_offset,
+                                                  in_dim,
+                                                  out_dim,
+                                                  shared_mid,
+                                                  n_tokens);
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    bool ok = true;
+    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+        ds4_metal_tensor *out_hc_row = metal_graph_tensor_row_view(out_hc, t, hc_dim);
+        ds4_metal_tensor *shared_out_row = metal_graph_tensor_row_view(shared_out, t, out_dim);
+        ds4_metal_tensor *shared_mid_row = metal_graph_tensor_row_view((ds4_metal_tensor *)shared_mid, t, in_dim);
+        ds4_metal_tensor *routed_out_row = metal_graph_tensor_row_view((ds4_metal_tensor *)routed_out, t, out_dim);
+        ds4_metal_tensor *residual_hc_row = metal_graph_tensor_row_view((ds4_metal_tensor *)residual_hc, t, hc_dim);
+        ds4_metal_tensor *split_row = metal_graph_tensor_row_view((ds4_metal_tensor *)split, t, mix_hc);
+        ok = out_hc_row && shared_out_row && shared_mid_row && routed_out_row &&
+             residual_hc_row && split_row &&
+             ds4_metal_shared_down_hc_expand_q8_0_tensor(out_hc_row,
+                                                          shared_out_row,
+                                                          model->map,
+                                                          model->size,
+                                                          weight_offset,
+                                                          in_dim,
+                                                          out_dim,
+                                                          shared_mid_row,
+                                                          routed_out_row,
+                                                          residual_hc_row,
+                                                          split_row,
+                                                          DS4_N_EMBD,
+                                                          DS4_N_HC) != 0;
+        ds4_metal_tensor_free(split_row);
+        ds4_metal_tensor_free(residual_hc_row);
+        ds4_metal_tensor_free(routed_out_row);
+        ds4_metal_tensor_free(shared_mid_row);
+        ds4_metal_tensor_free(shared_out_row);
+        ds4_metal_tensor_free(out_hc_row);
+    }
+    return ok;
+}
+
 /* Upload prompt token ids for kernels that need token-aware hash routing. */
 static bool metal_graph_upload_prompt_tokens(
         ds4_metal_tensor *out_tokens,
@@ -11094,6 +11351,11 @@ static bool metal_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
+    /* In strict verifier mode, keep speculative rows on the row-preserving
+     * attention path by default.  DS4_MTP_VERIFY_FAST_FRONTIER=1 is a diagnostic
+     * override: it can preserve local top-1 decisions, but q4 tests showed that
+     * committing its batched attention/frontier state drifts later generation
+     * unless accepted tokens are replayed exactly. */
     const bool spec_row_fallback =
         metal_graph_use_exact_verify_stage(g, "DS4_MTP_VERIFY_FAST_FRONTIER");
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
@@ -11148,7 +11410,28 @@ static bool metal_graph_encode_layer_attention_batch(
                                                    g->batch_flat_hc,
                                                    n_tokens);
     DS4_METAL_STAGE_PROBE("hc_mix", g->batch_hc_mix, mix_hc);
-    if (metal_graph_use_reference_hc_decode()) {
+    const bool verify_fused_hc_norm =
+        g->spec_verify_mode &&
+        getenv("DS4_MTP_VERIFY_FUSED_HC_NORM") != NULL &&
+        !metal_graph_use_reference_hc_decode() &&
+        !metal_graph_use_reference_hc_norm_decode();
+    if (verify_fused_hc_norm) {
+        if (ok) ok = ds4_metal_hc_split_weighted_sum_norm_tensor(attn_cur_view,
+                                                                 g->batch_attn_norm,
+                                                                 hc_split_view,
+                                                                 hc_mix_view,
+                                                                 g->batch_cur_hc,
+                                                                 model->map,
+                                                                 model->size,
+                                                                 layer->hc_attn_scale->abs_offset,
+                                                                 layer->hc_attn_base->abs_offset,
+                                                                 layer->attn_norm->abs_offset,
+                                                                 DS4_N_EMBD,
+                                                                 DS4_N_HC,
+                                                                 DS4_N_HC_SINKHORN_ITER,
+                                                                 DS4_HC_EPS,
+                                                                 DS4_RMS_EPS) != 0;
+    } else if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_metal_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
                                                         model->map,
@@ -11184,14 +11467,16 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_pre");
-    if (ok) ok = ds4_metal_rms_norm_weight_rows_tensor(g->batch_attn_norm,
-                                                       g->batch_attn_cur,
-                                                       model->map,
-                                                       model->size,
-                                                       layer->attn_norm->abs_offset,
-                                                       DS4_N_EMBD,
-                                                       n_tokens,
-                                                       DS4_RMS_EPS) != 0;
+    if (!verify_fused_hc_norm) {
+        if (ok) ok = ds4_metal_rms_norm_weight_rows_tensor(g->batch_attn_norm,
+                                                           g->batch_attn_cur,
+                                                           model->map,
+                                                           model->size,
+                                                           layer->attn_norm->abs_offset,
+                                                           DS4_N_EMBD,
+                                                           n_tokens,
+                                                           DS4_RMS_EPS) != 0;
+    }
     DS4_METAL_STAGE_PROBE("attn_norm", g->batch_attn_norm, DS4_N_EMBD);
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->batch_attn_norm,
@@ -12456,7 +12741,28 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    g->batch_flat_hc,
                                                    n_tokens);
     DS4_METAL_FFN_STAGE_PROBE("ffn_hc_mix", g->batch_hc_mix, mix_hc);
-    if (metal_graph_use_reference_hc_decode()) {
+    const bool verify_fused_hc_norm =
+        g->spec_verify_mode &&
+        getenv("DS4_MTP_VERIFY_FUSED_HC_NORM") != NULL &&
+        !metal_graph_use_reference_hc_decode() &&
+        !metal_graph_use_reference_hc_norm_decode();
+    if (verify_fused_hc_norm) {
+        if (ok) ok = ds4_metal_hc_split_weighted_sum_norm_tensor(ffn_cur_view,
+                                                                 g->batch_ffn_norm,
+                                                                 hc_split_view,
+                                                                 hc_mix_view,
+                                                                 g->batch_after_attn_hc,
+                                                                 model->map,
+                                                                 model->size,
+                                                                 layer->hc_ffn_scale->abs_offset,
+                                                                 layer->hc_ffn_base->abs_offset,
+                                                                 layer->ffn_norm->abs_offset,
+                                                                 DS4_N_EMBD,
+                                                                 DS4_N_HC,
+                                                                 DS4_N_HC_SINKHORN_ITER,
+                                                                 DS4_HC_EPS,
+                                                                 DS4_RMS_EPS) != 0;
+    } else if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_metal_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
                                                         model->map,
@@ -12492,14 +12798,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_pre");
-    if (ok) ok = ds4_metal_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
-                                                       g->batch_ffn_cur,
-                                                       model->map,
-                                                       model->size,
-                                                       layer->ffn_norm->abs_offset,
-                                                       DS4_N_EMBD,
-                                                       n_tokens,
-                                                       DS4_RMS_EPS) != 0;
+    if (!verify_fused_hc_norm) {
+        if (ok) ok = ds4_metal_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
+                                                           g->batch_ffn_cur,
+                                                           model->map,
+                                                           model->size,
+                                                           layer->ffn_norm->abs_offset,
+                                                           DS4_N_EMBD,
+                                                           n_tokens,
+                                                           DS4_RMS_EPS) != 0;
+    }
     DS4_METAL_FFN_STAGE_PROBE("ffn_norm", g->batch_ffn_norm, DS4_N_EMBD);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->batch_ffn_norm,
@@ -12598,40 +12906,38 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
-    if (ok) ok = metal_graph_matmul_q8_0_maybe_rows(g,
-                                                    g->batch_shared_gate,
-                                                    model,
-                                                    layer->ffn_gate_shexp->abs_offset,
-                                                    DS4_N_EMBD,
-                                                    shared_dim,
-                                                    g->batch_ffn_norm,
-                                                    n_tokens);
+    if (ok) ok = metal_graph_shared_gate_up_swiglu_q8_maybe_rows(g,
+                                                                 g->batch_shared_gate,
+                                                                 g->batch_shared_up,
+                                                                 g->batch_shared_mid,
+                                                                 model,
+                                                                 layer->ffn_gate_shexp->abs_offset,
+                                                                 layer->ffn_up_shexp->abs_offset,
+                                                                 DS4_N_EMBD,
+                                                                 shared_dim,
+                                                                 g->batch_ffn_norm,
+                                                                 n_tokens);
     DS4_METAL_FFN_STAGE_PROBE("ffn_shexp_gate", g->batch_shared_gate, shared_dim);
-    if (ok) ok = metal_graph_matmul_q8_0_maybe_rows(g,
-                                                    g->batch_shared_up,
-                                                    model,
-                                                    layer->ffn_up_shexp->abs_offset,
-                                                    DS4_N_EMBD,
-                                                    shared_dim,
-                                                    g->batch_ffn_norm,
-                                                    n_tokens);
     DS4_METAL_FFN_STAGE_PROBE("ffn_shexp_up", g->batch_shared_up, shared_dim);
     DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up");
-    if (ok) ok = ds4_metal_swiglu_tensor(g->batch_shared_mid,
-                                         g->batch_shared_gate,
-                                         g->batch_shared_up,
-                                         (uint32_t)((uint64_t)n_tokens * shared_dim),
-                                         0.0f,
-                                         1.0f) != 0;
     DS4_METAL_FFN_STAGE_PROBE("ffn_shexp_mid", g->batch_shared_mid, shared_dim);
-    if (ok) ok = metal_graph_matmul_q8_0_maybe_rows(g,
-                                                    g->batch_shared_out,
-                                                    model,
-                                                    layer->ffn_down_shexp->abs_offset,
-                                                    shared_dim,
-                                                    DS4_N_EMBD,
-                                                    g->batch_shared_mid,
-                                                    n_tokens);
+    const bool fused_shared_down_hc =
+        metal_graph_use_exact_verify_rows(g) &&
+        getenv("DS4_MTP_VERIFY_FAST_BATCH") == NULL &&
+        getenv("DS4_MTP_VERIFY_FUSED_SHARED_DOWN_HC") != NULL &&
+        n_tokens > 1;
+    if (ok) ok = metal_graph_shared_down_hc_q8_maybe_rows(g,
+                                                          next_hc_view,
+                                                          g->batch_shared_out,
+                                                          model,
+                                                          layer->ffn_down_shexp->abs_offset,
+                                                          shared_dim,
+                                                          DS4_N_EMBD,
+                                                          g->batch_shared_mid,
+                                                          g->batch_routed_out,
+                                                          g->batch_after_attn_hc,
+                                                          hc_split_view,
+                                                          n_tokens);
     DS4_METAL_FFN_STAGE_PROBE("ffn_shexp", g->batch_shared_out, DS4_N_EMBD);
     DS4_METAL_PROFILE_FFN_STAGE("shared_down");
     if (ok) {
@@ -12654,13 +12960,15 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_out", g->batch_ffn_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
-    if (ok) ok = ds4_metal_hc_expand_add_split_tensor(next_hc_view,
-                                                       g->batch_routed_out,
-                                                       g->batch_shared_out,
-                                                       g->batch_after_attn_hc,
-                                                       hc_split_view,
-                                                       DS4_N_EMBD,
-                                                       DS4_N_HC) != 0;
+    if (ok && !fused_shared_down_hc) {
+        ok = ds4_metal_hc_expand_add_split_tensor(next_hc_view,
+                                                  g->batch_routed_out,
+                                                  g->batch_shared_out,
+                                                  g->batch_after_attn_hc,
+                                                  hc_split_view,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+    }
     DS4_METAL_FFN_STAGE_PROBE("hc_ffn_post", g->batch_next_hc, hc_dim);
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,
@@ -12733,6 +13041,41 @@ static bool metal_graph_eval_token_raw_swa(
     return ok;
 }
 
+static bool metal_graph_eval_token_raw_swa_with_raw_cache(
+        ds4_metal_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        int                    token,
+        uint32_t               pos,
+        ds4_metal_tensor     **raw_cache_override,
+        uint32_t               raw_cap_override,
+        float                 *logits) {
+    bool ok = ds4_metal_begin_commands() != 0;
+    if (ok) {
+        ok = metal_graph_encode_token_raw_swa_with_raw_cache(g,
+                                                             model,
+                                                             weights,
+                                                             token,
+                                                             pos,
+                                                             logits != NULL,
+                                                             true,
+                                                             raw_cache_override,
+                                                             raw_cap_override);
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    if (ok && logits) {
+        ok = ds4_metal_tensor_read(g->logits,
+                                   0,
+                                   logits,
+                                   (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (!ok && ds4_metal_synchronize() == 0) {
+        fprintf(stderr, "ds4: Metal synchronize after raw-cache graph eval failure also failed\n");
+    }
+    return ok;
+}
+
 /* Greedy verifier helper.  Speculative decoding only needs the target model's
  * top token after most accepted draft rows; the full vocabulary row is needed
  * once, for the final committed state that normal sampling will continue from.
@@ -12771,7 +13114,7 @@ static bool metal_graph_eval_token_raw_swa_top(
     return ok;
 }
 
-static bool metal_graph_eval_mtp_draft_from_hc(
+static bool metal_graph_encode_mtp_draft_from_hc(
         ds4_metal_graph       *g,
         const ds4_model       *base_model,
         const ds4_weights     *base_weights,
@@ -12781,9 +13124,8 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         ds4_metal_tensor      *out_hc,
         int                    token,
         uint32_t               pos,
-        float                 *logits,
-        int                   *top_id,
-        int                   *top_ids,
+        bool                   need_output,
+        bool                   need_top,
         uint32_t               top_k) {
     if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
     if (top_k == 0) top_k = 1;
@@ -12796,7 +13138,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
 
     ds4_metal_tensor *saved_cur = g->cur_hc;
     ds4_metal_tensor *saved_after = g->after_ffn_hc;
-    bool ok = ds4_metal_begin_commands() != 0;
+    bool ok = true;
     if (ok) ok = ds4_metal_embed_token_hc_tensor(g->mtp_embed,
                                                   base_model->map,
                                                   base_model->size,
@@ -12859,22 +13201,54 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                              token);
     }
     if (ok) g->cur_hc = out_hc;
-    if (ok) ok = metal_graph_encode_output_head_mtp(g,
-                                                    base_model,
-                                                    base_weights,
-                                                    mtp_model,
-                                                    mtp,
-                                                    base_weights->output->dim[1]);
-    if (ok && (top_id || top_ids)) {
+    if (ok && need_output) ok = metal_graph_encode_output_head_mtp(g,
+                                                                   base_model,
+                                                                   base_weights,
+                                                                   mtp_model,
+                                                                   mtp,
+                                                                   base_weights->output->dim[1]);
+    if (ok && need_top) {
         ok = ds4_metal_indexer_topk_tensor(g->comp_selected,
                                            g->logits,
                                            DS4_N_VOCAB,
                                            1,
                                            top_k) != 0;
     }
-    if (ok) ok = ds4_metal_end_commands() != 0;
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
+    return ok;
+}
+
+static bool metal_graph_eval_mtp_draft_from_hc(
+        ds4_metal_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        ds4_metal_tensor      *prev_hc,
+        ds4_metal_tensor      *out_hc,
+        int                    token,
+        uint32_t               pos,
+        float                 *logits,
+        int                   *top_id,
+        int                   *top_ids,
+        uint32_t               top_k) {
+    if (top_k == 0) top_k = 1;
+
+    bool ok = ds4_metal_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_mtp_draft_from_hc(g,
+                                                      base_model,
+                                                      base_weights,
+                                                      mtp_model,
+                                                      mtp,
+                                                      prev_hc,
+                                                      out_hc,
+                                                      token,
+                                                      pos,
+                                                      logits || top_id || top_ids,
+                                                      top_id || top_ids,
+                                                      top_k);
+    if (ok) ok = ds4_metal_end_commands() != 0;
 
     if (ok && logits) {
         ok = ds4_metal_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
@@ -12891,8 +13265,74 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
     if (!ok) {
         (void)ds4_metal_synchronize();
-        g->cur_hc = saved_cur;
-        g->after_ffn_hc = saved_after;
+    }
+    return ok;
+}
+
+static bool metal_graph_eval_mtp_target_first_pair(
+        ds4_metal_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        int                    token0,
+        uint32_t               pos0,
+        int                    token1,
+        uint32_t               pos1,
+        float                 *logits1,
+        int                   *top1) {
+    if (!g || !top1) return false;
+    const uint32_t saved_raw = g->mtp_n_raw;
+    uint32_t after_first_raw = saved_raw + 1u;
+    if (after_first_raw > g->raw_window) after_first_raw = g->raw_window;
+
+    bool ok = ds4_metal_begin_commands() != 0;
+    if (ok) {
+        ok = metal_graph_encode_mtp_draft_from_hc(g,
+                                                  base_model,
+                                                  base_weights,
+                                                  mtp_model,
+                                                  mtp,
+                                                  g->cur_hc,
+                                                  g->mtp_state_hc,
+                                                  token0,
+                                                  pos0,
+                                                  false,
+                                                  false,
+                                                  1);
+    }
+    if (ok) {
+        g->mtp_n_raw = after_first_raw;
+        ok = metal_graph_encode_mtp_draft_from_hc(g,
+                                                  base_model,
+                                                  base_weights,
+                                                  mtp_model,
+                                                  mtp,
+                                                  g->mtp_state_hc,
+                                                  g->mtp_next_hc,
+                                                  token1,
+                                                  pos1,
+                                                  true,
+                                                  true,
+                                                  1);
+    }
+    g->mtp_n_raw = saved_raw;
+    if (ok) ok = ds4_metal_end_commands() != 0;
+
+    if (ok && logits1) {
+        ok = ds4_metal_tensor_read(g->logits,
+                                   0,
+                                   logits1,
+                                   (uint64_t)DS4_N_VOCAB * sizeof(logits1[0])) != 0;
+    }
+    if (ok) {
+        ok = ds4_metal_tensor_read(g->comp_selected, 0, top1, sizeof(*top1)) != 0;
+    }
+    if (ok) {
+        g->mtp_n_raw = after_first_raw;
+    } else {
+        g->mtp_n_raw = saved_raw;
+        (void)ds4_metal_synchronize();
     }
     return ok;
 }
@@ -12906,7 +13346,9 @@ static bool metal_graph_eval_mtp_draft(
         int                    token,
         uint32_t               pos,
         float                 *logits,
-        int                   *top_id) {
+        int                   *top_id,
+        int                   *top_ids,
+        uint32_t               top_k) {
     return metal_graph_eval_mtp_draft_from_hc(g,
                                               base_model,
                                               base_weights,
@@ -12918,8 +13360,70 @@ static bool metal_graph_eval_mtp_draft(
                                               pos,
                                               logits,
                                               top_id,
-                                              NULL,
-                                              1);
+                                              top_ids,
+                                              top_k);
+}
+
+/* Opt-in probe experiment: encode the normal target decode and the first MTP
+ * draft into one command sequence.  This avoids one standalone MTP submission
+ * but cannot honor CPU-side target-margin gates, since those need target logits
+ * before deciding whether the MTP probe should run. */
+static bool metal_graph_eval_token_raw_swa_fused_mtp(
+        ds4_metal_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        int                    token,
+        uint32_t               pos,
+        float                 *target_logits,
+        float                 *mtp_logits,
+        int                   *top_id,
+        int                   *top_ids,
+        uint32_t               top_k) {
+    if (!g || !g->spec_logits || !target_logits) return false;
+    if (top_k == 0) top_k = 1;
+
+    const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    bool ok = ds4_metal_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_token_raw_swa(g,
+                                                  base_model,
+                                                  base_weights,
+                                                  token,
+                                                  pos,
+                                                  true,
+                                                  true);
+    if (ok) ok = ds4_metal_tensor_copy(g->spec_logits, 0, g->logits, 0, logits_bytes) != 0;
+    if (ok) ok = metal_graph_encode_mtp_draft_from_hc(g,
+                                                      base_model,
+                                                      base_weights,
+                                                      mtp_model,
+                                                      mtp,
+                                                      g->cur_hc,
+                                                      g->mtp_state_hc,
+                                                      token,
+                                                      pos,
+                                                      mtp_logits || top_id || top_ids,
+                                                      top_id || top_ids,
+                                                      top_k);
+    if (ok) ok = ds4_metal_end_commands() != 0;
+
+    if (ok) ok = ds4_metal_tensor_read(g->spec_logits, 0, target_logits, logits_bytes) != 0;
+    if (ok && mtp_logits) {
+        ok = ds4_metal_tensor_read(g->logits, 0, mtp_logits, logits_bytes) != 0;
+    }
+    if (ok && top_ids) {
+        ok = ds4_metal_tensor_read(g->comp_selected,
+                                   0,
+                                   top_ids,
+                                   (uint64_t)top_k * sizeof(top_ids[0])) != 0;
+        if (ok && top_id) *top_id = top_ids[0];
+    } else if (ok && top_id) {
+        ok = ds4_metal_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
+    }
+    if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
+    if (!ok) (void)ds4_metal_synchronize();
+    return ok;
 }
 
 /* Execute Metal prefill in layer-major order so intermediate activations stay
@@ -13415,6 +13919,17 @@ typedef struct {
     double total_sec;
 } ds4_verify_suffix_profile;
 
+typedef struct {
+    double upload_sec;
+    double layer_sec;
+    double row0_head_sec;
+    double row0_top_read_sec;
+    double row1_head_sec;
+    double logits_read_sec;
+    double total_sec;
+    uint32_t logits_row;
+} ds4_verify_n2_split_profile;
+
 /* Layer-major speculative target verifier for tiny MTP suffixes.
  *
  * This is the first production-shaped verifier attempt: unlike repeated decode
@@ -13437,7 +13952,10 @@ static bool metal_graph_verify_suffix_tops(
         int                   *row_tops,
         float                 *row_logits,
         ds4_verify_suffix_profile *profile) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits ||
+        n_tokens > g->spec_logits_rows) {
+        return false;
+    }
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     const bool want_tops = top_rows != 0 && row_tops != NULL;
@@ -13537,12 +14055,136 @@ static bool metal_graph_verify_suffix_tops(
 }
 
 static bool metal_graph_read_spec_logits_row(ds4_metal_graph *g, uint32_t row, float *logits) {
-    if (!g || !g->spec_logits || !logits || row >= g->prefill_cap) return false;
+    if (!g || !g->spec_logits || !logits || row >= g->spec_logits_rows) return false;
     const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
     return ds4_metal_tensor_read(g->spec_logits,
                                  (uint64_t)row * row_bytes,
                                  logits,
                                  row_bytes) != 0;
+}
+
+/* Strict N=2 verifier variant.
+ *
+ * The plain exact batch verifier computes output logits for both speculative
+ * rows before it knows whether row 0 accepts draft[1].  This variant keeps the
+ * same exact row-preserving layer pass, then computes row 0's head first.  It
+ * only computes row 1's head when the second draft is actually accepted. */
+static bool metal_graph_verify_suffix_n2_split_head(
+        ds4_metal_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        bool                   capture_prefix1,
+        bool                   eager_row1_head,
+        int                   *row0_top,
+        float                 *row_logits,
+        ds4_verify_n2_split_profile *profile) {
+    if (!g || !row0_top || !row_logits || !g->spec_logits ||
+        g->prefill_cap < 2 || g->spec_logits_rows < 2) {
+        return false;
+    }
+    if (start > (uint32_t)prompt->len || 2u > (uint32_t)prompt->len - start) return false;
+
+    if (profile) memset(profile, 0, sizeof(*profile));
+    const double t0 = profile ? now_sec() : 0.0;
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, 2);
+    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                         g->prefill_tokens,
+                                                         model,
+                                                         weights,
+                                                         prompt,
+                                                         start,
+                                                         2);
+    const double upload_done = profile ? now_sec() : 0.0;
+    if (profile) profile->upload_sec = upload_done - t0;
+    if (!ok) return false;
+
+    const bool saved_capture = g->spec_capture_prefix1;
+    const bool saved_verify_mode = g->spec_verify_mode;
+    const bool saved_exact_rows = g->spec_exact_rows;
+    g->spec_capture_prefix1 = capture_prefix1;
+    g->spec_verify_mode = true;
+    g->spec_exact_rows = true;
+
+    const double layer_t0 = profile ? now_sec() : 0.0;
+    ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = metal_graph_encode_layer_batch(g,
+                                            model,
+                                            &weights->layer[il],
+                                            il,
+                                            start,
+                                            2);
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    const double layer_done = profile ? now_sec() : 0.0;
+    if (profile) profile->layer_sec = layer_done - layer_t0;
+
+    g->spec_capture_prefix1 = saved_capture;
+    g->spec_verify_mode = saved_verify_mode;
+    g->spec_exact_rows = saved_exact_rows;
+    if (!ok) return false;
+
+    const double row0_head_t0 = profile ? now_sec() : 0.0;
+    ok = ds4_metal_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                          model,
+                                                          weights,
+                                                          2,
+                                                          0,
+                                                          weights->output->dim[1]);
+    if (ok) ok = ds4_metal_indexer_topk_tensor(g->comp_selected,
+                                               g->spec_logits,
+                                               DS4_N_VOCAB,
+                                               1,
+                                               1) != 0;
+    if (ok && eager_row1_head) {
+        ok = metal_graph_encode_output_head_batch_row(g,
+                                                      model,
+                                                      weights,
+                                                      2,
+                                                      1,
+                                                      weights->output->dim[1]);
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    const double row0_head_done = profile ? now_sec() : 0.0;
+    if (profile) profile->row0_head_sec = row0_head_done - row0_head_t0;
+    if (!ok) return false;
+
+    const double row0_top_read_t0 = profile ? now_sec() : 0.0;
+    ok = ds4_metal_tensor_read(g->comp_selected, 0, row0_top, sizeof(*row0_top)) != 0;
+    const double row0_top_read_done = profile ? now_sec() : 0.0;
+    if (profile) profile->row0_top_read_sec = row0_top_read_done - row0_top_read_t0;
+    if (!ok) return false;
+
+    const uint32_t logits_row = (*row0_top == prompt->v[start + 1u]) ? 1u : 0u;
+    if (profile) profile->logits_row = logits_row;
+    if (logits_row == 1u && !eager_row1_head) {
+        const double row1_head_t0 = profile ? now_sec() : 0.0;
+        ok = ds4_metal_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              2,
+                                                              1,
+                                                              weights->output->dim[1]);
+        if (ok) ok = ds4_metal_end_commands() != 0;
+        else (void)ds4_metal_synchronize();
+        const double row1_head_done = profile ? now_sec() : 0.0;
+        if (profile) profile->row1_head_sec = row1_head_done - row1_head_t0;
+        if (!ok) return false;
+    }
+    const double logits_read_t0 = profile ? now_sec() : 0.0;
+    ok = metal_graph_read_spec_logits_row(g, logits_row, row_logits);
+    const double logits_read_done = profile ? now_sec() : 0.0;
+    if (profile) {
+        profile->logits_read_sec = logits_read_done - logits_read_t0;
+        profile->total_sec = logits_read_done - t0;
+    }
+    return ok;
 }
 
 /* Fast hybrid verifier for approximate speed mode.
@@ -13564,7 +14206,8 @@ static bool metal_graph_verify_suffix_prefix_final(
         int                   *row_tops,
         float                 *last_logits) {
     if (!g || !row_tops || !last_logits || n_tokens < 2 ||
-        n_tokens > g->prefill_cap || !g->spec_logits) {
+        n_tokens > g->prefill_cap || !g->spec_logits ||
+        n_tokens > g->spec_logits_rows) {
         return false;
     }
     if (validate_rows == 0 || validate_rows >= n_tokens) return false;
@@ -13779,6 +14422,7 @@ static bool metal_graph_verify_decode_exact_n(
         uint32_t               start,
         int                   *row_tops,
         float                 *prefix1_logits,
+        float                 *prefix2_logits,
         float                 *last_logits) {
     if (!g || !tokens || n_tokens == 0 || n_tokens > 4 || !last_logits || g->raw_cap == 0) {
         return false;
@@ -13808,7 +14452,9 @@ static bool metal_graph_verify_decode_exact_n(
     ds4_metal_tensor *saved_cur = g->cur_hc;
     ds4_metal_tensor *saved_after = g->after_ffn_hc;
     const bool saved_capture = g->spec_capture_prefix1;
+    const bool saved_capture2 = g->spec_capture_prefix2;
     g->spec_capture_prefix1 = prefix1_logits != NULL && n_tokens > 1;
+    g->spec_capture_prefix2 = prefix2_logits != NULL && n_tokens > 2;
 
     if (ok) ok = ds4_metal_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -13830,6 +14476,10 @@ static bool metal_graph_verify_decode_exact_n(
                 ok = metal_graph_capture_prefix1_attn_state(g, il) &&
                      metal_graph_capture_prefix1_index_state(g, il);
             }
+            if (ok && t == 1 && g->spec_capture_prefix2) {
+                ok = metal_graph_capture_prefix2_attn_state(g, il) &&
+                     metal_graph_capture_prefix2_index_state(g, il);
+            }
         }
         for (uint32_t t = 0; ok && t < n_tokens; t++) {
             ds4_metal_tensor *tmp = cur[t];
@@ -13843,6 +14493,7 @@ static bool metal_graph_verify_decode_exact_n(
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
     g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix2 = saved_capture2;
 
     for (uint32_t t = 0; ok && t < n_tokens; t++) {
         g->cur_hc = cur[t];
@@ -13870,6 +14521,12 @@ static bool metal_graph_verify_decode_exact_n(
                                        prefix1_logits,
                                        (uint64_t)DS4_N_VOCAB * sizeof(prefix1_logits[0])) != 0;
         }
+        if (ok && t == 1 && prefix2_logits) {
+            ok = ds4_metal_tensor_read(g->logits,
+                                       0,
+                                       prefix2_logits,
+                                       (uint64_t)DS4_N_VOCAB * sizeof(prefix2_logits[0])) != 0;
+        }
         if (ok && t + 1u == n_tokens) {
             ok = ds4_metal_tensor_read(g->logits,
                                        0,
@@ -13881,6 +14538,7 @@ static bool metal_graph_verify_decode_exact_n(
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
     g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix2 = saved_capture2;
     for (uint32_t t = 0; t < n_tokens; t++) {
         ds4_metal_tensor_free(next[t]);
         ds4_metal_tensor_free(cur[t]);
@@ -14059,7 +14717,7 @@ static int metal_graph_prompt_logits_test(
 
     ds4_metal_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false, 0);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -15027,6 +15685,34 @@ static DS4_MAYBE_UNUSED int logits_rank_for_token(const float *logits,
     return rank;
 }
 
+static DS4_MAYBE_UNUSED int logits_top_k_ids(const float *logits,
+                                             uint32_t n_vocab,
+                                             int *top_ids,
+                                             int top_k) {
+    if (!logits || !top_ids || top_k <= 0) return 0;
+    if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
+    float vals[16];
+    if (top_k > 16) top_k = 16;
+    int n = 0;
+    for (int i = 0; i < top_k; i++) {
+        top_ids[i] = -1;
+        vals[i] = DS4_NEG_INF;
+    }
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (n == top_k && v <= vals[n - 1]) continue;
+        int j = n < top_k ? n++ : n - 1;
+        while (j > 0 && vals[j - 1] < v) {
+            vals[j] = vals[j - 1];
+            top_ids[j] = top_ids[j - 1];
+            j--;
+        }
+        vals[j] = v;
+        top_ids[j] = (int)i;
+    }
+    return n;
+}
+
 static uint64_t sample_rng_next(uint64_t *state) {
     uint64_t x = *state;
     if (x == 0) x = 0x9e3779b97f4a7c15ULL;
@@ -15372,7 +16058,7 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_metal_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, 0);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate Metal graph runtime\n");
         return 1;
@@ -15596,8 +16282,86 @@ static void ds4_acquire_instance_lock(void) {
 #define DS4_MTP_AUDIT_MARGIN_BUCKETS 7
 #define DS4_MTP_TREE_MAX_DEPTH 6
 #define DS4_MTP_TREE_K_BUCKETS 4
+#define DS4_MTP_TREE_SHAPE_DEPTH 3
+#define DS4_MTP_TREE_SHAPES 6
+#define DS4_MTP_TREE_DYNAMIC_POLICIES 5
+#define DS4_MTP_STATS_MAX_DRAFT 16
 
 static const int ds4_mtp_tree_k_values[DS4_MTP_TREE_K_BUCKETS] = { 1, 2, 4, 8 };
+static const int ds4_mtp_tree_shape_fanout[DS4_MTP_TREE_SHAPES][DS4_MTP_TREE_SHAPE_DEPTH] = {
+    { 2, 2, 2 },
+    { 4, 2, 1 },
+    { 4, 2, 2 },
+    { 4, 4, 1 },
+    { 4, 4, 2 },
+    { 8, 4, 1 },
+};
+static const char *ds4_mtp_tree_shape_names[DS4_MTP_TREE_SHAPES] = {
+    "2x2x2",
+    "4x2x1",
+    "4x2x2",
+    "4x4x1",
+    "4x4x2",
+    "8x4x1",
+};
+static const char *ds4_mtp_tree_dynamic_policy_names[DS4_MTP_TREE_DYNAMIC_POLICIES] = {
+    "root>=2:2x2x2_else4x2x2",
+    "root>=5:2x2x2_root>=2:4x2x2_else4x4x2",
+    "min>=2:2x2x2_else4x2x2",
+    "min>=5:2x2x2_min>=2:4x2x2_else4x4x2",
+    "depth>=2:2_else4",
+};
+
+static uint64_t ds4_mtp_tree_shape_nodes(const int *fanout,
+                                         int depth,
+                                         uint64_t *max_width) {
+    uint64_t nodes = 0;
+    uint64_t width = 1;
+    uint64_t max_w = 0;
+    for (int d = 0; d < depth && d < DS4_MTP_TREE_SHAPE_DEPTH; d++) {
+        width *= (uint64_t)fanout[d];
+        nodes += width;
+        if (width > max_w) max_w = width;
+    }
+    if (max_width) *max_width = max_w;
+    return nodes;
+}
+
+static uint64_t ds4_mtp_tree_shape_serial_path_decodes(const int *fanout,
+                                                       int depth) {
+    uint64_t decodes = 0;
+    uint64_t width = 1;
+    for (int d = 0; d < depth && d < DS4_MTP_TREE_SHAPE_DEPTH; d++) {
+        width *= (uint64_t)fanout[d];
+        decodes += width * (uint64_t)(d + 1);
+    }
+    return decodes;
+}
+
+static uint64_t ds4_ceil_div_u64(uint64_t n, uint64_t d) {
+    if (d == 0) return 0;
+    return (n + d - 1u) / d;
+}
+
+static bool ds4_mtp_tree_shape_by_name(const char *name, int *fanout) {
+    if (!name || !name[0] || !fanout) return false;
+    for (int i = 0; i < DS4_MTP_TREE_SHAPES; i++) {
+        if (strcmp(name, ds4_mtp_tree_shape_names[i])) continue;
+        for (int d = 0; d < DS4_MTP_TREE_SHAPE_DEPTH; d++) {
+            fanout[d] = ds4_mtp_tree_shape_fanout[i][d];
+        }
+        return true;
+    }
+    return false;
+}
+
+static int ds4_mtp_tree_shape_index_by_name(const char *name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < DS4_MTP_TREE_SHAPES; i++) {
+        if (strcmp(name, ds4_mtp_tree_shape_names[i]) == 0) return i;
+    }
+    return -1;
+}
 
 struct ds4_session {
     ds4_engine *engine;
@@ -15608,6 +16372,10 @@ struct ds4_session {
     float *logits;
     float *mtp_logits;
     int mtp_draft_token;
+    bool mtp_prefetched_second_valid;
+    bool mtp_prefetched_second_margin_valid;
+    int mtp_prefetched_second_token;
+    float mtp_prefetched_second_margin;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
@@ -15619,18 +16387,33 @@ struct ds4_session {
     bool mtp_stats_enabled;
     bool mtp_stats_print;
     bool mtp_adaptive_enabled;
+    bool mtp_adaptive_cheap;
+    bool mtp_adaptive_cheap_full_skip;
+    bool mtp_stop_generation;
     bool mtp_speed_audit_enabled;
     bool mtp_tree_oracle_enabled;
     bool mtp_oracle_reported;
     bool mtp_batch_probe_reported;
+    bool mtp_tree_branch_swap_reported;
+    bool mtp_tree_sibling_reported;
+    bool mtp_tree_grandchild_reported;
+    uint64_t mtp_tree_root_batch_probe_steps;
+    uint64_t mtp_tree_row_kernel_probe_steps;
+    uint64_t mtp_tree_full_probe_steps;
     bool mtp_draft_margin_valid;
+    bool mtp_draft_target_margin_valid;
     float mtp_draft_margin;
+    int mtp_draft_target_margin_bucket;
+    int mtp_draft_top_k;
+    int mtp_draft_top_ids[16];
     struct {
         uint64_t target_eval_count;
         uint64_t mtp_probe_count;
         uint64_t mtp_spec_steps;
         uint64_t mtp_first_miss;
+        uint64_t mtp_first_rescue;
         uint64_t mtp_margin_skip;
+        uint64_t mtp_target_margin_skip;
         uint64_t mtp_micro;
         uint64_t mtp_decode2;
         uint64_t mtp_seq;
@@ -15639,6 +16422,12 @@ struct ds4_session {
         uint64_t mtp_full_accept;
         uint64_t mtp_partial_accept;
         uint64_t mtp_adaptive_skip;
+        uint64_t mtp_drafted_hist[DS4_MTP_STATS_MAX_DRAFT + 1];
+        uint64_t mtp_committed_hist[DS4_MTP_STATS_MAX_DRAFT + 1];
+        uint64_t mtp_probe_target_margin_total[DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        uint64_t mtp_probe_target_margin_hit[DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        double mtp_committed_total_sec[DS4_MTP_STATS_MAX_DRAFT + 1];
+        double mtp_committed_replay_sec[DS4_MTP_STATS_MAX_DRAFT + 1];
         double target_eval_sec;
         double mtp_probe_sec;
         double mtp_draft_sec;
@@ -15668,10 +16457,36 @@ struct ds4_session {
     struct {
         uint64_t steps;
         uint64_t failures;
+        uint64_t actual_depth_sum;
         uint64_t position_total[DS4_MTP_TREE_MAX_DEPTH];
         uint64_t position_le[DS4_MTP_TREE_K_BUCKETS][DS4_MTP_TREE_MAX_DEPTH];
         uint64_t path_contains[DS4_MTP_TREE_K_BUCKETS][DS4_MTP_TREE_MAX_DEPTH];
         uint64_t path_len_sum[DS4_MTP_TREE_K_BUCKETS];
+        uint64_t full_tree_nodes_sum[DS4_MTP_TREE_K_BUCKETS];
+        uint64_t shape_contains[DS4_MTP_TREE_SHAPES][DS4_MTP_TREE_MAX_DEPTH];
+        uint64_t shape_len_sum[DS4_MTP_TREE_SHAPES];
+        uint64_t shape_full_depth[DS4_MTP_TREE_SHAPES];
+        uint64_t shape_nodes_sum[DS4_MTP_TREE_SHAPES];
+        uint64_t root_margin_steps[DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        uint64_t shape_root_len_sum[DS4_MTP_TREE_SHAPES][DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        uint64_t shape_root_full_depth[DS4_MTP_TREE_SHAPES][DS4_MTP_AUDIT_MARGIN_BUCKETS];
+        uint64_t dynamic_contains[DS4_MTP_TREE_DYNAMIC_POLICIES][DS4_MTP_TREE_MAX_DEPTH];
+        uint64_t dynamic_len_sum[DS4_MTP_TREE_DYNAMIC_POLICIES];
+        uint64_t dynamic_full_depth[DS4_MTP_TREE_DYNAMIC_POLICIES];
+        uint64_t dynamic_nodes_sum[DS4_MTP_TREE_DYNAMIC_POLICIES];
+        uint64_t branch_dynamic_steps[DS4_MTP_TREE_DYNAMIC_POLICIES];
+        uint64_t branch_dynamic_len_sum[DS4_MTP_TREE_DYNAMIC_POLICIES];
+        uint64_t branch_dynamic_full_depth[DS4_MTP_TREE_DYNAMIC_POLICIES];
+        uint64_t branch_dynamic_nodes_sum[DS4_MTP_TREE_DYNAMIC_POLICIES];
+        double branch_dynamic_mtp_eval_sec;
+        uint64_t target_verify_steps[DS4_MTP_TREE_SHAPES];
+        uint64_t target_verify_failures[DS4_MTP_TREE_SHAPES];
+        uint64_t target_verify_len_sum[DS4_MTP_TREE_SHAPES];
+        uint64_t target_verify_nodes_sum[DS4_MTP_TREE_SHAPES];
+        uint64_t target_verify_paths_sum[DS4_MTP_TREE_SHAPES];
+        uint64_t target_verify_decode_sum[DS4_MTP_TREE_SHAPES];
+        double target_verify_target_sec[DS4_MTP_TREE_SHAPES];
+        double target_verify_mtp_sec[DS4_MTP_TREE_SHAPES];
         double oracle_sec;
         double mtp_eval_sec;
     } mtp_tree_oracle;
@@ -15685,6 +16500,17 @@ typedef enum ds4_mtp_stats_path {
     DS4_MTP_STATS_DECODE2,
     DS4_MTP_STATS_SEQ,
 } ds4_mtp_stats_path;
+
+static int ds4_mtp_adaptive_skip_len(void) {
+    int skip_len = 10;
+    const char *skip_env = getenv("DS4_MTP_ADAPTIVE_SKIP");
+    if (skip_env && skip_env[0]) {
+        char *end = NULL;
+        long v = strtol(skip_env, &end, 10);
+        if (end != skip_env && v >= 0 && v <= 4096) skip_len = (int)v;
+    }
+    return skip_len;
+}
 
 static void ds4_mtp_stats_record_step(ds4_session *s,
                                       ds4_mtp_stats_path path,
@@ -15702,6 +16528,16 @@ static void ds4_mtp_stats_record_step(ds4_session *s,
         if (committed > 0) s->mtp_stats.mtp_suffix_committed += (uint64_t)committed;
         if (drafted > 0 && committed == drafted) s->mtp_stats.mtp_full_accept++;
         else if (committed > 0) s->mtp_stats.mtp_partial_accept++;
+        int drafted_bucket = drafted;
+        if (drafted_bucket < 0) drafted_bucket = 0;
+        if (drafted_bucket > DS4_MTP_STATS_MAX_DRAFT) drafted_bucket = DS4_MTP_STATS_MAX_DRAFT;
+        int committed_bucket = committed;
+        if (committed_bucket < 0) committed_bucket = 0;
+        if (committed_bucket > DS4_MTP_STATS_MAX_DRAFT) committed_bucket = DS4_MTP_STATS_MAX_DRAFT;
+        s->mtp_stats.mtp_drafted_hist[drafted_bucket]++;
+        s->mtp_stats.mtp_committed_hist[committed_bucket]++;
+        s->mtp_stats.mtp_committed_total_sec[committed_bucket] += total_sec;
+        s->mtp_stats.mtp_committed_replay_sec[committed_bucket] += replay_sec;
         s->mtp_stats.mtp_draft_sec += draft_sec;
         s->mtp_stats.mtp_verify_sec += verify_sec;
         s->mtp_stats.mtp_prefix_sec += prefix_sec;
@@ -15715,7 +16551,14 @@ static void ds4_mtp_stats_record_step(ds4_session *s,
         case DS4_MTP_STATS_SEQ:         s->mtp_stats.mtp_seq++; break;
         }
     }
-    if (s->mtp_adaptive_enabled) {
+    bool adaptive_stop = false;
+    if (s->mtp_adaptive_enabled && s->mtp_adaptive_cheap) {
+        adaptive_stop = committed <= 0 || committed < drafted || s->mtp_adaptive_cheap_full_skip;
+        if (adaptive_stop) {
+            const int skip_len = ds4_mtp_adaptive_skip_len();
+            if (s->mtp_probe_skip < skip_len) s->mtp_probe_skip = skip_len;
+        }
+    } else if (s->mtp_adaptive_enabled) {
         const double target_avg =
             s->mtp_stats.target_eval_count ?
             s->mtp_stats.target_eval_sec / (double)s->mtp_stats.target_eval_count : 0.0;
@@ -15724,18 +16567,19 @@ static void ds4_mtp_stats_record_step(ds4_session *s,
             s->mtp_stats.mtp_probe_sec / (double)s->mtp_stats.mtp_probe_count : 0.0;
         const double saved = (double)committed * target_avg;
         const double extra = total_sec + probe_avg;
-        int skip_len = 2;
-        const char *skip_env = getenv("DS4_MTP_ADAPTIVE_SKIP");
-        if (skip_env && skip_env[0]) {
-            char *end = NULL;
-            long v = strtol(skip_env, &end, 10);
-            if (end != skip_env && v >= 0 && v <= 32) skip_len = (int)v;
-        }
-        if (committed <= 0 || committed < drafted || saved <= extra) {
+        const int skip_len = ds4_mtp_adaptive_skip_len();
+        adaptive_stop = committed <= 0 || committed < drafted || saved <= extra;
+        if (adaptive_stop) {
             if (s->mtp_probe_skip < skip_len) s->mtp_probe_skip = skip_len;
         }
     }
+    if (adaptive_stop && getenv("DS4_MTP_ADAPTIVE_STOP_DIRECT") != NULL) {
+        s->mtp_stop_generation = true;
+    }
 }
+
+static int ds4_mtp_audit_margin_bucket(float margin);
+static const char *ds4_mtp_audit_margin_bucket_name(int bucket);
 
 static void ds4_mtp_stats_print(ds4_session *s) {
     if (!s || !s->mtp_stats_print) return;
@@ -15751,7 +16595,8 @@ static void ds4_mtp_stats_print(ds4_session *s) {
     fprintf(stderr,
             "ds4: mtp stats target_eval=%llu target_avg=%.3fms "
             "probe=%llu probe_avg=%.3fms steps=%llu first_miss=%llu "
-            "margin_skip=%llu micro=%llu decode2=%llu seq=%llu "
+            "first_rescue=%llu margin_skip=%llu target_margin_skip=%llu "
+            "micro=%llu decode2=%llu seq=%llu "
             "drafted=%llu committed=%llu full=%llu partial=%llu adaptive_skip=%llu "
             "draft=%.3fms verify=%.3fms prefix=%.3fms replay=%.3fms total=%.3fms "
             "est_saved=%.3fms est_extra=%.3fms est_net=%.3fms\n",
@@ -15761,7 +16606,9 @@ static void ds4_mtp_stats_print(ds4_session *s) {
             probe_ms,
             (unsigned long long)s->mtp_stats.mtp_spec_steps,
             (unsigned long long)s->mtp_stats.mtp_first_miss,
+            (unsigned long long)s->mtp_stats.mtp_first_rescue,
             (unsigned long long)s->mtp_stats.mtp_margin_skip,
+            (unsigned long long)s->mtp_stats.mtp_target_margin_skip,
             (unsigned long long)s->mtp_stats.mtp_micro,
             (unsigned long long)s->mtp_stats.mtp_decode2,
             (unsigned long long)s->mtp_stats.mtp_seq,
@@ -15778,6 +16625,73 @@ static void ds4_mtp_stats_print(ds4_session *s) {
             saved_ms,
             extra_ms,
             saved_ms - extra_ms);
+    fprintf(stderr, "ds4: mtp stats draft_hist=");
+    bool any = false;
+    for (int i = 0; i <= DS4_MTP_STATS_MAX_DRAFT; i++) {
+        if (!s->mtp_stats.mtp_drafted_hist[i]) continue;
+        fprintf(stderr,
+                "%s%d:%llu",
+                any ? "," : "",
+                i,
+                (unsigned long long)s->mtp_stats.mtp_drafted_hist[i]);
+        any = true;
+    }
+    if (!any) fprintf(stderr, "empty");
+    fprintf(stderr, " commit_hist=");
+    any = false;
+    for (int i = 0; i <= DS4_MTP_STATS_MAX_DRAFT; i++) {
+        if (!s->mtp_stats.mtp_committed_hist[i]) continue;
+        fprintf(stderr,
+                "%s%d:%llu",
+                any ? "," : "",
+                i,
+                (unsigned long long)s->mtp_stats.mtp_committed_hist[i]);
+        any = true;
+    }
+    if (!any) fprintf(stderr, "empty");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "ds4: mtp stats commit_total_ms=");
+    any = false;
+    for (int i = 0; i <= DS4_MTP_STATS_MAX_DRAFT; i++) {
+        if (!s->mtp_stats.mtp_committed_hist[i]) continue;
+        fprintf(stderr,
+                "%s%d:%.3f",
+                any ? "," : "",
+                i,
+                s->mtp_stats.mtp_committed_total_sec[i] * 1000.0);
+        any = true;
+    }
+    if (!any) fprintf(stderr, "empty");
+    fprintf(stderr, " commit_replay_ms=");
+    any = false;
+    for (int i = 0; i <= DS4_MTP_STATS_MAX_DRAFT; i++) {
+        if (!s->mtp_stats.mtp_committed_hist[i]) continue;
+        fprintf(stderr,
+                "%s%d:%.3f",
+                any ? "," : "",
+                i,
+                s->mtp_stats.mtp_committed_replay_sec[i] * 1000.0);
+        any = true;
+    }
+    if (!any) fprintf(stderr, "empty");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "ds4: mtp stats target_margin_probe=");
+    any = false;
+    for (int i = 0; i < DS4_MTP_AUDIT_MARGIN_BUCKETS; i++) {
+        const uint64_t total = s->mtp_stats.mtp_probe_target_margin_total[i];
+        if (!total) continue;
+        const uint64_t hit = s->mtp_stats.mtp_probe_target_margin_hit[i];
+        fprintf(stderr,
+                "%s%s:%llu/%llu(%.1f%%)",
+                any ? "," : "",
+                ds4_mtp_audit_margin_bucket_name(i),
+                (unsigned long long)hit,
+                (unsigned long long)total,
+                (100.0 * (double)hit) / (double)total);
+        any = true;
+    }
+    if (!any) fprintf(stderr, "empty");
+    fprintf(stderr, "\n");
 }
 
 static int ds4_mtp_audit_margin_bucket(float margin) {
@@ -15800,6 +16714,852 @@ static const char *ds4_mtp_audit_margin_bucket_name(int bucket) {
     case 5: return "<5";
     default: return ">=5";
     }
+}
+
+static uint64_t ds4_mtp_tree_frontier_state_bytes(ds4_metal_graph *g) {
+    if (!g) return 0;
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        bytes += ds4_metal_tensor_bytes(g->layer_attn_state_kv[il]);
+        bytes += ds4_metal_tensor_bytes(g->layer_attn_state_score[il]);
+        if (ratio == 4) {
+            bytes += ds4_metal_tensor_bytes(g->layer_index_state_kv[il]);
+            bytes += ds4_metal_tensor_bytes(g->layer_index_state_score[il]);
+        }
+    }
+    return bytes;
+}
+
+static DS4_MAYBE_UNUSED uint64_t layer_attn_state_bytes(uint32_t ratio);
+static DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio);
+static void ds4_mtp_tree_state_alloc_probe(ds4_session *s);
+
+static void ds4_mtp_tree_state_plan_print(ds4_session *s, int depth) {
+    if (!s ||
+        (getenv("DS4_MTP_TREE_STATE_PLAN") == NULL &&
+         getenv("DS4_MTP_TREE_BATCH_PLAN") == NULL &&
+         getenv("DS4_MTP_TREE_STATE_ALLOC") == NULL)) {
+        return;
+    }
+    if (depth <= 0) return;
+    if (depth > DS4_MTP_TREE_SHAPE_DEPTH) depth = DS4_MTP_TREE_SHAPE_DEPTH;
+
+    ds4_metal_graph *g = &s->graph;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t frontier_bytes = ds4_mtp_tree_frontier_state_bytes(g);
+    const uint64_t raw_row_bytes =
+        (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t scratch_rows =
+        s->prefill_cap < g->spec_logits_rows ? s->prefill_cap : g->spec_logits_rows;
+
+    fprintf(stderr,
+            "ds4: mtp tree-plan depth=%d scratch_rows=%u prefill_cap=%u spec_logits_rows=%u "
+            "frontier_state=%.2f MiB raw_row_per_node=%.2f MiB\n",
+            depth,
+            scratch_rows,
+            s->prefill_cap,
+            g->spec_logits_rows,
+            (double)frontier_bytes / (1024.0 * 1024.0),
+            (double)raw_row_bytes / (1024.0 * 1024.0));
+
+    for (int i = 0; i < DS4_MTP_TREE_SHAPES; i++) {
+        uint64_t max_width = 0;
+        const uint64_t nodes =
+            ds4_mtp_tree_shape_nodes(ds4_mtp_tree_shape_fanout[i],
+                                     depth,
+                                     &max_width);
+        const uint64_t serial_decodes =
+            ds4_mtp_tree_shape_serial_path_decodes(ds4_mtp_tree_shape_fanout[i],
+                                                   depth);
+        const uint64_t active_hc_bytes = 2u * max_width * hc_dim * sizeof(float);
+        const uint64_t branch_raw_bytes = nodes * raw_row_bytes;
+        const uint64_t branch_frontier_bytes = nodes * frontier_bytes;
+        uint64_t width = 1;
+        uint64_t chunked_passes = 0;
+        uint64_t peak_frontier_buffers = 0;
+        uint64_t peak_raw_path_rows = 0;
+        char widths_buf[64];
+        size_t widths_len = 0;
+        widths_buf[0] = '\0';
+        for (int d = 0; d < depth; d++) {
+            const uint64_t parent_width = width;
+            width *= (uint64_t)ds4_mtp_tree_shape_fanout[i][d];
+            chunked_passes += ds4_ceil_div_u64(width, scratch_rows);
+            const uint64_t frontier_buffers = parent_width + width;
+            if (frontier_buffers > peak_frontier_buffers) {
+                peak_frontier_buffers = frontier_buffers;
+            }
+            const uint64_t raw_path_rows = width * (uint64_t)(d + 1);
+            if (raw_path_rows > peak_raw_path_rows) {
+                peak_raw_path_rows = raw_path_rows;
+            }
+            int written = snprintf(widths_buf + widths_len,
+                                   sizeof(widths_buf) - widths_len,
+                                   "%s%llu",
+                                   d ? "x" : "",
+                                   (unsigned long long)width);
+            if (written < 0) written = 0;
+            if ((size_t)written >= sizeof(widths_buf) - widths_len) {
+                widths_len = sizeof(widths_buf) - 1u;
+            } else {
+                widths_len += (size_t)written;
+            }
+        }
+        const uint64_t frontier_double_buffer_bytes =
+            peak_frontier_buffers * frontier_bytes;
+        const uint64_t raw_active_path_bytes =
+            peak_raw_path_rows * raw_row_bytes;
+        fprintf(stderr,
+                "ds4: mtp tree-plan shape=%s nodes=%llu max_width=%llu fits_scratch=%d "
+                "active_hc=%.2f MiB branch_raw=%.2f MiB branch_frontier=%.2f MiB\n",
+                ds4_mtp_tree_shape_names[i],
+                (unsigned long long)nodes,
+                (unsigned long long)max_width,
+                max_width <= (uint64_t)scratch_rows ? 1 : 0,
+                (double)active_hc_bytes / (1024.0 * 1024.0),
+                (double)branch_raw_bytes / (1024.0 * 1024.0),
+                (double)branch_frontier_bytes / (1024.0 * 1024.0));
+        fprintf(stderr,
+                "ds4: mtp tree-batch-plan shape=%s widths=%s target_rows=%llu "
+                "serial_path_decodes=%llu replay_multiplier=%.2f depth_passes=%d "
+                "chunked_passes=%llu frontier_double_buffer=%.2f MiB "
+                "raw_active_path=%.2f MiB\n",
+                ds4_mtp_tree_shape_names[i],
+                widths_buf,
+                (unsigned long long)nodes,
+                (unsigned long long)serial_decodes,
+                nodes > 0 ? (double)serial_decodes / (double)nodes : 0.0,
+                depth,
+                (unsigned long long)chunked_passes,
+                (double)frontier_double_buffer_bytes / (1024.0 * 1024.0),
+                (double)raw_active_path_bytes / (1024.0 * 1024.0));
+    }
+
+    const int worst_dynamic[DS4_MTP_TREE_SHAPE_DEPTH] = { 4, 4, 4 };
+    uint64_t max_width = 0;
+    const uint64_t nodes = ds4_mtp_tree_shape_nodes(worst_dynamic, depth, &max_width);
+    const uint64_t serial_decodes =
+        ds4_mtp_tree_shape_serial_path_decodes(worst_dynamic, depth);
+    uint64_t width = 1;
+    uint64_t chunked_passes = 0;
+    for (int d = 0; d < depth; d++) {
+        width *= (uint64_t)worst_dynamic[d];
+        chunked_passes += ds4_ceil_div_u64(width, scratch_rows);
+    }
+    fprintf(stderr,
+            "ds4: mtp tree-plan dynamic=depth>=2:2_else4 worst_nodes=%llu "
+            "worst_max_width=%llu fits_scratch=%d serial_path_decodes=%llu "
+            "chunked_passes=%llu note=chunk_or_cap_required\n",
+            (unsigned long long)nodes,
+            (unsigned long long)max_width,
+            max_width <= (uint64_t)scratch_rows ? 1 : 0,
+            (unsigned long long)serial_decodes,
+            (unsigned long long)chunked_passes);
+
+    ds4_mtp_tree_state_alloc_probe(s);
+}
+
+static void ds4_mtp_tree_row_kernel_plan_print(ds4_session *s) {
+    const char *env = getenv("DS4_MTP_TREE_ROW_KERNEL_PLAN");
+    if (!s || !env || !env[0]) return;
+
+    const char *shape = strcmp(env, "1") == 0 ? "4x2x2" : env;
+    int fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    if (!ds4_mtp_tree_shape_by_name(shape, fanout)) {
+        fprintf(stderr,
+                "ds4: mtp tree-row-kernel-plan shape=%s invalid=1\n",
+                shape);
+        return;
+    }
+
+    int depth = DS4_MTP_TREE_SHAPE_DEPTH;
+    const char *depth_env = getenv("DS4_MTP_TREE_ROW_KERNEL_PLAN_DEPTH");
+    if (depth_env && depth_env[0]) {
+        char *end = NULL;
+        long v = strtol(depth_env, &end, 10);
+        if (end != depth_env && v > 0 && v <= DS4_MTP_TREE_SHAPE_DEPTH) {
+            depth = (int)v;
+        }
+    }
+
+    ds4_metal_graph *g = &s->graph;
+    const uint32_t scratch_rows =
+        s->prefill_cap < g->spec_logits_rows ? s->prefill_cap : g->spec_logits_rows;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t frontier_bytes = ds4_mtp_tree_frontier_state_bytes(g);
+    const uint64_t raw_row_bytes =
+        (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    uint64_t nodes = 0;
+    uint64_t max_width = 0;
+    uint64_t width = 1;
+    uint64_t chunked_passes = 0;
+    uint64_t peak_frontier_slots = 0;
+    uint64_t peak_raw_path_rows = 0;
+    char widths_buf[64];
+    size_t widths_len = 0;
+    widths_buf[0] = '\0';
+    for (int d = 0; d < depth; d++) {
+        const uint64_t parent_width = width;
+        width *= (uint64_t)fanout[d];
+        nodes += width;
+        if (width > max_width) max_width = width;
+        chunked_passes += scratch_rows ? ds4_ceil_div_u64(width, scratch_rows) : 0;
+        const uint64_t frontier_slots = parent_width + width;
+        if (frontier_slots > peak_frontier_slots) peak_frontier_slots = frontier_slots;
+        const uint64_t raw_path_rows = width * (uint64_t)(d + 1);
+        if (raw_path_rows > peak_raw_path_rows) peak_raw_path_rows = raw_path_rows;
+        int written = snprintf(widths_buf + widths_len,
+                               sizeof(widths_buf) - widths_len,
+                               "%s%llu",
+                               d ? "x" : "",
+                               (unsigned long long)width);
+        if (written < 0) written = 0;
+        if ((size_t)written >= sizeof(widths_buf) - widths_len) {
+            widths_len = sizeof(widths_buf) - 1u;
+        } else {
+            widths_len += (size_t)written;
+        }
+    }
+
+    uint32_t raw_layers = 0;
+    uint32_t ratio4_layers = 0;
+    uint32_t ratio128_layers = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) raw_layers++;
+        else if (ratio == 4) ratio4_layers++;
+        else ratio128_layers++;
+    }
+
+    fprintf(stderr,
+            "ds4: mtp tree-row-kernel-plan shape=%s depth=%d widths=%s "
+            "nodes=%llu max_width=%llu scratch_rows=%u fits_scratch=%d "
+            "chunked_passes=%llu active_hc=%.2f MiB frontier_slot=%.2f MiB "
+            "peak_frontier=%.2f MiB raw_active_path=%.2f MiB\n",
+            shape,
+            depth,
+            widths_buf,
+            (unsigned long long)nodes,
+            (unsigned long long)max_width,
+            scratch_rows,
+            scratch_rows && max_width <= (uint64_t)scratch_rows ? 1 : 0,
+            (unsigned long long)chunked_passes,
+            (double)(2u * max_width * hc_dim * sizeof(float)) / (1024.0 * 1024.0),
+            (double)frontier_bytes / (1024.0 * 1024.0),
+            (double)(peak_frontier_slots * frontier_bytes) / (1024.0 * 1024.0),
+            (double)(peak_raw_path_rows * raw_row_bytes) / (1024.0 * 1024.0));
+
+    width = 1;
+    for (int d = 0; d < depth; d++) {
+        width *= (uint64_t)fanout[d];
+        fprintf(stderr,
+                "ds4: mtp tree-row-kernel-plan depth=%d rows=%llu "
+                "layer_rows=%llu raw_rows=%llu r4_rows=%llu r128_rows=%llu "
+                "position_semantics=same-position-siblings parent_state=branch-slot\n",
+                d,
+                (unsigned long long)width,
+                (unsigned long long)(width * DS4_N_LAYER),
+                (unsigned long long)(width * raw_layers),
+                (unsigned long long)(width * ratio4_layers),
+                (unsigned long long)(width * ratio128_layers));
+    }
+
+    fprintf(stderr,
+            "ds4: mtp tree-row-kernel-contract inputs=token,absolute_position,parent_slot,dst_slot,"
+            "branch_raw_window,branch_raw_cap,branch_compressed_row_base "
+            "outputs=hc_row,optional_logits,updated_raw_row,updated_frontier_counters,"
+            "new_attn_comp_rows,new_index_comp_rows\n");
+    fprintf(stderr,
+            "ds4: mtp tree-row-kernel-contract exactness=same_as_one_token_decode "
+            "linear_suffix_batch_reuse=0 sibling_kv_visibility=branch-local "
+            "same_position_rope=1 batch_output_head=0 "
+            "gate=top_mismatches=0,logit_mismatches=0,max_delta=0\n");
+    fprintf(stderr,
+            "ds4: mtp tree-row-kernel-next-slice replace=ds4_mtp_tree_decode_rows_command_batch "
+            "first_depth=0 first_shape=4x2x2 priority=compressed_layers "
+            "reason=r4+r128_rows_dominate_row_probe\n");
+}
+
+typedef struct {
+    ds4_metal_tensor *raw_rows[DS4_N_LAYER];
+    ds4_metal_tensor *attn_state_kv[DS4_N_LAYER];
+    ds4_metal_tensor *attn_state_score[DS4_N_LAYER];
+    ds4_metal_tensor *index_state_kv[DS4_N_LAYER];
+    ds4_metal_tensor *index_state_score[DS4_N_LAYER];
+    ds4_metal_tensor *attn_comp_rows[DS4_N_LAYER];
+    ds4_metal_tensor *index_comp_rows[DS4_N_LAYER];
+    uint32_t *n_comp;
+    uint32_t *n_index_comp;
+    uint32_t *base_n_comp;
+    uint32_t *base_n_index_comp;
+    uint64_t peak_frontier_slots;
+    uint64_t peak_raw_path_rows;
+    uint32_t max_new_comp_rows;
+    uint64_t bytes;
+} ds4_mtp_tree_state_scratch;
+
+static void ds4_mtp_tree_state_scratch_free(ds4_mtp_tree_state_scratch *st) {
+    if (!st) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_metal_tensor_free(st->raw_rows[il]);
+        ds4_metal_tensor_free(st->attn_state_kv[il]);
+        ds4_metal_tensor_free(st->attn_state_score[il]);
+        ds4_metal_tensor_free(st->index_state_kv[il]);
+        ds4_metal_tensor_free(st->index_state_score[il]);
+        ds4_metal_tensor_free(st->attn_comp_rows[il]);
+        ds4_metal_tensor_free(st->index_comp_rows[il]);
+    }
+    free(st->base_n_index_comp);
+    free(st->base_n_comp);
+    free(st->n_index_comp);
+    free(st->n_comp);
+    memset(st, 0, sizeof(*st));
+}
+
+static bool ds4_mtp_tree_state_scratch_alloc(ds4_mtp_tree_state_scratch *st,
+                                             const int *fanout,
+                                             int depth) {
+    if (!st || !fanout || depth <= 0) return false;
+    memset(st, 0, sizeof(*st));
+
+    uint64_t parent_width = 1;
+    uint64_t width = 1;
+    for (int d = 0; d < depth && d < DS4_MTP_TREE_SHAPE_DEPTH; d++) {
+        parent_width = width;
+        width *= (uint64_t)fanout[d];
+        const uint64_t frontier_slots = parent_width + width;
+        if (frontier_slots > st->peak_frontier_slots) {
+            st->peak_frontier_slots = frontier_slots;
+        }
+        const uint64_t raw_path_rows = width * (uint64_t)(d + 1);
+        if (raw_path_rows > st->peak_raw_path_rows) {
+            st->peak_raw_path_rows = raw_path_rows;
+        }
+    }
+    if (st->peak_frontier_slots == 0 || st->peak_raw_path_rows == 0) return false;
+
+    const uint64_t counter_count = st->peak_frontier_slots * (uint64_t)DS4_N_LAYER;
+    if (counter_count > SIZE_MAX / sizeof(uint32_t)) return false;
+    st->n_comp = xcalloc((size_t)counter_count, sizeof(st->n_comp[0]));
+    st->n_index_comp = xcalloc((size_t)counter_count, sizeof(st->n_index_comp[0]));
+    st->base_n_comp = xcalloc((size_t)counter_count, sizeof(st->base_n_comp[0]));
+    st->base_n_index_comp = xcalloc((size_t)counter_count, sizeof(st->base_n_index_comp[0]));
+    st->max_new_comp_rows = (uint32_t)depth;
+    st->bytes += 4u * counter_count * sizeof(uint32_t);
+
+    const uint64_t raw_bytes =
+        st->peak_raw_path_rows * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        st->raw_rows[il] = ds4_metal_tensor_alloc(raw_bytes);
+        if (!st->raw_rows[il]) goto fail;
+        st->bytes += raw_bytes;
+
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        st->attn_state_kv[il] = ds4_metal_tensor_alloc(st->peak_frontier_slots * ab);
+        st->attn_state_score[il] = ds4_metal_tensor_alloc(st->peak_frontier_slots * ab);
+        const uint64_t attn_comp_bytes =
+            st->peak_frontier_slots * (uint64_t)st->max_new_comp_rows *
+            (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+        st->attn_comp_rows[il] = ds4_metal_tensor_alloc(attn_comp_bytes);
+        if (!st->attn_state_kv[il] || !st->attn_state_score[il] ||
+            !st->attn_comp_rows[il]) {
+            goto fail;
+        }
+        st->bytes += 2u * st->peak_frontier_slots * ab + attn_comp_bytes;
+
+        if (ratio == 4) {
+            const uint64_t ib = layer_index_state_bytes(ratio);
+            st->index_state_kv[il] = ds4_metal_tensor_alloc(st->peak_frontier_slots * ib);
+            st->index_state_score[il] = ds4_metal_tensor_alloc(st->peak_frontier_slots * ib);
+            const uint64_t index_comp_bytes =
+                st->peak_frontier_slots * (uint64_t)st->max_new_comp_rows *
+                (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            st->index_comp_rows[il] = ds4_metal_tensor_alloc(index_comp_bytes);
+            if (!st->index_state_kv[il] || !st->index_state_score[il] ||
+                !st->index_comp_rows[il]) {
+                goto fail;
+            }
+            st->bytes += 2u * st->peak_frontier_slots * ib + index_comp_bytes;
+        }
+    }
+    return true;
+
+fail:
+    ds4_mtp_tree_state_scratch_free(st);
+    return false;
+}
+
+static bool ds4_mtp_tree_state_scratch_encode_capture_comp_rows(
+        ds4_mtp_tree_state_scratch *st,
+        ds4_session *s,
+        uint64_t slot) {
+    if (!st || !s || slot >= st->peak_frontier_slots) return false;
+    ds4_metal_graph *g = &s->graph;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint64_t idx = slot * DS4_N_LAYER + il;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+
+        const uint32_t base = st->base_n_comp[idx];
+        const uint32_t total = st->n_comp[idx];
+        if (total < base || total - base > st->max_new_comp_rows) return false;
+        const uint32_t rows = total - base;
+        if (rows != 0) {
+            const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+            const uint64_t dst_off =
+                (slot * (uint64_t)st->max_new_comp_rows) * row_bytes;
+            const uint64_t src_off = (uint64_t)base * row_bytes;
+            if (!st->attn_comp_rows[il] || !g->layer_attn_comp_cache[il] ||
+                ds4_metal_tensor_copy(st->attn_comp_rows[il],
+                                      dst_off,
+                                      g->layer_attn_comp_cache[il],
+                                      src_off,
+                                      (uint64_t)rows * row_bytes) == 0) {
+                return false;
+            }
+        }
+
+        if (ratio == 4) {
+            const uint32_t index_base = st->base_n_index_comp[idx];
+            const uint32_t index_total = st->n_index_comp[idx];
+            if (index_total < index_base ||
+                index_total - index_base > st->max_new_comp_rows) {
+                return false;
+            }
+            const uint32_t index_rows = index_total - index_base;
+            if (index_rows != 0) {
+                const uint64_t row_bytes =
+                    (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                const uint64_t dst_off =
+                    (slot * (uint64_t)st->max_new_comp_rows) * row_bytes;
+                const uint64_t src_off = (uint64_t)index_base * row_bytes;
+                if (!st->index_comp_rows[il] || !g->layer_index_comp_cache[il] ||
+                    ds4_metal_tensor_copy(st->index_comp_rows[il],
+                                          dst_off,
+                                          g->layer_index_comp_cache[il],
+                                          src_off,
+                                          (uint64_t)index_rows * row_bytes) == 0) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool ds4_mtp_tree_state_scratch_encode_restore_comp_rows(
+        ds4_mtp_tree_state_scratch *st,
+        ds4_session *s,
+        uint64_t slot) {
+    if (!st || !s || slot >= st->peak_frontier_slots) return false;
+    ds4_metal_graph *g = &s->graph;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint64_t idx = slot * DS4_N_LAYER + il;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+
+        const uint32_t base = st->base_n_comp[idx];
+        const uint32_t total = st->n_comp[idx];
+        if (total < base || total - base > st->max_new_comp_rows) return false;
+        const uint32_t rows = total - base;
+        if (rows != 0) {
+            const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+            const uint64_t src_off =
+                (slot * (uint64_t)st->max_new_comp_rows) * row_bytes;
+            const uint64_t dst_off = (uint64_t)base * row_bytes;
+            if (!st->attn_comp_rows[il] || !g->layer_attn_comp_cache[il] ||
+                ds4_metal_tensor_copy(g->layer_attn_comp_cache[il],
+                                      dst_off,
+                                      st->attn_comp_rows[il],
+                                      src_off,
+                                      (uint64_t)rows * row_bytes) == 0) {
+                return false;
+            }
+        }
+
+        if (ratio == 4) {
+            const uint32_t index_base = st->base_n_index_comp[idx];
+            const uint32_t index_total = st->n_index_comp[idx];
+            if (index_total < index_base ||
+                index_total - index_base > st->max_new_comp_rows) {
+                return false;
+            }
+            const uint32_t index_rows = index_total - index_base;
+            if (index_rows != 0) {
+                const uint64_t row_bytes =
+                    (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                const uint64_t src_off =
+                    (slot * (uint64_t)st->max_new_comp_rows) * row_bytes;
+                const uint64_t dst_off = (uint64_t)index_base * row_bytes;
+                if (!st->index_comp_rows[il] || !g->layer_index_comp_cache[il] ||
+                    ds4_metal_tensor_copy(g->layer_index_comp_cache[il],
+                                          dst_off,
+                                          st->index_comp_rows[il],
+                                          src_off,
+                                          (uint64_t)index_rows * row_bytes) == 0) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool ds4_mtp_tree_state_scratch_restore_comp_rows(
+        ds4_mtp_tree_state_scratch *st,
+        ds4_session *s,
+        uint64_t slot) {
+    bool ok = ds4_metal_begin_commands() != 0;
+    if (ok) ok = ds4_mtp_tree_state_scratch_encode_restore_comp_rows(st, s, slot);
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    return ok;
+}
+
+static bool ds4_mtp_tree_state_scratch_copy_root(ds4_mtp_tree_state_scratch *st,
+                                                 ds4_session *s,
+                                                 uint64_t slots_to_copy) {
+    if (!st || !s || slots_to_copy == 0 ||
+        slots_to_copy > st->peak_frontier_slots) {
+        return false;
+    }
+    ds4_metal_graph *g = &s->graph;
+    bool ok = ds4_metal_begin_commands() != 0;
+    for (uint64_t slot = 0; ok && slot < slots_to_copy; slot++) {
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            const uint64_t idx = slot * DS4_N_LAYER + il;
+            st->base_n_comp[idx] = g->layer_n_comp[il];
+            st->base_n_index_comp[idx] = g->layer_n_index_comp[il];
+            st->n_comp[idx] = g->layer_n_comp[il];
+            st->n_index_comp[idx] = g->layer_n_index_comp[il];
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+
+            const uint64_t ab = layer_attn_state_bytes(ratio);
+            ok = ds4_metal_tensor_copy(st->attn_state_kv[il],
+                                       slot * ab,
+                                       g->layer_attn_state_kv[il],
+                                       0,
+                                       ab) != 0 &&
+                 ds4_metal_tensor_copy(st->attn_state_score[il],
+                                       slot * ab,
+                                       g->layer_attn_state_score[il],
+                                       0,
+                                       ab) != 0;
+            if (ok && ratio == 4) {
+                const uint64_t ib = layer_index_state_bytes(ratio);
+                ok = ds4_metal_tensor_copy(st->index_state_kv[il],
+                                           slot * ib,
+                                           g->layer_index_state_kv[il],
+                                           0,
+                                           ib) != 0 &&
+                     ds4_metal_tensor_copy(st->index_state_score[il],
+                                           slot * ib,
+                                           g->layer_index_state_score[il],
+                                           0,
+                                           ib) != 0;
+            }
+        }
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    return ok;
+}
+
+static bool ds4_mtp_tree_state_scratch_capture_slot(ds4_mtp_tree_state_scratch *st,
+                                                    ds4_session *s,
+                                                    uint64_t slot) {
+    if (!st || !s || slot >= st->peak_frontier_slots) return false;
+
+    ds4_metal_graph *g = &s->graph;
+    bool ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint64_t idx = slot * DS4_N_LAYER + il;
+        st->n_comp[idx] = g->layer_n_comp[il];
+        st->n_index_comp[idx] = g->layer_n_index_comp[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        ok = ds4_metal_tensor_copy(st->attn_state_kv[il],
+                                   slot * ab,
+                                   g->layer_attn_state_kv[il],
+                                   0,
+                                   ab) != 0 &&
+             ds4_metal_tensor_copy(st->attn_state_score[il],
+                                   slot * ab,
+                                   g->layer_attn_state_score[il],
+                                   0,
+                                   ab) != 0;
+        if (ok && ratio == 4) {
+            const uint64_t ib = layer_index_state_bytes(ratio);
+            ok = ds4_metal_tensor_copy(st->index_state_kv[il],
+                                       slot * ib,
+                                       g->layer_index_state_kv[il],
+                                       0,
+                                       ib) != 0 &&
+                 ds4_metal_tensor_copy(st->index_state_score[il],
+                                       slot * ib,
+                                       g->layer_index_state_score[il],
+                                       0,
+                                       ib) != 0;
+        }
+    }
+    if (ok) ok = ds4_mtp_tree_state_scratch_encode_capture_comp_rows(st, s, slot);
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    return ok;
+}
+
+static bool ds4_mtp_tree_state_scratch_copy_slot(ds4_mtp_tree_state_scratch *st,
+                                                 uint64_t dst_slot,
+                                                 uint64_t src_slot) {
+    if (!st ||
+        dst_slot >= st->peak_frontier_slots ||
+        src_slot >= st->peak_frontier_slots) {
+        return false;
+    }
+
+    bool ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint64_t dst_idx = dst_slot * DS4_N_LAYER + il;
+        const uint64_t src_idx = src_slot * DS4_N_LAYER + il;
+        st->base_n_comp[dst_idx] = st->base_n_comp[src_idx];
+        st->base_n_index_comp[dst_idx] = st->base_n_index_comp[src_idx];
+        st->n_comp[dst_idx] = st->n_comp[src_idx];
+        st->n_index_comp[dst_idx] = st->n_index_comp[src_idx];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        ok = ds4_metal_tensor_copy(st->attn_state_kv[il],
+                                   dst_slot * ab,
+                                   st->attn_state_kv[il],
+                                   src_slot * ab,
+                                   ab) != 0 &&
+                 ds4_metal_tensor_copy(st->attn_state_score[il],
+                                       dst_slot * ab,
+                                       st->attn_state_score[il],
+                                       src_slot * ab,
+                                       ab) != 0;
+        const uint64_t attn_row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+        ok = ok &&
+             ds4_metal_tensor_copy(st->attn_comp_rows[il],
+                                   dst_slot * (uint64_t)st->max_new_comp_rows * attn_row_bytes,
+                                   st->attn_comp_rows[il],
+                                   src_slot * (uint64_t)st->max_new_comp_rows * attn_row_bytes,
+                                   (uint64_t)st->max_new_comp_rows * attn_row_bytes) != 0;
+        if (ok && ratio == 4) {
+            const uint64_t ib = layer_index_state_bytes(ratio);
+            ok = ds4_metal_tensor_copy(st->index_state_kv[il],
+                                       dst_slot * ib,
+                                       st->index_state_kv[il],
+                                       src_slot * ib,
+                                       ib) != 0 &&
+                 ds4_metal_tensor_copy(st->index_state_score[il],
+                                       dst_slot * ib,
+                                       st->index_state_score[il],
+                                       src_slot * ib,
+                                       ib) != 0;
+            const uint64_t index_row_bytes =
+                (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            ok = ok &&
+                 ds4_metal_tensor_copy(st->index_comp_rows[il],
+                                       dst_slot * (uint64_t)st->max_new_comp_rows * index_row_bytes,
+                                       st->index_comp_rows[il],
+                                       src_slot * (uint64_t)st->max_new_comp_rows * index_row_bytes,
+                                       (uint64_t)st->max_new_comp_rows * index_row_bytes) != 0;
+        }
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    return ok;
+}
+
+static void ds4_mtp_tree_raw_cache_free(ds4_metal_tensor **raw_cache) {
+    if (!raw_cache) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_metal_tensor_free(raw_cache[il]);
+        raw_cache[il] = NULL;
+    }
+}
+
+static bool ds4_mtp_tree_raw_cache_copy(ds4_session *s,
+                                        ds4_metal_tensor **raw_cache,
+                                        uint64_t *bytes_out) {
+    if (!s || !raw_cache) return false;
+    ds4_metal_graph *g = &s->graph;
+    const uint64_t raw_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    if (raw_bytes == 0) return false;
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        raw_cache[il] = ds4_metal_tensor_alloc(raw_bytes);
+        if (!raw_cache[il]) {
+            ds4_mtp_tree_raw_cache_free(raw_cache);
+            return false;
+        }
+        bytes += raw_bytes;
+    }
+
+    bool ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = ds4_metal_tensor_copy(raw_cache[il],
+                                   0,
+                                   g->layer_raw_cache[il],
+                                   0,
+                                   raw_bytes) != 0;
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    if (!ok) {
+        ds4_mtp_tree_raw_cache_free(raw_cache);
+        return false;
+    }
+    if (bytes_out) *bytes_out = bytes;
+    return true;
+}
+
+static bool ds4_mtp_tree_raw_cache_compact_copy(ds4_session *s,
+                                                uint32_t start,
+                                                uint32_t path_len,
+                                                ds4_metal_tensor **raw_cache,
+                                                uint32_t *raw_cap_out,
+                                                uint64_t *bytes_out) {
+    if (!s || !raw_cache || !raw_cap_out) return false;
+    ds4_metal_graph *g = &s->graph;
+    if (path_len == 0) return false;
+    const uint32_t start_raw = metal_graph_raw_span_for_batch(g, start, 1);
+    if (start_raw == 0) return false;
+    const uint32_t prefix_rows = start_raw - 1u;
+    const uint32_t compact_cap = prefix_rows + path_len;
+    if (compact_cap == 0) return false;
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t raw_bytes = (uint64_t)compact_cap * row_bytes;
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        raw_cache[il] = ds4_metal_tensor_alloc(raw_bytes);
+        if (!raw_cache[il]) {
+            ds4_mtp_tree_raw_cache_free(raw_cache);
+            return false;
+        }
+        bytes += raw_bytes;
+    }
+
+    const uint32_t first_pos = start - prefix_rows;
+    bool ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        for (uint32_t p = first_pos; ok && p < start; p++) {
+            const uint64_t src_off = (uint64_t)(p % g->raw_cap) * row_bytes;
+            const uint64_t dst_off = (uint64_t)(p % compact_cap) * row_bytes;
+            ok = ds4_metal_tensor_copy(raw_cache[il],
+                                       dst_off,
+                                       g->layer_raw_cache[il],
+                                       src_off,
+                                       row_bytes) != 0;
+        }
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    if (!ok) {
+        ds4_mtp_tree_raw_cache_free(raw_cache);
+        return false;
+    }
+    *raw_cap_out = compact_cap;
+    if (bytes_out) *bytes_out = bytes;
+    return true;
+}
+
+static bool ds4_mtp_tree_raw_cache_clone(ds4_metal_tensor **dst,
+                                         ds4_metal_tensor **src,
+                                         uint32_t raw_cap,
+                                         uint64_t *bytes_out) {
+    if (!dst || !src || raw_cap == 0) return false;
+    const uint64_t raw_bytes =
+        (uint64_t)raw_cap * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    if (raw_bytes == 0) return false;
+
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!src[il]) {
+            ds4_mtp_tree_raw_cache_free(dst);
+            return false;
+        }
+        dst[il] = ds4_metal_tensor_alloc(raw_bytes);
+        if (!dst[il]) {
+            ds4_mtp_tree_raw_cache_free(dst);
+            return false;
+        }
+        bytes += raw_bytes;
+    }
+
+    bool ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = ds4_metal_tensor_copy(dst[il], 0, src[il], 0, raw_bytes) != 0;
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    if (!ok) {
+        ds4_mtp_tree_raw_cache_free(dst);
+        return false;
+    }
+    if (bytes_out) *bytes_out = bytes;
+    return true;
+}
+
+static void ds4_mtp_tree_state_alloc_probe(ds4_session *s) {
+    const char *shape_env = getenv("DS4_MTP_TREE_STATE_ALLOC");
+    if (!s || !shape_env || !shape_env[0]) return;
+
+    int fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    if (!ds4_mtp_tree_shape_by_name(shape_env, fanout)) {
+        fprintf(stderr,
+                "ds4: mtp tree-state-alloc shape=%s invalid=1\n",
+                shape_env);
+        return;
+    }
+    int depth = DS4_MTP_TREE_SHAPE_DEPTH;
+    const char *depth_env = getenv("DS4_MTP_TREE_STATE_ALLOC_DEPTH");
+    if (depth_env && depth_env[0]) {
+        char *end = NULL;
+        long v = strtol(depth_env, &end, 10);
+        if (end != depth_env && v > 0 && v <= DS4_MTP_TREE_SHAPE_DEPTH) {
+            depth = (int)v;
+        }
+    }
+
+    const double alloc0 = now_sec();
+    ds4_mtp_tree_state_scratch st;
+    const bool alloc_ok = ds4_mtp_tree_state_scratch_alloc(&st, fanout, depth);
+    const double alloc1 = now_sec();
+    uint64_t slots_to_copy = 0;
+    bool copy_ok = alloc_ok;
+    double copy_sec = 0.0;
+    if (alloc_ok) {
+        slots_to_copy = getenv("DS4_MTP_TREE_STATE_ALLOC_FILL") != NULL ?
+            st.peak_frontier_slots : 1u;
+        const double copy0 = now_sec();
+        copy_ok = ds4_mtp_tree_state_scratch_copy_root(&st, s, slots_to_copy);
+        copy_sec = now_sec() - copy0;
+    }
+    fprintf(stderr,
+            "ds4: mtp tree-state-alloc shape=%s depth=%d ok=%d copy_ok=%d "
+            "peak_frontier_slots=%llu peak_raw_path_rows=%llu bytes=%.2f MiB "
+            "slot_copies=%llu alloc=%.3fms copy=%.3fms\n",
+            shape_env,
+            depth,
+            alloc_ok ? 1 : 0,
+            copy_ok ? 1 : 0,
+            (unsigned long long)(alloc_ok ? st.peak_frontier_slots : 0),
+            (unsigned long long)(alloc_ok ? st.peak_raw_path_rows : 0),
+            alloc_ok ? (double)st.bytes / (1024.0 * 1024.0) : 0.0,
+            (unsigned long long)slots_to_copy,
+            (alloc1 - alloc0) * 1000.0,
+            copy_sec * 1000.0);
+    if (alloc_ok) ds4_mtp_tree_state_scratch_free(&st);
 }
 
 static void ds4_mtp_speed_audit_print(ds4_session *s) {
@@ -15893,20 +17653,36 @@ static void ds4_mtp_tree_oracle_print(ds4_session *s) {
     const double oracle_ms = s->mtp_tree_oracle.oracle_sec * 1000.0;
     const double mtp_ms = s->mtp_tree_oracle.mtp_eval_sec * 1000.0;
     const double avg_ms = oracle_ms / (double)s->mtp_tree_oracle.steps;
+    const double avg_depth =
+        (double)s->mtp_tree_oracle.actual_depth_sum /
+        (double)s->mtp_tree_oracle.steps;
     fprintf(stderr,
-            "ds4: mtp tree-oracle steps=%llu failures=%llu oracle=%.3fms avg=%.3fms mtp_eval=%.3fms\n",
+            "ds4: mtp tree-oracle steps=%llu failures=%llu avg_depth=%.2f "
+            "oracle=%.3fms avg=%.3fms mtp_eval=%.3fms\n",
             (unsigned long long)s->mtp_tree_oracle.steps,
             (unsigned long long)s->mtp_tree_oracle.failures,
+            avg_depth,
             oracle_ms,
             avg_ms,
             mtp_ms);
+    int plan_depth = (int)ceil(avg_depth);
+    if (plan_depth <= 0) plan_depth = 1;
+    ds4_mtp_tree_state_plan_print(s, plan_depth);
 
     for (int b = 0; b < DS4_MTP_TREE_K_BUCKETS; b++) {
         const int k = ds4_mtp_tree_k_values[b];
         const double avg_len =
             (double)s->mtp_tree_oracle.path_len_sum[b] /
             (double)s->mtp_tree_oracle.steps;
-        fprintf(stderr, "ds4: mtp tree-oracle path<=top%d avg_len=%.2f", k, avg_len);
+        const double avg_nodes =
+            (double)s->mtp_tree_oracle.full_tree_nodes_sum[b] /
+            (double)s->mtp_tree_oracle.steps;
+        fprintf(stderr,
+                "ds4: mtp tree-oracle full-top%d avg_accept_len=%.2f avg_nodes=%.1f accept_per_node=%.3f",
+                k,
+                avg_len,
+                avg_nodes,
+                avg_nodes > 0.0 ? avg_len / avg_nodes : 0.0);
         for (int d = 0; d < DS4_MTP_TREE_MAX_DEPTH; d++) {
             const uint64_t total = s->mtp_tree_oracle.position_total[d];
             if (!total) continue;
@@ -15919,6 +17695,220 @@ static void ds4_mtp_tree_oracle_print(ds4_session *s) {
                     (100.0 * (double)contained) / (double)total);
         }
         fputc('\n', stderr);
+    }
+
+    for (int i = 0; i < DS4_MTP_TREE_SHAPES; i++) {
+        const double avg_len =
+            (double)s->mtp_tree_oracle.shape_len_sum[i] /
+            (double)s->mtp_tree_oracle.steps;
+        const double avg_nodes =
+            (double)s->mtp_tree_oracle.shape_nodes_sum[i] /
+            (double)s->mtp_tree_oracle.steps;
+        const uint64_t full = s->mtp_tree_oracle.shape_full_depth[i];
+        fprintf(stderr,
+                "ds4: mtp tree-oracle shape=%s avg_accept_len=%.2f avg_nodes=%.1f "
+                "accept_per_node=%.3f full_depth=%llu/%llu(%.1f%%)",
+                ds4_mtp_tree_shape_names[i],
+                avg_len,
+                avg_nodes,
+                avg_nodes > 0.0 ? avg_len / avg_nodes : 0.0,
+                (unsigned long long)full,
+                (unsigned long long)s->mtp_tree_oracle.steps,
+                (100.0 * (double)full) / (double)s->mtp_tree_oracle.steps);
+        for (int d = 0; d < DS4_MTP_TREE_MAX_DEPTH; d++) {
+            const uint64_t total = s->mtp_tree_oracle.position_total[d];
+            if (!total) continue;
+            const uint64_t contained = s->mtp_tree_oracle.shape_contains[i][d];
+            fprintf(stderr,
+                    " d%d=%llu/%llu(%.1f%%)",
+                    d + 1,
+                    (unsigned long long)contained,
+                    (unsigned long long)total,
+                    (100.0 * (double)contained) / (double)total);
+        }
+        fputc('\n', stderr);
+    }
+
+    double opt_len_sum = 0.0;
+    double opt_len_nodes_sum = 0.0;
+    double opt_eff_sum = 0.0;
+    double opt_eff_nodes_sum = 0.0;
+    uint64_t opt_steps = 0;
+    for (int b = 0; b < DS4_MTP_AUDIT_MARGIN_BUCKETS; b++) {
+        const uint64_t steps = s->mtp_tree_oracle.root_margin_steps[b];
+        if (!steps) continue;
+        int best_len_shape = -1;
+        int best_eff_shape = -1;
+        double best_len = -1.0;
+        double best_eff = -1.0;
+        double best_eff_len = -1.0;
+        double best_len_nodes = 0.0;
+        double best_eff_nodes = 0.0;
+        for (int i = 0; i < DS4_MTP_TREE_SHAPES; i++) {
+            uint64_t max_width = 0;
+            const uint64_t nodes =
+                ds4_mtp_tree_shape_nodes(ds4_mtp_tree_shape_fanout[i],
+                                         DS4_MTP_TREE_SHAPE_DEPTH,
+                                         &max_width);
+            (void)max_width;
+            const double avg_len =
+                (double)s->mtp_tree_oracle.shape_root_len_sum[i][b] /
+                (double)steps;
+            const double eff = nodes > 0 ? avg_len / (double)nodes : 0.0;
+            if (best_len_shape < 0 ||
+                avg_len > best_len ||
+                (avg_len == best_len && nodes < best_len_nodes))
+            {
+                best_len_shape = i;
+                best_len = avg_len;
+                best_len_nodes = (double)nodes;
+            }
+            if (best_eff_shape < 0 ||
+                eff > best_eff ||
+                (eff == best_eff && avg_len > best_eff_len))
+            {
+                best_eff_shape = i;
+                best_eff = eff;
+                best_eff_len = avg_len;
+                best_eff_nodes = (double)nodes;
+            }
+        }
+        if (best_len_shape >= 0 && best_eff_shape >= 0) {
+            const uint64_t best_len_full =
+                s->mtp_tree_oracle.shape_root_full_depth[best_len_shape][b];
+            const uint64_t best_eff_full =
+                s->mtp_tree_oracle.shape_root_full_depth[best_eff_shape][b];
+            fprintf(stderr,
+                    "ds4: mtp tree-oracle opt-root-bucket=%s steps=%llu "
+                    "best_len=%s avg_len=%.2f nodes=%.0f full=%llu/%llu(%.1f%%) "
+                    "best_eff=%s avg_len=%.2f nodes=%.0f accept_per_node=%.3f full=%llu/%llu(%.1f%%)\n",
+                    ds4_mtp_audit_margin_bucket_name(b),
+                    (unsigned long long)steps,
+                    ds4_mtp_tree_shape_names[best_len_shape],
+                    best_len,
+                    best_len_nodes,
+                    (unsigned long long)best_len_full,
+                    (unsigned long long)steps,
+                    (100.0 * (double)best_len_full) / (double)steps,
+                    ds4_mtp_tree_shape_names[best_eff_shape],
+                    (double)s->mtp_tree_oracle.shape_root_len_sum[best_eff_shape][b] /
+                        (double)steps,
+                    best_eff_nodes,
+                    best_eff,
+                    (unsigned long long)best_eff_full,
+                    (unsigned long long)steps,
+                    (100.0 * (double)best_eff_full) / (double)steps);
+            opt_len_sum += (double)s->mtp_tree_oracle.shape_root_len_sum[best_len_shape][b];
+            opt_len_nodes_sum += (double)steps * best_len_nodes;
+            opt_eff_sum += (double)s->mtp_tree_oracle.shape_root_len_sum[best_eff_shape][b];
+            opt_eff_nodes_sum += (double)steps * best_eff_nodes;
+            opt_steps += steps;
+        }
+    }
+    if (opt_steps > 0) {
+        const double avg_len = opt_len_sum / (double)opt_steps;
+        const double avg_len_nodes = opt_len_nodes_sum / (double)opt_steps;
+        const double avg_eff_len = opt_eff_sum / (double)opt_steps;
+        const double avg_eff_nodes = opt_eff_nodes_sum / (double)opt_steps;
+        fprintf(stderr,
+                "ds4: mtp tree-oracle opt-root-policy best_len avg_accept_len=%.2f "
+                "avg_nodes=%.1f accept_per_node=%.3f\n",
+                avg_len,
+                avg_len_nodes,
+                avg_len_nodes > 0.0 ? avg_len / avg_len_nodes : 0.0);
+        fprintf(stderr,
+                "ds4: mtp tree-oracle opt-root-policy best_eff avg_accept_len=%.2f "
+                "avg_nodes=%.1f accept_per_node=%.3f\n",
+                avg_eff_len,
+                avg_eff_nodes,
+                avg_eff_nodes > 0.0 ? avg_eff_len / avg_eff_nodes : 0.0);
+    }
+
+    for (int i = 0; i < DS4_MTP_TREE_DYNAMIC_POLICIES; i++) {
+        const double avg_len =
+            (double)s->mtp_tree_oracle.dynamic_len_sum[i] /
+            (double)s->mtp_tree_oracle.steps;
+        const double avg_nodes =
+            (double)s->mtp_tree_oracle.dynamic_nodes_sum[i] /
+            (double)s->mtp_tree_oracle.steps;
+        const uint64_t full = s->mtp_tree_oracle.dynamic_full_depth[i];
+        fprintf(stderr,
+                "ds4: mtp tree-oracle dynamic=%s avg_accept_len=%.2f avg_nodes=%.1f "
+                "accept_per_node=%.3f full_depth=%llu/%llu(%.1f%%)",
+                ds4_mtp_tree_dynamic_policy_names[i],
+                avg_len,
+                avg_nodes,
+                avg_nodes > 0.0 ? avg_len / avg_nodes : 0.0,
+                (unsigned long long)full,
+                (unsigned long long)s->mtp_tree_oracle.steps,
+                (100.0 * (double)full) / (double)s->mtp_tree_oracle.steps);
+        for (int d = 0; d < DS4_MTP_TREE_MAX_DEPTH; d++) {
+            const uint64_t total = s->mtp_tree_oracle.position_total[d];
+            if (!total) continue;
+            const uint64_t contained = s->mtp_tree_oracle.dynamic_contains[i][d];
+            fprintf(stderr,
+                    " d%d=%llu/%llu(%.1f%%)",
+                    d + 1,
+                    (unsigned long long)contained,
+                    (unsigned long long)total,
+                    (100.0 * (double)contained) / (double)total);
+        }
+        fputc('\n', stderr);
+    }
+
+    for (int i = 0; i < DS4_MTP_TREE_DYNAMIC_POLICIES; i++) {
+        const uint64_t steps = s->mtp_tree_oracle.branch_dynamic_steps[i];
+        if (!steps) continue;
+        const double avg_len =
+            (double)s->mtp_tree_oracle.branch_dynamic_len_sum[i] /
+            (double)steps;
+        const double avg_nodes =
+            (double)s->mtp_tree_oracle.branch_dynamic_nodes_sum[i] /
+            (double)steps;
+        const uint64_t full = s->mtp_tree_oracle.branch_dynamic_full_depth[i];
+        fprintf(stderr,
+                "ds4: mtp tree-oracle branch-dynamic=%s avg_accept_len=%.2f "
+                "avg_nodes=%.1f accept_per_node=%.3f full_depth=%llu/%llu(%.1f%%) "
+                "mtp_eval=%.3fms",
+                ds4_mtp_tree_dynamic_policy_names[i],
+                avg_len,
+                avg_nodes,
+                avg_nodes > 0.0 ? avg_len / avg_nodes : 0.0,
+                (unsigned long long)full,
+                (unsigned long long)steps,
+                (100.0 * (double)full) / (double)steps,
+                s->mtp_tree_oracle.branch_dynamic_mtp_eval_sec * 1000.0);
+        fputc('\n', stderr);
+    }
+
+    for (int i = 0; i < DS4_MTP_TREE_SHAPES; i++) {
+        const uint64_t steps = s->mtp_tree_oracle.target_verify_steps[i];
+        if (!steps) continue;
+        const double avg_len =
+            (double)s->mtp_tree_oracle.target_verify_len_sum[i] /
+            (double)steps;
+        const double avg_nodes =
+            (double)s->mtp_tree_oracle.target_verify_nodes_sum[i] /
+            (double)steps;
+        const double avg_paths =
+            (double)s->mtp_tree_oracle.target_verify_paths_sum[i] /
+            (double)steps;
+        const double avg_decodes =
+            (double)s->mtp_tree_oracle.target_verify_decode_sum[i] /
+            (double)steps;
+        fprintf(stderr,
+                "ds4: mtp tree-oracle target-verify shape=%s steps=%llu "
+                "failures=%llu avg_accept_len=%.2f avg_nodes=%.1f "
+                "avg_paths=%.1f avg_target_decodes=%.1f target=%.3fms mtp=%.3fms\n",
+                ds4_mtp_tree_shape_names[i],
+                (unsigned long long)steps,
+                (unsigned long long)s->mtp_tree_oracle.target_verify_failures[i],
+                avg_len,
+                avg_nodes,
+                avg_paths,
+                avg_decodes,
+                s->mtp_tree_oracle.target_verify_target_sec[i] * 1000.0,
+                s->mtp_tree_oracle.target_verify_mtp_sec[i] * 1000.0);
     }
 
     for (int d = 0; d < DS4_MTP_TREE_MAX_DEPTH; d++) {
@@ -15939,6 +17929,164 @@ static void ds4_mtp_tree_oracle_print(ds4_session *s) {
         }
         fputc('\n', stderr);
     }
+}
+
+static float ds4_mtp_tree_min_margin(const float *margins, int actual_depth) {
+    float min_margin = FLT_MAX;
+    for (int d = 0; d < actual_depth; d++) {
+        const float margin = margins[d];
+        if (!isfinite(margin)) return DS4_NEG_INF;
+        if (margin < min_margin) min_margin = margin;
+    }
+    return min_margin;
+}
+
+static void ds4_mtp_tree_dynamic_policy_fanout(int policy,
+                                               const float *margins,
+                                               int actual_depth,
+                                               int *fanout) {
+    if (!fanout) return;
+    for (int d = 0; d < DS4_MTP_TREE_SHAPE_DEPTH; d++) fanout[d] = 0;
+    if (!margins || actual_depth <= 0) return;
+
+    int shape = -1;
+    const float root_margin = margins[0];
+    const float min_margin = ds4_mtp_tree_min_margin(margins, actual_depth);
+    switch (policy) {
+    case 0:
+        shape = root_margin >= 2.0f ? 0 : 2;
+        break;
+    case 1:
+        shape = root_margin >= 5.0f ? 0 : root_margin >= 2.0f ? 2 : 4;
+        break;
+    case 2:
+        shape = min_margin >= 2.0f ? 0 : 2;
+        break;
+    case 3:
+        shape = min_margin >= 5.0f ? 0 : min_margin >= 2.0f ? 2 : 4;
+        break;
+    default:
+        break;
+    }
+    if (shape >= 0) {
+        for (int d = 0; d < DS4_MTP_TREE_SHAPE_DEPTH; d++) {
+            fanout[d] = ds4_mtp_tree_shape_fanout[shape][d];
+        }
+        return;
+    }
+
+    for (int d = 0; d < DS4_MTP_TREE_SHAPE_DEPTH; d++) {
+        const float margin = d < actual_depth ? margins[d] : DS4_NEG_INF;
+        fanout[d] = margin >= 2.0f ? 2 : 4;
+    }
+}
+
+static int ds4_mtp_tree_dynamic_depth_fanout(float margin) {
+    return margin >= 2.0f ? 2 : 4;
+}
+
+static bool ds4_mtp_tree_branch_dynamic_nodes(ds4_session *s,
+                                               ds4_metal_tensor *root_state,
+                                               const float *root_logits,
+                                               uint32_t root_n_raw,
+                                               uint32_t start,
+                                               int actual_depth,
+                                               uint64_t *nodes_out,
+                                               double *mtp_eval_sec_out) {
+    if (!s || !s->engine || !root_state || !root_logits ||
+        !nodes_out || !mtp_eval_sec_out || actual_depth <= 0) {
+        return false;
+    }
+    ds4_engine *e = s->engine;
+    ds4_metal_graph *g = &s->graph;
+    *nodes_out = 0;
+    *mtp_eval_sec_out = 0.0;
+
+    float v0 = DS4_NEG_INF;
+    float v1 = DS4_NEG_INF;
+    logits_top2(root_logits, DS4_N_VOCAB, NULL, &v0, NULL, &v1);
+    const int root_k = ds4_mtp_tree_dynamic_depth_fanout(v0 - v1);
+    int root_ids[16];
+    if (logits_top_k_ids(root_logits, DS4_N_VOCAB, root_ids, root_k) != root_k) {
+        return false;
+    }
+    *nodes_out += (uint64_t)root_k;
+    if (actual_depth <= 1) return true;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    ds4_metal_tensor *child_state = ds4_metal_tensor_alloc(hc_bytes);
+    ds4_metal_tensor *scratch_state = ds4_metal_tensor_alloc(hc_bytes);
+    float *tmp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(tmp_logits[0]));
+    if (!child_state || !scratch_state || !tmp_logits) {
+        ds4_metal_tensor_free(scratch_state);
+        ds4_metal_tensor_free(child_state);
+        free(tmp_logits);
+        return false;
+    }
+
+    bool ok = true;
+    const uint32_t saved_n_raw = g->mtp_n_raw;
+    uint32_t child_n_raw = root_n_raw + 1u;
+    if (child_n_raw > g->raw_window) child_n_raw = g->raw_window;
+    if (child_n_raw > g->raw_cap) child_n_raw = g->raw_cap;
+    for (int i = 0; ok && i < root_k; i++) {
+        int ignored_top = -1;
+        g->mtp_n_raw = root_n_raw;
+        const double mtp0 = now_sec();
+        ok = metal_graph_eval_mtp_draft_from_hc(g,
+                                                &e->model,
+                                                &e->weights,
+                                                &e->mtp_model,
+                                                &e->mtp_weights,
+                                                root_state,
+                                                child_state,
+                                                root_ids[i],
+                                                start,
+                                                tmp_logits,
+                                                &ignored_top,
+                                                NULL,
+                                                1);
+        *mtp_eval_sec_out += now_sec() - mtp0;
+        if (!ok) break;
+        logits_top2(tmp_logits, DS4_N_VOCAB, NULL, &v0, NULL, &v1);
+        const int child_k = ds4_mtp_tree_dynamic_depth_fanout(v0 - v1);
+        int child_ids[16];
+        if (logits_top_k_ids(tmp_logits, DS4_N_VOCAB, child_ids, child_k) != child_k) {
+            ok = false;
+            break;
+        }
+        *nodes_out += (uint64_t)child_k;
+        if (actual_depth <= 2) continue;
+
+        for (int j = 0; ok && j < child_k; j++) {
+            g->mtp_n_raw = child_n_raw;
+            const double mtp1 = now_sec();
+            ok = metal_graph_eval_mtp_draft_from_hc(g,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    &e->mtp_model,
+                                                    &e->mtp_weights,
+                                                    child_state,
+                                                    scratch_state,
+                                                    child_ids[j],
+                                                    start + 1u,
+                                                    tmp_logits,
+                                                    &ignored_top,
+                                                    NULL,
+                                                    1);
+            *mtp_eval_sec_out += now_sec() - mtp1;
+            if (!ok) break;
+            logits_top2(tmp_logits, DS4_N_VOCAB, NULL, &v0, NULL, &v1);
+            *nodes_out += (uint64_t)ds4_mtp_tree_dynamic_depth_fanout(v0 - v1);
+        }
+    }
+
+    g->mtp_n_raw = saved_n_raw;
+    ds4_metal_tensor_free(scratch_state);
+    ds4_metal_tensor_free(child_state);
+    free(tmp_logits);
+    return ok;
 }
 
 static int ds4_mtp_speed_repeat_guard_cap(ds4_session *s, const int *drafts, int draft_n) {
@@ -16238,6 +18386,10 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return e && e->mtp_ready ? e->mtp_draft_tokens : 0;
 }
 
+bool ds4_session_mtp_stopped(ds4_session *s) {
+    return s && s->mtp_stop_generation;
+}
+
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
@@ -16257,6 +18409,7 @@ static void spec_frontier_free(ds4_spec_frontier *f) {
 static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
     memset(f, 0, sizeof(*f));
     ds4_metal_graph *g = &s->graph;
+    if (!metal_graph_ensure_spec_frontier_buffers(g)) return false;
     f->mtp_n_raw = g->mtp_n_raw;
 
     bool ok = ds4_metal_begin_commands() != 0;
@@ -16314,6 +18467,2462 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     return ok;
 }
 
+typedef struct {
+    ds4_metal_tensor *orig_attn_state_kv[DS4_N_LAYER];
+    ds4_metal_tensor *orig_attn_state_score[DS4_N_LAYER];
+    ds4_metal_tensor *orig_index_state_kv[DS4_N_LAYER];
+    ds4_metal_tensor *orig_index_state_score[DS4_N_LAYER];
+    ds4_metal_tensor *view_attn_state_kv[DS4_N_LAYER];
+    ds4_metal_tensor *view_attn_state_score[DS4_N_LAYER];
+    ds4_metal_tensor *view_index_state_kv[DS4_N_LAYER];
+    ds4_metal_tensor *view_index_state_score[DS4_N_LAYER];
+    uint32_t orig_n_comp[DS4_N_LAYER];
+    uint32_t orig_n_index_comp[DS4_N_LAYER];
+    bool bound;
+} ds4_mtp_tree_state_binding;
+
+static void ds4_mtp_tree_state_unbind(ds4_session *s,
+                                      ds4_mtp_tree_state_binding *binding) {
+    if (!s || !binding || !binding->bound) return;
+    ds4_metal_graph *g = &s->graph;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_n_comp[il] = binding->orig_n_comp[il];
+        g->layer_n_index_comp[il] = binding->orig_n_index_comp[il];
+        if (binding->orig_attn_state_kv[il]) {
+            g->layer_attn_state_kv[il] = binding->orig_attn_state_kv[il];
+            g->layer_attn_state_score[il] = binding->orig_attn_state_score[il];
+        }
+        if (binding->orig_index_state_kv[il]) {
+            g->layer_index_state_kv[il] = binding->orig_index_state_kv[il];
+            g->layer_index_state_score[il] = binding->orig_index_state_score[il];
+        }
+        ds4_metal_tensor_free(binding->view_attn_state_kv[il]);
+        ds4_metal_tensor_free(binding->view_attn_state_score[il]);
+        ds4_metal_tensor_free(binding->view_index_state_kv[il]);
+        ds4_metal_tensor_free(binding->view_index_state_score[il]);
+    }
+    memset(binding, 0, sizeof(*binding));
+}
+
+static bool ds4_mtp_tree_state_bind_slot(ds4_session *s,
+                                         ds4_mtp_tree_state_scratch *st,
+                                         uint64_t slot,
+                                         ds4_mtp_tree_state_binding *binding) {
+    if (!s || !st || !binding || slot >= st->peak_frontier_slots) return false;
+    memset(binding, 0, sizeof(*binding));
+    ds4_metal_graph *g = &s->graph;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        binding->orig_n_comp[il] = g->layer_n_comp[il];
+        binding->orig_n_index_comp[il] = g->layer_n_index_comp[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        binding->orig_attn_state_kv[il] = g->layer_attn_state_kv[il];
+        binding->orig_attn_state_score[il] = g->layer_attn_state_score[il];
+        binding->view_attn_state_kv[il] =
+            ds4_metal_tensor_view(st->attn_state_kv[il], slot * ab, ab);
+        binding->view_attn_state_score[il] =
+            ds4_metal_tensor_view(st->attn_state_score[il], slot * ab, ab);
+        if (!binding->view_attn_state_kv[il] || !binding->view_attn_state_score[il]) {
+            ds4_mtp_tree_state_unbind(s, binding);
+            return false;
+        }
+        g->layer_attn_state_kv[il] = binding->view_attn_state_kv[il];
+        g->layer_attn_state_score[il] = binding->view_attn_state_score[il];
+        g->layer_n_comp[il] = st->n_comp[slot * DS4_N_LAYER + il];
+
+        if (ratio == 4) {
+            const uint64_t ib = layer_index_state_bytes(ratio);
+            binding->orig_index_state_kv[il] = g->layer_index_state_kv[il];
+            binding->orig_index_state_score[il] = g->layer_index_state_score[il];
+            binding->view_index_state_kv[il] =
+                ds4_metal_tensor_view(st->index_state_kv[il], slot * ib, ib);
+            binding->view_index_state_score[il] =
+                ds4_metal_tensor_view(st->index_state_score[il], slot * ib, ib);
+            if (!binding->view_index_state_kv[il] || !binding->view_index_state_score[il]) {
+                ds4_mtp_tree_state_unbind(s, binding);
+                return false;
+            }
+            g->layer_index_state_kv[il] = binding->view_index_state_kv[il];
+            g->layer_index_state_score[il] = binding->view_index_state_score[il];
+            g->layer_n_index_comp[il] = st->n_index_comp[slot * DS4_N_LAYER + il];
+        }
+    }
+    binding->bound = true;
+    return true;
+}
+
+static void ds4_mtp_tree_branch_swap_probe(ds4_session *s,
+                                           ds4_spec_frontier *frontier,
+                                           const float *saved_logits,
+                                           int saved_len,
+                                           uint32_t start,
+                                           int token) {
+    const char *slot_path_shape_env = getenv("DS4_MTP_TREE_SLOT_PATH_PROBE");
+    const char *raw_full_shape_env = getenv("DS4_MTP_TREE_RAW_SWAP_PROBE");
+    const char *raw_compact_shape_env = getenv("DS4_MTP_TREE_RAW_COMPACT_PROBE");
+    const bool slot_path_probe = slot_path_shape_env && slot_path_shape_env[0];
+    const bool raw_full_probe = raw_full_shape_env && raw_full_shape_env[0];
+    const bool raw_compact_probe = raw_compact_shape_env && raw_compact_shape_env[0];
+    const bool raw_compact_like_probe = raw_compact_probe || slot_path_probe;
+    const bool raw_probe = raw_full_probe || raw_compact_like_probe;
+    const char *shape_env = slot_path_probe ?
+        slot_path_shape_env : (raw_compact_probe ?
+            raw_compact_shape_env : (raw_full_probe ?
+                raw_full_shape_env : getenv("DS4_MTP_TREE_BRANCH_SWAP_PROBE")));
+    if (!s || !s->engine || !frontier || !saved_logits ||
+        !shape_env || !shape_env[0] || s->mtp_tree_branch_swap_reported) {
+        return;
+    }
+    s->mtp_tree_branch_swap_reported = true;
+    int fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    if (!ds4_mtp_tree_shape_by_name(shape_env, fanout)) {
+        fprintf(stderr,
+                "ds4: mtp tree-branch-swap-probe shape=%s invalid=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    ds4_engine *e = s->engine;
+    float *normal_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(normal_logits[0]));
+    float *branch_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(branch_logits[0]));
+    ds4_mtp_tree_state_scratch st;
+    memset(&st, 0, sizeof(st));
+    ds4_mtp_tree_state_binding binding;
+    memset(&binding, 0, sizeof(binding));
+    ds4_metal_tensor *branch_raw_cache[DS4_N_LAYER];
+    memset(branch_raw_cache, 0, sizeof(branch_raw_cache));
+
+    const bool saved_valid = s->checkpoint_valid;
+    double normal_sec = 0.0;
+    double alloc_sec = 0.0;
+    double copy_sec = 0.0;
+    double raw_copy_sec = 0.0;
+    double branch_sec = 0.0;
+    uint64_t raw_bytes = 0;
+    uint32_t branch_raw_cap = s->graph.raw_cap;
+    uint32_t probe_depth = 1;
+    bool normal_ok = false;
+    bool alloc_ok = false;
+    bool copy_ok = false;
+    bool raw_ok = !raw_probe;
+    bool bind_ok = false;
+    bool branch_ok = false;
+
+    if (raw_compact_like_probe) {
+        probe_depth = slot_path_probe ? DS4_MTP_TREE_SHAPE_DEPTH : 1u;
+        const char *depth_env = slot_path_probe ?
+            getenv("DS4_MTP_TREE_SLOT_PATH_PROBE_DEPTH") :
+            getenv("DS4_MTP_TREE_RAW_COMPACT_PROBE_DEPTH");
+        if (depth_env && depth_env[0]) {
+            char *end = NULL;
+            unsigned long v = strtoul(depth_env, &end, 10);
+            if (end != depth_env && v > 0 && v <= DS4_MTP_TREE_SHAPE_DEPTH) {
+                probe_depth = (uint32_t)v;
+            }
+        }
+    }
+    int probe_tokens[DS4_MTP_TREE_SHAPE_DEPTH] = { token, 0, 0 };
+
+    s->checkpoint.len = saved_len;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    normal_ok = spec_frontier_restore(frontier, s);
+    if (normal_ok) {
+        const double t0 = now_sec();
+        for (uint32_t i = 0; normal_ok && i < probe_depth; i++) {
+            normal_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                       &e->model,
+                                                       &e->weights,
+                                                       probe_tokens[i],
+                                                       start + i,
+                                                       normal_logits);
+            if (normal_ok && i + 1u < probe_depth) {
+                probe_tokens[i + 1u] = sample_argmax(normal_logits, DS4_N_VOCAB);
+            }
+        }
+        normal_sec = now_sec() - t0;
+    }
+
+    s->checkpoint.len = saved_len;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (!spec_frontier_restore(frontier, s)) goto done;
+
+    const double alloc0 = now_sec();
+    alloc_ok = ds4_mtp_tree_state_scratch_alloc(&st, fanout, DS4_MTP_TREE_SHAPE_DEPTH);
+    alloc_sec = now_sec() - alloc0;
+    if (!alloc_ok) goto done;
+
+    const double copy0 = now_sec();
+    copy_ok = ds4_mtp_tree_state_scratch_copy_root(&st, s, 1);
+    copy_sec = now_sec() - copy0;
+    if (!copy_ok) goto done;
+
+    if (raw_probe) {
+        const double raw_copy0 = now_sec();
+        if (raw_compact_like_probe) {
+            raw_ok = ds4_mtp_tree_raw_cache_compact_copy(s,
+                                                         start,
+                                                         probe_depth,
+                                                         branch_raw_cache,
+                                                         &branch_raw_cap,
+                                                         &raw_bytes);
+        } else {
+            raw_ok = ds4_mtp_tree_raw_cache_copy(s, branch_raw_cache, &raw_bytes);
+        }
+        raw_copy_sec = now_sec() - raw_copy0;
+        if (!raw_ok) goto done;
+    }
+
+    bind_ok = ds4_mtp_tree_state_bind_slot(s, &st, 0, &binding);
+    if (!bind_ok) goto done;
+    const double branch0 = now_sec();
+    if (slot_path_probe) {
+        branch_ok = true;
+        uint64_t parent_slot = 0;
+        for (uint32_t i = 0; branch_ok && i < probe_depth; i++) {
+            if (i != 0) {
+                ds4_mtp_tree_state_unbind(s, &binding);
+                bind_ok = ds4_mtp_tree_state_bind_slot(s, &st, parent_slot, &binding);
+                if (!bind_ok) {
+                    branch_ok = false;
+                    break;
+                }
+            }
+            branch_ok = metal_graph_eval_token_raw_swa_with_raw_cache(&s->graph,
+                                                                      &e->model,
+                                                                      &e->weights,
+                                                                      probe_tokens[i],
+                                                                      start + i,
+                                                                      branch_raw_cache,
+                                                                      branch_raw_cap,
+                                                                      branch_logits);
+            const uint64_t child_slot = (uint64_t)i + 1u;
+            if (branch_ok && child_slot < st.peak_frontier_slots) {
+                branch_ok = ds4_mtp_tree_state_scratch_capture_slot(&st, s, child_slot);
+                parent_slot = child_slot;
+            } else if (branch_ok) {
+                branch_ok = false;
+            }
+        }
+    } else if (raw_probe) {
+        branch_ok = true;
+        for (uint32_t i = 0; branch_ok && i < probe_depth; i++) {
+            branch_ok = metal_graph_eval_token_raw_swa_with_raw_cache(&s->graph,
+                                                                      &e->model,
+                                                                      &e->weights,
+                                                                      probe_tokens[i],
+                                                                      start + i,
+                                                                      branch_raw_cache,
+                                                                      branch_raw_cap,
+                                                                      branch_logits);
+        }
+    } else {
+        branch_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                   &e->model,
+                                                   &e->weights,
+                                                   token,
+                                                   start,
+                                                   branch_logits);
+    }
+    branch_sec = now_sec() - branch0;
+    ds4_mtp_tree_state_unbind(s, &binding);
+
+done:
+    ds4_mtp_tree_state_unbind(s, &binding);
+    const int normal_top = normal_ok ? sample_argmax(normal_logits, DS4_N_VOCAB) : -1;
+    const int branch_top = branch_ok ? sample_argmax(branch_logits, DS4_N_VOCAB) : -1;
+    const float delta = normal_ok && branch_ok ?
+        max_abs_diff(normal_logits, branch_logits, DS4_N_VOCAB) : -1.0f;
+    fprintf(stderr,
+            "ds4: mtp tree-%s-swap-probe shape=%s pos=%u token=%d depth=%u "
+            "normal_ok=%d alloc_ok=%d copy_ok=%d raw_ok=%d bind_ok=%d branch_ok=%d "
+            "normal_top=%d branch_top=%d delta=%.6g state_bytes=%.2f MiB "
+            "raw_bytes=%.2f MiB raw_cap=%u normal=%.3fms alloc=%.3fms copy=%.3fms "
+            "raw_copy=%.3fms branch=%.3fms raw=%s\n",
+            slot_path_probe ? "slot-path" :
+                (raw_compact_probe ? "raw-compact" : (raw_full_probe ? "raw" : "branch")),
+            shape_env,
+            start,
+            token,
+            probe_depth,
+            normal_ok ? 1 : 0,
+            alloc_ok ? 1 : 0,
+            copy_ok ? 1 : 0,
+            raw_ok ? 1 : 0,
+            bind_ok ? 1 : 0,
+            branch_ok ? 1 : 0,
+            normal_top,
+            branch_top,
+            delta,
+            alloc_ok ? (double)st.bytes / (1024.0 * 1024.0) : 0.0,
+            (double)raw_bytes / (1024.0 * 1024.0),
+            branch_raw_cap,
+            normal_sec * 1000.0,
+            alloc_sec * 1000.0,
+            copy_sec * 1000.0,
+            raw_copy_sec * 1000.0,
+            branch_sec * 1000.0,
+            slot_path_probe ? "branch-compact-slot-path" :
+                (raw_compact_probe ? "branch-compact-window" :
+                    (raw_full_probe ? "branch-full-copy" : "live")));
+    if (normal_ok && branch_ok && (normal_top != branch_top || delta > 1.0e-3f)) {
+        s->mtp_oracle_reported = true;
+    }
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    (void)spec_frontier_restore(frontier, s);
+    ds4_mtp_tree_raw_cache_free(branch_raw_cache);
+    ds4_mtp_tree_state_scratch_free(&st);
+    free(branch_logits);
+    free(normal_logits);
+}
+
+static void ds4_mtp_tree_sibling_probe(ds4_session *s,
+                                       ds4_spec_frontier *frontier,
+                                       const float *saved_logits,
+                                       const float *root_mtp_logits,
+                                       int saved_len,
+                                       uint32_t start) {
+    const char *shape_env = getenv("DS4_MTP_TREE_SIBLING_PROBE");
+    if (!s || !s->engine || !frontier || !saved_logits || !root_mtp_logits ||
+        !shape_env || !shape_env[0] || s->mtp_tree_sibling_reported) {
+        return;
+    }
+    s->mtp_tree_sibling_reported = true;
+
+    int fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    if (!ds4_mtp_tree_shape_by_name(shape_env, fanout) ||
+        fanout[0] <= 0 || fanout[0] > 16) {
+        fprintf(stderr,
+                "ds4: mtp tree-sibling-probe shape=%s invalid=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+    const int root_width = fanout[0];
+    int root_ids[16];
+    if (logits_top_k_ids(root_mtp_logits, DS4_N_VOCAB, root_ids, root_width) != root_width) {
+        fprintf(stderr,
+                "ds4: mtp tree-sibling-probe shape=%s root_topk_failed=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    ds4_engine *e = s->engine;
+    float *normal_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(normal_logits[0]));
+    float *branch_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(branch_logits[0]));
+    ds4_mtp_tree_state_scratch st;
+    memset(&st, 0, sizeof(st));
+    ds4_mtp_tree_state_binding binding;
+    memset(&binding, 0, sizeof(binding));
+    ds4_metal_tensor *branch_raw_cache[DS4_N_LAYER];
+    memset(branch_raw_cache, 0, sizeof(branch_raw_cache));
+
+    const bool saved_valid = s->checkpoint_valid;
+    double alloc_sec = 0.0;
+    double copy_sec = 0.0;
+    double raw_copy_sec = 0.0;
+    double normal_sec = 0.0;
+    double branch_sec = 0.0;
+    uint64_t raw_bytes = 0;
+    uint32_t branch_raw_cap = s->graph.raw_cap;
+    int mismatches = 0;
+    float max_delta = 0.0f;
+    bool normal_ok = true;
+    bool branch_ok = true;
+    bool alloc_ok = false;
+    bool copy_ok = false;
+    bool raw_ok = false;
+
+    s->checkpoint.len = saved_len;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (!spec_frontier_restore(frontier, s)) {
+        normal_ok = false;
+        branch_ok = false;
+        goto done;
+    }
+
+    const double alloc0 = now_sec();
+    alloc_ok = ds4_mtp_tree_state_scratch_alloc(&st, fanout, DS4_MTP_TREE_SHAPE_DEPTH);
+    alloc_sec = now_sec() - alloc0;
+    if (!alloc_ok) {
+        branch_ok = false;
+        goto done;
+    }
+
+    const double copy0 = now_sec();
+    copy_ok = ds4_mtp_tree_state_scratch_copy_root(&st, s, (uint64_t)root_width + 1u);
+    copy_sec = now_sec() - copy0;
+    if (!copy_ok) {
+        branch_ok = false;
+        goto done;
+    }
+
+    const double raw0 = now_sec();
+    raw_ok = ds4_mtp_tree_raw_cache_compact_copy(s,
+                                                 start,
+                                                 1,
+                                                 branch_raw_cache,
+                                                 &branch_raw_cap,
+                                                 &raw_bytes);
+    raw_copy_sec = now_sec() - raw0;
+    if (!raw_ok) {
+        branch_ok = false;
+        goto done;
+    }
+
+    for (int i = 0; i < root_width; i++) {
+        s->checkpoint.len = saved_len;
+        memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+        normal_ok = spec_frontier_restore(frontier, s);
+        if (normal_ok) {
+            const double t0 = now_sec();
+            normal_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                       &e->model,
+                                                       &e->weights,
+                                                       root_ids[i],
+                                                       start,
+                                                       normal_logits);
+            normal_sec += now_sec() - t0;
+        }
+        if (!normal_ok) break;
+
+        ds4_mtp_tree_state_unbind(s, &binding);
+        branch_ok = ds4_mtp_tree_state_bind_slot(s,
+                                                 &st,
+                                                 (uint64_t)i + 1u,
+                                                 &binding);
+        if (branch_ok) {
+            const double t0 = now_sec();
+            branch_ok = metal_graph_eval_token_raw_swa_with_raw_cache(&s->graph,
+                                                                      &e->model,
+                                                                      &e->weights,
+                                                                      root_ids[i],
+                                                                      start,
+                                                                      branch_raw_cache,
+                                                                      branch_raw_cap,
+                                                                      branch_logits);
+            branch_sec += now_sec() - t0;
+        }
+        ds4_mtp_tree_state_unbind(s, &binding);
+        if (!branch_ok) break;
+
+        const int normal_top = sample_argmax(normal_logits, DS4_N_VOCAB);
+        const int branch_top = sample_argmax(branch_logits, DS4_N_VOCAB);
+        const float delta = max_abs_diff(normal_logits, branch_logits, DS4_N_VOCAB);
+        if (delta > max_delta) max_delta = delta;
+        if (normal_top != branch_top || delta > 1.0e-3f) mismatches++;
+    }
+
+done:
+    ds4_mtp_tree_state_unbind(s, &binding);
+    fprintf(stderr,
+            "ds4: mtp tree-sibling-probe shape=%s root_width=%d "
+            "normal_ok=%d alloc_ok=%d copy_ok=%d raw_ok=%d branch_ok=%d "
+            "mismatches=%d max_delta=%.6g state_bytes=%.2f MiB raw_bytes=%.2f MiB "
+            "raw_cap=%u normal=%.3fms alloc=%.3fms copy=%.3fms "
+            "raw_copy=%.3fms branch=%.3fms raw=branch-compact-siblings\n",
+            shape_env,
+            root_width,
+            normal_ok ? 1 : 0,
+            alloc_ok ? 1 : 0,
+            copy_ok ? 1 : 0,
+            raw_ok ? 1 : 0,
+            branch_ok ? 1 : 0,
+            mismatches,
+            max_delta,
+            alloc_ok ? (double)st.bytes / (1024.0 * 1024.0) : 0.0,
+            (double)raw_bytes / (1024.0 * 1024.0),
+            branch_raw_cap,
+            normal_sec * 1000.0,
+            alloc_sec * 1000.0,
+            copy_sec * 1000.0,
+            raw_copy_sec * 1000.0,
+            branch_sec * 1000.0);
+    if (!normal_ok || !branch_ok || mismatches != 0) {
+        s->mtp_oracle_reported = true;
+    }
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    (void)spec_frontier_restore(frontier, s);
+    ds4_mtp_tree_raw_cache_free(branch_raw_cache);
+    ds4_mtp_tree_state_scratch_free(&st);
+    free(branch_logits);
+    free(normal_logits);
+}
+
+static void ds4_mtp_tree_grandchild_probe(ds4_session *s,
+                                          ds4_spec_frontier *frontier,
+                                          const float *saved_logits,
+                                          ds4_metal_tensor *root_mtp_state,
+                                          const float *root_mtp_logits,
+                                          uint32_t root_mtp_n_raw,
+                                          int saved_len,
+                                          uint32_t start) {
+    const char *shape_env = getenv("DS4_MTP_TREE_GRANDCHILD_PROBE");
+    if (!s || !s->engine || !frontier || !saved_logits ||
+        !root_mtp_state || !root_mtp_logits ||
+        !shape_env || !shape_env[0] || s->mtp_tree_grandchild_reported) {
+        return;
+    }
+    s->mtp_tree_grandchild_reported = true;
+
+    int fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    if (!ds4_mtp_tree_shape_by_name(shape_env, fanout) ||
+        fanout[0] <= 0 || fanout[0] > 16 ||
+        fanout[1] <= 0 || fanout[1] > 16) {
+        fprintf(stderr,
+                "ds4: mtp tree-grandchild-probe shape=%s invalid=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    const int root_width = fanout[0];
+    const int child_width = fanout[1];
+    const int branch_count = root_width * child_width;
+    const uint64_t grand_base = 1u + (uint64_t)root_width;
+    int root_ids[16];
+    int child_ids[16][16];
+    memset(child_ids, -1, sizeof(child_ids));
+    if (logits_top_k_ids(root_mtp_logits, DS4_N_VOCAB, root_ids, root_width) != root_width) {
+        fprintf(stderr,
+                "ds4: mtp tree-grandchild-probe shape=%s root_topk_failed=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    ds4_engine *e = s->engine;
+    ds4_metal_graph *g = &s->graph;
+    ds4_metal_tensor *child_mtp_state = ds4_metal_tensor_alloc(
+            (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    float *mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(mtp_logits[0]));
+    float *normal_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(normal_logits[0]));
+    float *branch_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(branch_logits[0]));
+    ds4_mtp_tree_state_scratch st;
+    memset(&st, 0, sizeof(st));
+    ds4_mtp_tree_state_binding binding;
+    memset(&binding, 0, sizeof(binding));
+    ds4_metal_tensor *root_raw_cache[16][DS4_N_LAYER];
+    memset(root_raw_cache, 0, sizeof(root_raw_cache));
+
+    const bool saved_valid = s->checkpoint_valid;
+    const uint32_t saved_mtp_n_raw = g->mtp_n_raw;
+    double mtp_sec = 0.0;
+    double alloc_sec = 0.0;
+    double copy_sec = 0.0;
+    double raw_copy_sec = 0.0;
+    double normal_sec = 0.0;
+    double branch_sec = 0.0;
+    uint64_t raw_bytes = 0;
+    uint32_t branch_raw_cap = 0;
+    int mismatches = 0;
+    float max_delta = 0.0f;
+    bool mtp_ok = child_mtp_state != NULL && mtp_logits != NULL;
+    bool normal_ok = true;
+    bool branch_ok = true;
+    bool alloc_ok = false;
+    bool copy_ok = false;
+    bool raw_ok = false;
+
+    if (!mtp_ok) {
+        normal_ok = false;
+        branch_ok = false;
+        goto done;
+    }
+
+    for (int i = 0; mtp_ok && i < root_width; i++) {
+        int ignored_top = -1;
+        g->mtp_n_raw = root_mtp_n_raw;
+        const double t0 = now_sec();
+        mtp_ok = metal_graph_eval_mtp_draft_from_hc(g,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    &e->mtp_model,
+                                                    &e->mtp_weights,
+                                                    root_mtp_state,
+                                                    child_mtp_state,
+                                                    root_ids[i],
+                                                    start,
+                                                    mtp_logits,
+                                                    &ignored_top,
+                                                    child_ids[i],
+                                                    (uint32_t)child_width);
+        mtp_sec += now_sec() - t0;
+    }
+    if (!mtp_ok) {
+        normal_ok = false;
+        branch_ok = false;
+        goto done;
+    }
+
+    s->checkpoint.len = saved_len;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (!spec_frontier_restore(frontier, s)) {
+        normal_ok = false;
+        branch_ok = false;
+        goto done;
+    }
+
+    const double alloc0 = now_sec();
+    alloc_ok = ds4_mtp_tree_state_scratch_alloc(&st, fanout, DS4_MTP_TREE_SHAPE_DEPTH);
+    alloc_sec = now_sec() - alloc0;
+    if (!alloc_ok) {
+        branch_ok = false;
+        goto done;
+    }
+
+    const double copy0 = now_sec();
+    copy_ok = ds4_mtp_tree_state_scratch_copy_root(&st, s, (uint64_t)root_width + 1u);
+    copy_sec = now_sec() - copy0;
+    if (!copy_ok) {
+        branch_ok = false;
+        goto done;
+    }
+
+    for (int i = 0; i < root_width; i++) {
+        uint64_t one_raw_bytes = 0;
+        uint32_t one_raw_cap = 0;
+        const double raw0 = now_sec();
+        raw_ok = ds4_mtp_tree_raw_cache_compact_copy(s,
+                                                     start,
+                                                     2,
+                                                     root_raw_cache[i],
+                                                     &one_raw_cap,
+                                                     &one_raw_bytes);
+        raw_copy_sec += now_sec() - raw0;
+        if (!raw_ok) {
+            branch_ok = false;
+            goto done;
+        }
+        raw_bytes += one_raw_bytes;
+        branch_raw_cap = one_raw_cap;
+
+        ds4_mtp_tree_state_unbind(s, &binding);
+        branch_ok = ds4_mtp_tree_state_bind_slot(s,
+                                                 &st,
+                                                 (uint64_t)i + 1u,
+                                                 &binding);
+        if (branch_ok) {
+            const double t0 = now_sec();
+            branch_ok = metal_graph_eval_token_raw_swa_with_raw_cache(&s->graph,
+                                                                      &e->model,
+                                                                      &e->weights,
+                                                                      root_ids[i],
+                                                                      start,
+                                                                      root_raw_cache[i],
+                                                                      one_raw_cap,
+                                                                      branch_logits);
+            branch_sec += now_sec() - t0;
+        }
+        if (branch_ok) {
+            branch_ok = ds4_mtp_tree_state_scratch_capture_slot(&st,
+                                                                s,
+                                                                (uint64_t)i + 1u);
+        }
+        ds4_mtp_tree_state_unbind(s, &binding);
+        if (!branch_ok) goto done;
+    }
+
+    for (int i = 0; i < root_width; i++) {
+        const uint64_t parent_slot = (uint64_t)i + 1u;
+        for (int j = 0; j < child_width; j++) {
+            const uint64_t grand_slot = grand_base + (uint64_t)i * (uint64_t)child_width + (uint64_t)j;
+            if (grand_slot >= st.peak_frontier_slots) {
+                branch_ok = false;
+                goto done;
+            }
+            branch_ok = ds4_mtp_tree_state_scratch_copy_slot(&st, grand_slot, parent_slot);
+            if (!branch_ok) goto done;
+
+            s->checkpoint.len = saved_len;
+            memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+            normal_ok = spec_frontier_restore(frontier, s);
+            if (normal_ok) {
+                const double t0 = now_sec();
+                normal_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                           &e->model,
+                                                           &e->weights,
+                                                           root_ids[i],
+                                                           start,
+                                                           normal_logits);
+                if (normal_ok) {
+                    normal_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                               &e->model,
+                                                               &e->weights,
+                                                               child_ids[i][j],
+                                                               start + 1u,
+                                                               normal_logits);
+                }
+                normal_sec += now_sec() - t0;
+            }
+            if (!normal_ok) goto done;
+
+            ds4_mtp_tree_state_unbind(s, &binding);
+            branch_ok = ds4_mtp_tree_state_bind_slot(s, &st, grand_slot, &binding);
+            if (branch_ok) {
+                const double t0 = now_sec();
+                branch_ok = metal_graph_eval_token_raw_swa_with_raw_cache(&s->graph,
+                                                                          &e->model,
+                                                                          &e->weights,
+                                                                          child_ids[i][j],
+                                                                          start + 1u,
+                                                                          root_raw_cache[i],
+                                                                          branch_raw_cap,
+                                                                          branch_logits);
+                branch_sec += now_sec() - t0;
+            }
+            if (branch_ok) {
+                branch_ok = ds4_mtp_tree_state_scratch_capture_slot(&st, s, grand_slot);
+            }
+            ds4_mtp_tree_state_unbind(s, &binding);
+            if (!branch_ok) goto done;
+
+            const int normal_top = sample_argmax(normal_logits, DS4_N_VOCAB);
+            const int branch_top = sample_argmax(branch_logits, DS4_N_VOCAB);
+            const float delta = max_abs_diff(normal_logits, branch_logits, DS4_N_VOCAB);
+            if (delta > max_delta) max_delta = delta;
+            if (normal_top != branch_top || delta > 1.0e-3f) mismatches++;
+        }
+    }
+
+done:
+    ds4_mtp_tree_state_unbind(s, &binding);
+    fprintf(stderr,
+            "ds4: mtp tree-grandchild-probe shape=%s root_width=%d child_width=%d "
+            "branches=%d mtp_ok=%d normal_ok=%d alloc_ok=%d copy_ok=%d "
+            "raw_ok=%d branch_ok=%d mismatches=%d max_delta=%.6g "
+            "state_bytes=%.2f MiB raw_bytes=%.2f MiB raw_cap=%u "
+            "mtp=%.3fms normal=%.3fms alloc=%.3fms copy=%.3fms "
+            "raw_copy=%.3fms branch=%.3fms raw=branch-compact-grandchildren\n",
+            shape_env,
+            root_width,
+            child_width,
+            branch_count,
+            mtp_ok ? 1 : 0,
+            normal_ok ? 1 : 0,
+            alloc_ok ? 1 : 0,
+            copy_ok ? 1 : 0,
+            raw_ok ? 1 : 0,
+            branch_ok ? 1 : 0,
+            mismatches,
+            max_delta,
+            alloc_ok ? (double)st.bytes / (1024.0 * 1024.0) : 0.0,
+            (double)raw_bytes / (1024.0 * 1024.0),
+            branch_raw_cap,
+            mtp_sec * 1000.0,
+            normal_sec * 1000.0,
+            alloc_sec * 1000.0,
+            copy_sec * 1000.0,
+            raw_copy_sec * 1000.0,
+            branch_sec * 1000.0);
+    if (!mtp_ok || !normal_ok || !branch_ok || mismatches != 0) {
+        s->mtp_oracle_reported = true;
+    }
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    (void)spec_frontier_restore(frontier, s);
+    g->mtp_n_raw = saved_mtp_n_raw;
+    for (int i = 0; i < root_width; i++) {
+        ds4_mtp_tree_raw_cache_free(root_raw_cache[i]);
+    }
+    ds4_mtp_tree_state_scratch_free(&st);
+    ds4_metal_tensor_free(child_mtp_state);
+    free(branch_logits);
+    free(normal_logits);
+    free(mtp_logits);
+}
+
+static void ds4_mtp_tree_state_scratch_capture_bound_counters(
+        ds4_mtp_tree_state_scratch *st,
+        ds4_session *s,
+        uint64_t slot) {
+    if (!st || !s || slot >= st->peak_frontier_slots) return;
+    ds4_metal_graph *g = &s->graph;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        st->n_comp[slot * DS4_N_LAYER + il] = g->layer_n_comp[il];
+        st->n_index_comp[slot * DS4_N_LAYER + il] = g->layer_n_index_comp[il];
+    }
+}
+
+typedef struct {
+    uint32_t calls;
+    uint32_t rows;
+    double view_sec;
+    double embed_sec;
+    uint32_t batch_embed_calls;
+    double bind_sec;
+    double layer_encode_sec;
+    double layer_execute_sec;
+    double head_encode_sec;
+    double head_execute_sec;
+    double logits_read_sec;
+    uint32_t bucket_layers[3];
+    double bucket_encode_sec[3];
+    double bucket_execute_sec[3];
+    double restore_execute_sec;
+    double capture_execute_sec;
+} ds4_mtp_tree_depth_batch_profile;
+
+typedef struct {
+    uint64_t slot;
+    int token;
+    uint32_t position;
+    ds4_metal_tensor **raw_cache;
+    uint32_t raw_cap;
+} ds4_mtp_tree_row_desc;
+
+static uint32_t ds4_mtp_tree_layer_bucket(uint32_t il) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio == 0) return 0;
+    if (ratio == 4) return 1;
+    return 2;
+}
+
+static bool ds4_mtp_tree_decode_rows_command_batch(
+        ds4_session *s,
+        ds4_mtp_tree_state_scratch *st,
+        const uint64_t *slots,
+        const int *tokens,
+        const uint32_t *positions,
+        ds4_metal_tensor ***raw_caches,
+        const uint32_t *raw_caps,
+        uint32_t n_rows,
+        float *logits_out,
+        double *sec_out,
+        ds4_mtp_tree_depth_batch_profile *profile);
+
+static bool ds4_mtp_tree_decode_row_descs_serial_fallback(
+        ds4_session *s,
+        ds4_mtp_tree_state_scratch *st,
+        const ds4_mtp_tree_row_desc *rows,
+        uint32_t n_rows,
+        float *logits_out,
+        double *sec_out,
+        ds4_mtp_tree_depth_batch_profile *profile) {
+    if (!rows || n_rows == 0 || n_rows > 16) return false;
+    uint64_t slots[16];
+    int tokens[16];
+    uint32_t positions[16];
+    ds4_metal_tensor **raw_caches[16];
+    uint32_t raw_caps[16];
+    for (uint32_t r = 0; r < n_rows; r++) {
+        slots[r] = rows[r].slot;
+        tokens[r] = rows[r].token;
+        positions[r] = rows[r].position;
+        raw_caches[r] = rows[r].raw_cache;
+        raw_caps[r] = rows[r].raw_cap;
+    }
+    return ds4_mtp_tree_decode_rows_command_batch(s,
+                                                  st,
+                                                  slots,
+                                                  tokens,
+                                                  positions,
+                                                  raw_caches,
+                                                  raw_caps,
+                                                  n_rows,
+                                                  logits_out,
+                                                  sec_out,
+                                                  profile);
+}
+
+static bool ds4_mtp_tree_decode_rows_command_batch(
+        ds4_session *s,
+        ds4_mtp_tree_state_scratch *st,
+        const uint64_t *slots,
+        const int *tokens,
+        const uint32_t *positions,
+        ds4_metal_tensor ***raw_caches,
+        const uint32_t *raw_caps,
+        uint32_t n_rows,
+        float *logits_out,
+        double *sec_out,
+        ds4_mtp_tree_depth_batch_profile *profile) {
+    if (!s || !s->engine || !st || !slots || !tokens || !positions ||
+        !raw_caches || !raw_caps || n_rows == 0 || n_rows > 16) {
+        return false;
+    }
+    ds4_metal_graph *g = &s->graph;
+    ds4_engine *e = s->engine;
+    if (logits_out && (!g->spec_logits || n_rows > g->spec_logits_rows)) {
+        return false;
+    }
+
+    const double t0 = now_sec();
+    if (profile) {
+        profile->calls++;
+        profile->rows += n_rows;
+    }
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_metal_tensor *cur[16];
+    ds4_metal_tensor *next[16];
+    memset(cur, 0, sizeof(cur));
+    memset(next, 0, sizeof(next));
+
+    bool ok = true;
+    const double view0 = profile ? now_sec() : 0.0;
+    for (uint32_t r = 0; ok && r < n_rows; r++) {
+        if (slots[r] >= st->peak_frontier_slots || raw_caps[r] == 0 || !raw_caches[r]) {
+            ok = false;
+            break;
+        }
+        cur[r] = metal_graph_tensor_row_view(g->batch_cur_hc, r, hc_dim);
+        next[r] = metal_graph_tensor_row_view(g->batch_next_hc, r, hc_dim);
+        ok = cur[r] != NULL && next[r] != NULL;
+    }
+    if (profile) profile->view_sec += now_sec() - view0;
+    const double embed0 = profile ? now_sec() : 0.0;
+    const bool batch_embed = n_rows > 1 &&
+                             g->prefill_tokens != NULL;
+    if (batch_embed) {
+        int32_t token_ids[16];
+        for (uint32_t r = 0; r < n_rows; r++) token_ids[r] = (int32_t)tokens[r];
+        ok = ds4_metal_tensor_write(g->prefill_tokens,
+                                    0,
+                                    token_ids,
+                                    (uint64_t)n_rows * sizeof(token_ids[0])) != 0;
+        if (ok) {
+            ok = ds4_metal_embed_tokens_hc_tensor(g->batch_cur_hc,
+                                                  g->prefill_tokens,
+                                                  e->model.map,
+                                                  e->model.size,
+                                                  e->weights.token_embd->abs_offset,
+                                                  (uint32_t)e->weights.token_embd->dim[1],
+                                                  n_rows,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+        }
+        if (profile && ok) profile->batch_embed_calls++;
+    } else {
+        for (uint32_t r = 0; ok && r < n_rows; r++) {
+            ok = ds4_metal_embed_token_hc_tensor(cur[r],
+                                                 e->model.map,
+                                                 e->model.size,
+                                                 e->weights.token_embd->abs_offset,
+                                                 (uint32_t)e->weights.token_embd->dim[1],
+                                                 (uint32_t)tokens[r],
+                                                 DS4_N_EMBD,
+                                                 DS4_N_HC) != 0;
+        }
+    }
+    if (profile) profile->embed_sec += now_sec() - embed0;
+
+    const bool row_layer_profile = getenv("DS4_MTP_TREE_ROW_LAYER_PROFILE") != NULL;
+
+    ds4_metal_tensor *saved_cur = g->cur_hc;
+    ds4_metal_tensor *saved_after = g->after_ffn_hc;
+    const double layer_encode0 = profile ? now_sec() : 0.0;
+    if (!row_layer_profile) {
+        if (ok) ok = ds4_metal_begin_commands() != 0;
+    }
+    for (uint32_t r = 0; ok && r < n_rows; r++) {
+        ds4_mtp_tree_state_binding binding;
+        memset(&binding, 0, sizeof(binding));
+        const double bind0 = profile ? now_sec() : 0.0;
+        if (row_layer_profile) ok = ds4_metal_begin_commands() != 0;
+        if (ok) {
+            ok = ds4_mtp_tree_state_scratch_encode_restore_comp_rows(st, s, slots[r]) &&
+                 ds4_mtp_tree_state_bind_slot(s, st, slots[r], &binding);
+        }
+        if (row_layer_profile) {
+            const double restore0 = profile ? now_sec() : 0.0;
+            if (ok) ok = ds4_metal_end_commands() != 0;
+            else (void)ds4_metal_synchronize();
+            if (profile) profile->restore_execute_sec += now_sec() - restore0;
+        }
+        if (profile) profile->bind_sec += now_sec() - bind0;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            ds4_metal_tensor *raw_cache = raw_caches[r][il];
+            if (!raw_cache) {
+                ok = false;
+                break;
+            }
+            const uint32_t pos = positions[r];
+            const uint32_t raw_cap = raw_caps[r];
+            if (row_layer_profile) ok = ds4_metal_begin_commands() != 0;
+            const double bucket_encode0 = profile && row_layer_profile ? now_sec() : 0.0;
+            g->cur_hc = cur[r];
+            g->after_ffn_hc = next[r];
+            if (ok) {
+                ok = metal_graph_encode_decode_layer(g,
+                                                     &e->model,
+                                                     &e->weights.layer[il],
+                                                     il,
+                                                     pos,
+                                                     raw_cache,
+                                                     raw_cap,
+                                                     pos % raw_cap,
+                                                     metal_graph_raw_span_for_batch_cap(g,
+                                                                                       raw_cap,
+                                                                                       pos,
+                                                                                       1),
+                                                     tokens[r]);
+            }
+            const double bucket_encode_done = profile && row_layer_profile ? now_sec() : 0.0;
+            if (row_layer_profile) {
+                const double bucket_execute0 = profile ? now_sec() : 0.0;
+                if (ok) ok = ds4_metal_end_commands() != 0;
+                else (void)ds4_metal_synchronize();
+                if (profile) {
+                    const uint32_t bucket = ds4_mtp_tree_layer_bucket(il);
+                    profile->bucket_layers[bucket]++;
+                    profile->bucket_encode_sec[bucket] += bucket_encode_done - bucket_encode0;
+                    profile->bucket_execute_sec[bucket] += now_sec() - bucket_execute0;
+                }
+            }
+            ds4_metal_tensor *tmp = cur[r];
+            cur[r] = next[r];
+            next[r] = tmp;
+        }
+        if (row_layer_profile) ok = ok && ds4_metal_begin_commands() != 0;
+        if (ok) {
+            ds4_mtp_tree_state_scratch_capture_bound_counters(st, s, slots[r]);
+            ok = ds4_mtp_tree_state_scratch_encode_capture_comp_rows(st, s, slots[r]);
+        }
+        if (row_layer_profile) {
+            const double capture0 = profile ? now_sec() : 0.0;
+            if (ok) ok = ds4_metal_end_commands() != 0;
+            else (void)ds4_metal_synchronize();
+            if (profile) profile->capture_execute_sec += now_sec() - capture0;
+        }
+        const double unbind0 = profile ? now_sec() : 0.0;
+        ds4_mtp_tree_state_unbind(s, &binding);
+        if (profile) profile->bind_sec += now_sec() - unbind0;
+    }
+    const double layer_encode_done = profile ? now_sec() : 0.0;
+    if (profile) profile->layer_encode_sec += layer_encode_done - layer_encode0;
+    const double layer_execute0 = profile ? now_sec() : 0.0;
+    if (!row_layer_profile) {
+        if (ok) ok = ds4_metal_end_commands() != 0;
+        else (void)ds4_metal_synchronize();
+    }
+    if (profile) profile->layer_execute_sec += now_sec() - layer_execute0;
+
+    g->cur_hc = saved_cur;
+    g->after_ffn_hc = saved_after;
+    if (!ok) goto done;
+
+    if (logits_out) {
+        const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(logits_out[0]);
+        const double head_encode0 = profile ? now_sec() : 0.0;
+        ok = ds4_metal_begin_commands() != 0;
+        for (uint32_t r = 0; ok && r < n_rows; r++) {
+            g->cur_hc = cur[r];
+            ok = metal_graph_encode_output_head(g,
+                                                &e->model,
+                                                &e->weights,
+                                                e->weights.output->dim[1]);
+            if (ok) {
+                ok = ds4_metal_tensor_copy(g->spec_logits,
+                                           (uint64_t)r * row_bytes,
+                                           g->logits,
+                                           0,
+                                           row_bytes) != 0;
+            }
+        }
+        const double head_encode_done = profile ? now_sec() : 0.0;
+        if (profile) profile->head_encode_sec += head_encode_done - head_encode0;
+        const double head_execute0 = profile ? now_sec() : 0.0;
+        if (ok) ok = ds4_metal_end_commands() != 0;
+        else (void)ds4_metal_synchronize();
+        if (profile) profile->head_execute_sec += now_sec() - head_execute0;
+        g->cur_hc = saved_cur;
+        if (ok) {
+            const double read0 = profile ? now_sec() : 0.0;
+            ok = ds4_metal_tensor_read(g->spec_logits,
+                                       0,
+                                       logits_out,
+                                       (uint64_t)n_rows * row_bytes) != 0;
+            if (profile) profile->logits_read_sec += now_sec() - read0;
+        }
+    }
+
+done:
+    g->cur_hc = saved_cur;
+    g->after_ffn_hc = saved_after;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        ds4_metal_tensor_free(next[r]);
+        ds4_metal_tensor_free(cur[r]);
+    }
+    if (sec_out) *sec_out += now_sec() - t0;
+    return ok;
+}
+
+static uint64_t ds4_mtp_tree_root_batch_probe_limit(void) {
+    uint64_t limit = 1;
+    const char *env = getenv("DS4_MTP_TREE_ROOT_BATCH_REUSE_PROBE_STEPS");
+    if (!env || !env[0]) env = getenv("DS4_MTP_TREE_PROBE_STEPS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0 && v < 1000000ull) {
+            limit = (uint64_t)v;
+        }
+    }
+    return limit;
+}
+
+static void ds4_mtp_tree_root_batch_reuse_probe(ds4_session *s,
+                                                ds4_spec_frontier *frontier,
+                                                const float *saved_logits,
+                                                const float *root_mtp_logits,
+                                                int saved_len,
+                                                uint32_t start) {
+    const char *shape_env = getenv("DS4_MTP_TREE_ROOT_BATCH_REUSE_PROBE");
+    if (!s || !s->engine || !frontier || !saved_logits || !root_mtp_logits ||
+        !shape_env || !shape_env[0]) {
+        return;
+    }
+    const uint64_t probe_limit = ds4_mtp_tree_root_batch_probe_limit();
+    if (s->mtp_tree_root_batch_probe_steps >= probe_limit) return;
+    const uint64_t probe_step = s->mtp_tree_root_batch_probe_steps + 1u;
+    s->mtp_tree_root_batch_probe_steps = probe_step;
+
+    int fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    if (!ds4_mtp_tree_shape_by_name(shape_env, fanout) ||
+        fanout[0] <= 0 || fanout[0] > 16) {
+        fprintf(stderr,
+                "ds4: mtp tree-root-batch-reuse-probe shape=%s invalid=1\n",
+                shape_env);
+        return;
+    }
+
+    ds4_engine *e = s->engine;
+    ds4_metal_graph *g = &s->graph;
+    const int root_width = fanout[0];
+    if (!g->spec_logits || (uint32_t)root_width > g->spec_logits_rows) {
+        fprintf(stderr,
+                "ds4: mtp tree-root-batch-reuse-probe shape=%s unsupported=1 "
+                "root_width=%d spec_logits_rows=%u\n",
+                shape_env,
+                root_width,
+                g->spec_logits_rows);
+        return;
+    }
+
+    int root_ids[16];
+    if (logits_top_k_ids(root_mtp_logits, DS4_N_VOCAB, root_ids, root_width) != root_width) {
+        fprintf(stderr,
+                "ds4: mtp tree-root-batch-reuse-probe shape=%s root_topk_failed=1\n",
+                shape_env);
+        return;
+    }
+
+    const bool saved_valid = s->checkpoint_valid;
+    float *normal_logits =
+        xmalloc((size_t)root_width * (size_t)DS4_N_VOCAB * sizeof(normal_logits[0]));
+    float *batch_logits =
+        xmalloc((size_t)root_width * (size_t)DS4_N_VOCAB * sizeof(batch_logits[0]));
+    int row_tops[16];
+    memset(row_tops, -1, sizeof(row_tops));
+    bool normal_ok = normal_logits != NULL;
+    bool batch_ok = batch_logits != NULL;
+    double normal_sec = 0.0;
+    double batch_sec = 0.0;
+    int top_mismatches = 0;
+    int logit_mismatches = 0;
+    int first_top_row = -1;
+    int first_logit_row = -1;
+    int first_top_normal = -1;
+    int first_top_batch = -1;
+    int first_logit_normal_top = -1;
+    int first_logit_batch_top = -1;
+    float first_logit_delta = 0.0f;
+    float max_delta = 0.0f;
+
+    for (int i = 0; normal_ok && i < root_width; i++) {
+        s->checkpoint.len = saved_len;
+        s->checkpoint_valid = saved_valid;
+        memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+        normal_ok = spec_frontier_restore(frontier, s);
+        if (!normal_ok) break;
+        const double t0 = now_sec();
+        normal_ok = metal_graph_eval_token_raw_swa(g,
+                                                   &e->model,
+                                                   &e->weights,
+                                                   root_ids[i],
+                                                   start,
+                                                   normal_logits +
+                                                       (size_t)i * DS4_N_VOCAB);
+        normal_sec += now_sec() - t0;
+    }
+
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (batch_ok) batch_ok = spec_frontier_restore(frontier, s);
+    if (batch_ok) {
+        for (int i = 0; i < root_width; i++) token_vec_push(&s->checkpoint, root_ids[i]);
+        const double t0 = now_sec();
+        batch_ok = metal_graph_verify_suffix_tops(g,
+                                                  &e->model,
+                                                  &e->weights,
+                                                  &s->checkpoint,
+                                                  start,
+                                                  (uint32_t)root_width,
+                                                  false,
+                                                  true,
+                                                  row_tops,
+                                                  batch_logits,
+                                                  NULL);
+        batch_sec += now_sec() - t0;
+    }
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    (void)spec_frontier_restore(frontier, s);
+
+    if (normal_ok && batch_ok) {
+        for (int i = 0; i < root_width; i++) {
+            const float *normal_row = normal_logits + (size_t)i * DS4_N_VOCAB;
+            const float *batch_row = batch_logits + (size_t)i * DS4_N_VOCAB;
+            const int normal_top = sample_argmax(normal_row, DS4_N_VOCAB);
+            const int batch_top = sample_argmax(batch_row, DS4_N_VOCAB);
+            const float delta = max_abs_diff(normal_row, batch_row, DS4_N_VOCAB);
+            if (delta > max_delta) max_delta = delta;
+            if (normal_top != batch_top) {
+                top_mismatches++;
+                if (first_top_row < 0) {
+                    first_top_row = i;
+                    first_top_normal = normal_top;
+                    first_top_batch = batch_top;
+                }
+            }
+            if (delta != 0.0f) {
+                logit_mismatches++;
+                if (first_logit_row < 0) {
+                    first_logit_row = i;
+                    first_logit_normal_top = normal_top;
+                    first_logit_batch_top = batch_top;
+                    first_logit_delta = delta;
+                }
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: mtp tree-root-batch-reuse-probe shape=%s step=%llu/%llu "
+            "start=%u root_width=%d normal_ok=%d batch_ok=%d "
+            "top_mismatches=%d logit_mismatches=%d max_delta=%.6g "
+            "first_top_row=%d first_top_tops=%d/%d "
+            "first_logit_row=%d first_logit_tops=%d/%d first_logit_delta=%.6g "
+            "normal=%.3fms batch=%.3fms note=linear-suffix-batch-reuse\n",
+            shape_env,
+            (unsigned long long)probe_step,
+            (unsigned long long)probe_limit,
+            start,
+            root_width,
+            normal_ok ? 1 : 0,
+            batch_ok ? 1 : 0,
+            top_mismatches,
+            logit_mismatches,
+            max_delta,
+            first_top_row,
+            first_top_normal,
+            first_top_batch,
+            first_logit_row,
+            first_logit_normal_top,
+            first_logit_batch_top,
+            first_logit_delta,
+            normal_sec * 1000.0,
+            batch_sec * 1000.0);
+
+    free(batch_logits);
+    free(normal_logits);
+}
+
+static uint64_t ds4_mtp_tree_row_kernel_probe_limit(void) {
+    uint64_t limit = 1;
+    const char *env = getenv("DS4_MTP_TREE_ROW_KERNEL_PROBE_STEPS");
+    if (!env || !env[0]) env = getenv("DS4_MTP_TREE_PROBE_STEPS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0 && v < 1000000ull) {
+            limit = (uint64_t)v;
+        }
+    }
+    return limit;
+}
+
+static void ds4_mtp_tree_row_kernel_probe(ds4_session *s,
+                                          ds4_spec_frontier *frontier,
+                                          const float *saved_logits,
+                                          const float *root_mtp_logits,
+                                          int saved_len,
+                                          uint32_t start) {
+    const char *shape_env = getenv("DS4_MTP_TREE_ROW_KERNEL_PROBE");
+    if (!s || !s->engine || !frontier || !saved_logits || !root_mtp_logits ||
+        !shape_env || !shape_env[0]) {
+        return;
+    }
+    const uint64_t probe_limit = ds4_mtp_tree_row_kernel_probe_limit();
+    if (s->mtp_tree_row_kernel_probe_steps >= probe_limit) return;
+    const uint64_t probe_step = s->mtp_tree_row_kernel_probe_steps + 1u;
+    s->mtp_tree_row_kernel_probe_steps = probe_step;
+
+    int fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    if (!ds4_mtp_tree_shape_by_name(shape_env, fanout) ||
+        fanout[0] <= 0 || fanout[0] > 16) {
+        fprintf(stderr,
+                "ds4: mtp tree-row-kernel-probe shape=%s invalid=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    ds4_engine *e = s->engine;
+    ds4_metal_graph *g = &s->graph;
+    const int root_width = fanout[0];
+    if (!g->spec_logits || (uint32_t)root_width > g->spec_logits_rows) {
+        fprintf(stderr,
+                "ds4: mtp tree-row-kernel-probe shape=%s unsupported=1 "
+                "root_width=%d spec_logits_rows=%u\n",
+                shape_env,
+                root_width,
+                g->spec_logits_rows);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    int root_ids[16];
+    if (logits_top_k_ids(root_mtp_logits, DS4_N_VOCAB, root_ids, root_width) != root_width) {
+        fprintf(stderr,
+                "ds4: mtp tree-row-kernel-probe shape=%s root_topk_failed=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    const bool saved_valid = s->checkpoint_valid;
+    float *normal_logits =
+        xmalloc((size_t)root_width * (size_t)DS4_N_VOCAB * sizeof(normal_logits[0]));
+    float *row_logits =
+        xmalloc((size_t)root_width * (size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+    ds4_metal_tensor **root_raw_cache_batch =
+        xcalloc((size_t)root_width * DS4_N_LAYER, sizeof(root_raw_cache_batch[0]));
+    ds4_mtp_tree_state_scratch st;
+    memset(&st, 0, sizeof(st));
+    ds4_mtp_tree_row_desc rows[16];
+    memset(rows, 0, sizeof(rows));
+    ds4_mtp_tree_depth_batch_profile profile;
+    memset(&profile, 0, sizeof(profile));
+
+    double normal_sec = 0.0;
+    double alloc_sec = 0.0;
+    double copy_sec = 0.0;
+    double raw_copy_sec = 0.0;
+    double row_sec = 0.0;
+    uint64_t raw_bytes = 0;
+    uint32_t branch_raw_cap = 0;
+    int top_mismatches = 0;
+    int logit_mismatches = 0;
+    int first_top_row = -1;
+    int first_logit_row = -1;
+    int first_normal_top = -1;
+    int first_row_top = -1;
+    int first_logit_normal_top = -1;
+    int first_logit_row_top = -1;
+    float first_logit_delta = 0.0f;
+    float max_delta = 0.0f;
+    bool normal_ok = normal_logits != NULL;
+    bool alloc_ok = false;
+    bool copy_ok = false;
+    bool raw_ok = root_raw_cache_batch != NULL;
+    bool row_ok = row_logits != NULL;
+
+    for (int i = 0; normal_ok && i < root_width; i++) {
+        s->checkpoint.len = saved_len;
+        s->checkpoint_valid = saved_valid;
+        memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+        normal_ok = spec_frontier_restore(frontier, s);
+        if (!normal_ok) break;
+        const double normal0 = now_sec();
+        normal_ok = metal_graph_eval_token_raw_swa(g,
+                                                   &e->model,
+                                                   &e->weights,
+                                                   root_ids[i],
+                                                   start,
+                                                   normal_logits +
+                                                       (size_t)i * DS4_N_VOCAB);
+        normal_sec += now_sec() - normal0;
+    }
+
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (row_ok) row_ok = spec_frontier_restore(frontier, s);
+
+    const double alloc0 = now_sec();
+    if (row_ok) alloc_ok = ds4_mtp_tree_state_scratch_alloc(&st,
+                                                            fanout,
+                                                            DS4_MTP_TREE_SHAPE_DEPTH);
+    alloc_sec = now_sec() - alloc0;
+    if (row_ok && !alloc_ok) row_ok = false;
+
+    const double copy0 = now_sec();
+    if (row_ok) copy_ok = ds4_mtp_tree_state_scratch_copy_root(&st, s, (uint64_t)root_width);
+    copy_sec = now_sec() - copy0;
+    if (row_ok && !copy_ok) row_ok = false;
+
+    for (int i = 0; row_ok && raw_ok && i < root_width; i++) {
+        ds4_metal_tensor **root_raw_cache =
+            root_raw_cache_batch + (size_t)i * DS4_N_LAYER;
+        uint64_t one_raw_bytes = 0;
+        uint32_t one_raw_cap = 0;
+        const double raw0 = now_sec();
+        raw_ok = ds4_mtp_tree_raw_cache_compact_copy(s,
+                                                     start,
+                                                     3,
+                                                     root_raw_cache,
+                                                     &one_raw_cap,
+                                                     &one_raw_bytes);
+        raw_copy_sec += now_sec() - raw0;
+        if (!raw_ok) {
+            row_ok = false;
+            break;
+        }
+        raw_bytes += one_raw_bytes;
+        branch_raw_cap = one_raw_cap;
+        rows[i].slot = (uint64_t)i;
+        rows[i].token = root_ids[i];
+        rows[i].position = start;
+        rows[i].raw_cache = root_raw_cache;
+        rows[i].raw_cap = one_raw_cap;
+    }
+
+    if (row_ok) {
+        row_ok = ds4_mtp_tree_decode_row_descs_serial_fallback(s,
+                                                               &st,
+                                                               rows,
+                                                               (uint32_t)root_width,
+                                                               row_logits,
+                                                               &row_sec,
+                                                               &profile);
+    }
+
+    if (normal_ok && row_ok) {
+        for (int i = 0; i < root_width; i++) {
+            const float *normal_row = normal_logits + (size_t)i * DS4_N_VOCAB;
+            const float *row = row_logits + (size_t)i * DS4_N_VOCAB;
+            const int normal_top = sample_argmax(normal_row, DS4_N_VOCAB);
+            const int row_top = sample_argmax(row, DS4_N_VOCAB);
+            const float delta = max_abs_diff(normal_row, row, DS4_N_VOCAB);
+            if (delta > max_delta) max_delta = delta;
+            if (normal_top != row_top) {
+                top_mismatches++;
+                if (first_top_row < 0) {
+                    first_top_row = i;
+                    first_normal_top = normal_top;
+                    first_row_top = row_top;
+                }
+            }
+            if (delta != 0.0f) {
+                logit_mismatches++;
+                if (first_logit_row < 0) {
+                    first_logit_row = i;
+                    first_logit_normal_top = normal_top;
+                    first_logit_row_top = row_top;
+                    first_logit_delta = delta;
+                }
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: mtp tree-row-kernel-probe shape=%s step=%llu/%llu "
+            "start=%u depth=0 rows=%d same_position=1 serial_fallback=1 "
+            "normal_ok=%d alloc_ok=%d copy_ok=%d raw_ok=%d row_ok=%d "
+            "top_mismatches=%d logit_mismatches=%d max_delta=%.6g "
+            "first_top_row=%d first_top_tops=%d/%d "
+            "first_logit_row=%d first_logit_tops=%d/%d first_logit_delta=%.6g "
+            "state_bytes=%.2f MiB raw_bytes=%.2f MiB raw_cap=%u "
+            "normal=%.3fms alloc=%.3fms copy=%.3fms raw_copy=%.3fms row=%.3fms "
+            "calls=%u view=%.3fms embed=%.3fms bind=%.3fms "
+            "command_encode=%.3fms execute=%.3fms head=%.3fms "
+            "batch_embed_calls=%u read=%.3fms "
+            "layer_profile=%d restore_exec=%.3fms capture_exec=%.3fms "
+            "raw_layers=%u raw_encode=%.3fms raw_exec=%.3fms "
+            "r4_layers=%u r4_encode=%.3fms r4_exec=%.3fms "
+            "r128_layers=%u r128_encode=%.3fms r128_exec=%.3fms\n",
+            shape_env,
+            (unsigned long long)probe_step,
+            (unsigned long long)probe_limit,
+            start,
+            root_width,
+            normal_ok ? 1 : 0,
+            alloc_ok ? 1 : 0,
+            copy_ok ? 1 : 0,
+            raw_ok ? 1 : 0,
+            row_ok ? 1 : 0,
+            top_mismatches,
+            logit_mismatches,
+            max_delta,
+            first_top_row,
+            first_normal_top,
+            first_row_top,
+            first_logit_row,
+            first_logit_normal_top,
+            first_logit_row_top,
+            first_logit_delta,
+            alloc_ok ? (double)st.bytes / (1024.0 * 1024.0) : 0.0,
+            (double)raw_bytes / (1024.0 * 1024.0),
+            branch_raw_cap,
+            normal_sec * 1000.0,
+            alloc_sec * 1000.0,
+            copy_sec * 1000.0,
+            raw_copy_sec * 1000.0,
+            row_sec * 1000.0,
+            profile.calls,
+            profile.view_sec * 1000.0,
+            profile.embed_sec * 1000.0,
+            profile.bind_sec * 1000.0,
+            profile.layer_encode_sec * 1000.0,
+            profile.layer_execute_sec * 1000.0,
+            (profile.head_encode_sec + profile.head_execute_sec) * 1000.0,
+            profile.batch_embed_calls,
+            profile.logits_read_sec * 1000.0,
+            getenv("DS4_MTP_TREE_ROW_LAYER_PROFILE") != NULL ? 1 : 0,
+            profile.restore_execute_sec * 1000.0,
+            profile.capture_execute_sec * 1000.0,
+            profile.bucket_layers[0],
+            profile.bucket_encode_sec[0] * 1000.0,
+            profile.bucket_execute_sec[0] * 1000.0,
+            profile.bucket_layers[1],
+            profile.bucket_encode_sec[1] * 1000.0,
+            profile.bucket_execute_sec[1] * 1000.0,
+            profile.bucket_layers[2],
+            profile.bucket_encode_sec[2] * 1000.0,
+            profile.bucket_execute_sec[2] * 1000.0);
+
+    if (!normal_ok || !row_ok || top_mismatches != 0 || logit_mismatches != 0) {
+        s->mtp_oracle_reported = true;
+    }
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    (void)spec_frontier_restore(frontier, s);
+    if (root_raw_cache_batch) {
+        for (int i = 0; i < root_width; i++) {
+            ds4_mtp_tree_raw_cache_free(root_raw_cache_batch + (size_t)i * DS4_N_LAYER);
+        }
+    }
+    ds4_mtp_tree_state_scratch_free(&st);
+    free(root_raw_cache_batch);
+    free(row_logits);
+    free(normal_logits);
+}
+
+static uint64_t ds4_mtp_tree_full_probe_limit(bool depth_batch_probe) {
+    uint64_t limit = 1;
+    const char *env = depth_batch_probe ?
+        getenv("DS4_MTP_TREE_DEPTH_BATCH_PROBE_STEPS") :
+        getenv("DS4_MTP_TREE_FULL_PROBE_STEPS");
+    if (!env || !env[0]) env = getenv("DS4_MTP_TREE_PROBE_STEPS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0 && v < 1000000ull) {
+            limit = (uint64_t)v;
+        }
+    }
+    return limit;
+}
+
+static void ds4_mtp_tree_full_probe(ds4_session *s,
+                                    ds4_spec_frontier *frontier,
+                                    const float *saved_logits,
+                                    ds4_metal_tensor *root_mtp_state,
+                                    const float *root_mtp_logits,
+                                    uint32_t root_mtp_n_raw,
+                                    int saved_len,
+                                    uint32_t start) {
+    const char *batch_shape_env = getenv("DS4_MTP_TREE_DEPTH_BATCH_PROBE");
+    const bool depth_batch_probe = batch_shape_env && batch_shape_env[0];
+    const char *shape_env = depth_batch_probe ?
+        batch_shape_env : getenv("DS4_MTP_TREE_FULL_PROBE");
+    if (!s || !s->engine || !frontier || !saved_logits ||
+        !root_mtp_state || !root_mtp_logits ||
+        !shape_env || !shape_env[0]) {
+        return;
+    }
+    const uint64_t probe_limit = ds4_mtp_tree_full_probe_limit(depth_batch_probe);
+    if (s->mtp_tree_full_probe_steps >= probe_limit) return;
+    const uint64_t probe_step = s->mtp_tree_full_probe_steps + 1u;
+    s->mtp_tree_full_probe_steps = probe_step;
+
+    int fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    if (!ds4_mtp_tree_shape_by_name(shape_env, fanout) ||
+        fanout[0] <= 0 || fanout[0] > 16 ||
+        fanout[1] <= 0 || fanout[1] > 16 ||
+        fanout[2] <= 0 || fanout[2] > 16) {
+        fprintf(stderr,
+                "ds4: mtp tree-full-probe shape=%s invalid=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    const int root_width = fanout[0];
+    const int child_width = fanout[1];
+    const int grand_width = fanout[2];
+    const int pair_count = root_width * child_width;
+    const int branch_count = pair_count * grand_width;
+    if (pair_count <= 0 || branch_count <= 0 || branch_count > 256 ||
+        (depth_batch_probe &&
+         (root_width > 16 || pair_count > 16 || branch_count > 16))) {
+        fprintf(stderr,
+                "ds4: mtp tree-%s-probe shape=%s unsupported=1 "
+                "pair_count=%d branches=%d\n",
+                depth_batch_probe ? "depth-batch" : "full",
+                shape_env,
+                pair_count,
+                branch_count);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    int root_ids[16];
+    int child_ids[16][16];
+    int grand_ids[16][16][16];
+    memset(child_ids, -1, sizeof(child_ids));
+    memset(grand_ids, -1, sizeof(grand_ids));
+    if (logits_top_k_ids(root_mtp_logits, DS4_N_VOCAB, root_ids, root_width) != root_width) {
+        fprintf(stderr,
+                "ds4: mtp tree-full-probe shape=%s root_topk_failed=1\n",
+                shape_env);
+        s->mtp_oracle_reported = true;
+        return;
+    }
+
+    ds4_engine *e = s->engine;
+    ds4_metal_graph *g = &s->graph;
+    const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    ds4_metal_tensor *child_mtp_state = ds4_metal_tensor_alloc(hc_bytes);
+    ds4_metal_tensor *grand_mtp_state = ds4_metal_tensor_alloc(hc_bytes);
+    float *mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(mtp_logits[0]));
+    float *normal_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(normal_logits[0]));
+    const size_t branch_logits_rows = depth_batch_probe ? (size_t)branch_count : 1u;
+    float *branch_logits =
+        xmalloc(branch_logits_rows * (size_t)DS4_N_VOCAB * sizeof(branch_logits[0]));
+    ds4_metal_tensor **root_raw_cache_batch = depth_batch_probe ?
+        xcalloc((size_t)root_width * DS4_N_LAYER, sizeof(root_raw_cache_batch[0])) :
+        NULL;
+    ds4_metal_tensor **pair_raw_cache =
+        xcalloc((size_t)pair_count * DS4_N_LAYER, sizeof(pair_raw_cache[0]));
+    uint32_t *pair_raw_cap = xcalloc((size_t)pair_count, sizeof(pair_raw_cap[0]));
+    ds4_mtp_tree_state_scratch st;
+    memset(&st, 0, sizeof(st));
+    ds4_mtp_tree_state_binding binding;
+    memset(&binding, 0, sizeof(binding));
+    ds4_mtp_tree_depth_batch_profile depth_profile;
+    memset(&depth_profile, 0, sizeof(depth_profile));
+
+    const bool saved_valid = s->checkpoint_valid;
+    const uint32_t saved_mtp_n_raw = g->mtp_n_raw;
+    double mtp_sec = 0.0;
+    double alloc_sec = 0.0;
+    double copy_sec = 0.0;
+    double raw_copy_sec = 0.0;
+    double normal_sec = 0.0;
+    double branch_sec = 0.0;
+    uint64_t raw_bytes = 0;
+    uint32_t branch_raw_cap = 0;
+    int mismatches = 0;
+    int first_mismatch_root = -1;
+    int first_mismatch_child = -1;
+    int first_mismatch_grand = -1;
+    int first_normal_top = -1;
+    int first_branch_top = -1;
+    float first_delta = 0.0f;
+    float max_delta = 0.0f;
+    bool mtp_ok = child_mtp_state != NULL && grand_mtp_state != NULL && mtp_logits != NULL;
+    bool normal_ok = true;
+    bool branch_ok = true;
+    bool alloc_ok = false;
+    bool copy_ok = false;
+    bool raw_ok = false;
+
+    if (!mtp_ok) {
+        normal_ok = false;
+        branch_ok = false;
+        goto done;
+    }
+
+    uint32_t child_mtp_n_raw = root_mtp_n_raw + 1u;
+    if (child_mtp_n_raw > g->raw_window) child_mtp_n_raw = g->raw_window;
+    if (child_mtp_n_raw > g->raw_cap) child_mtp_n_raw = g->raw_cap;
+
+    for (int i = 0; mtp_ok && i < root_width; i++) {
+        int ignored_top = -1;
+        g->mtp_n_raw = root_mtp_n_raw;
+        const double child0 = now_sec();
+        mtp_ok = metal_graph_eval_mtp_draft_from_hc(g,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    &e->mtp_model,
+                                                    &e->mtp_weights,
+                                                    root_mtp_state,
+                                                    child_mtp_state,
+                                                    root_ids[i],
+                                                    start,
+                                                    mtp_logits,
+                                                    &ignored_top,
+                                                    child_ids[i],
+                                                    (uint32_t)child_width);
+        mtp_sec += now_sec() - child0;
+        for (int j = 0; mtp_ok && j < child_width; j++) {
+            g->mtp_n_raw = child_mtp_n_raw;
+            const double grand0 = now_sec();
+            mtp_ok = metal_graph_eval_mtp_draft_from_hc(g,
+                                                        &e->model,
+                                                        &e->weights,
+                                                        &e->mtp_model,
+                                                        &e->mtp_weights,
+                                                        child_mtp_state,
+                                                        grand_mtp_state,
+                                                        child_ids[i][j],
+                                                        start + 1u,
+                                                        mtp_logits,
+                                                        &ignored_top,
+                                                        grand_ids[i][j],
+                                                        (uint32_t)grand_width);
+            mtp_sec += now_sec() - grand0;
+        }
+    }
+    if (!mtp_ok) {
+        normal_ok = false;
+        branch_ok = false;
+        goto done;
+    }
+
+    s->checkpoint.len = saved_len;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (!spec_frontier_restore(frontier, s)) {
+        normal_ok = false;
+        branch_ok = false;
+        goto done;
+    }
+
+    const double alloc0 = now_sec();
+    alloc_ok = ds4_mtp_tree_state_scratch_alloc(&st, fanout, DS4_MTP_TREE_SHAPE_DEPTH);
+    alloc_sec = now_sec() - alloc0;
+    if (!alloc_ok ||
+        (uint64_t)root_width + (uint64_t)pair_count > st.peak_frontier_slots ||
+        (uint64_t)pair_count + (uint64_t)branch_count > st.peak_frontier_slots) {
+        branch_ok = false;
+        goto done;
+    }
+
+    const double copy0 = now_sec();
+    copy_ok = ds4_mtp_tree_state_scratch_copy_root(&st, s, (uint64_t)root_width);
+    copy_sec = now_sec() - copy0;
+    if (!copy_ok) {
+        branch_ok = false;
+        goto done;
+    }
+
+    raw_ok = true;
+    if (depth_batch_probe) {
+        uint64_t root_slots[16];
+        int root_tokens[16];
+        uint32_t root_positions[16];
+        ds4_metal_tensor **root_raw_rows[16];
+        uint32_t root_raw_caps[16];
+        for (int i = 0; i < root_width; i++) {
+            ds4_metal_tensor **root_raw_cache =
+                root_raw_cache_batch + (size_t)i * DS4_N_LAYER;
+            uint64_t one_raw_bytes = 0;
+            uint32_t one_raw_cap = 0;
+            const double raw0 = now_sec();
+            raw_ok = ds4_mtp_tree_raw_cache_compact_copy(s,
+                                                         start,
+                                                         3,
+                                                         root_raw_cache,
+                                                         &one_raw_cap,
+                                                         &one_raw_bytes);
+            raw_copy_sec += now_sec() - raw0;
+            if (!raw_ok) {
+                branch_ok = false;
+                goto done;
+            }
+            raw_bytes += one_raw_bytes;
+            branch_raw_cap = one_raw_cap;
+            root_slots[i] = (uint64_t)i;
+            root_tokens[i] = root_ids[i];
+            root_positions[i] = start;
+            root_raw_rows[i] = root_raw_cache;
+            root_raw_caps[i] = one_raw_cap;
+        }
+
+        branch_ok = ds4_mtp_tree_decode_rows_command_batch(s,
+                                                           &st,
+                                                           root_slots,
+                                                           root_tokens,
+                                                           root_positions,
+                                                           root_raw_rows,
+                                                           root_raw_caps,
+                                                           (uint32_t)root_width,
+                                                           NULL,
+                                                           &branch_sec,
+                                                           &depth_profile);
+        if (!branch_ok) goto done;
+
+        for (int i = 0; i < root_width; i++) {
+            ds4_metal_tensor **root_raw_cache =
+                root_raw_cache_batch + (size_t)i * DS4_N_LAYER;
+            for (int j = 0; j < child_width; j++) {
+                const int p = i * child_width + j;
+                uint64_t clone_bytes = 0;
+                const double clone0 = now_sec();
+                raw_ok = ds4_mtp_tree_raw_cache_clone(pair_raw_cache + (size_t)p * DS4_N_LAYER,
+                                                      root_raw_cache,
+                                                      root_raw_caps[i],
+                                                      &clone_bytes);
+                raw_copy_sec += now_sec() - clone0;
+                if (!raw_ok) {
+                    branch_ok = false;
+                    goto done;
+                }
+                raw_bytes += clone_bytes;
+                pair_raw_cap[p] = root_raw_caps[i];
+            }
+        }
+    } else {
+        for (int i = 0; i < root_width; i++) {
+            ds4_metal_tensor *root_raw_cache[DS4_N_LAYER];
+            memset(root_raw_cache, 0, sizeof(root_raw_cache));
+            uint64_t one_raw_bytes = 0;
+            uint32_t one_raw_cap = 0;
+            const double raw0 = now_sec();
+            raw_ok = ds4_mtp_tree_raw_cache_compact_copy(s,
+                                                         start,
+                                                         3,
+                                                         root_raw_cache,
+                                                         &one_raw_cap,
+                                                         &one_raw_bytes);
+            raw_copy_sec += now_sec() - raw0;
+            if (!raw_ok) {
+                branch_ok = false;
+                ds4_mtp_tree_raw_cache_free(root_raw_cache);
+                goto done;
+            }
+            raw_bytes += one_raw_bytes;
+            branch_raw_cap = one_raw_cap;
+
+            ds4_mtp_tree_state_unbind(s, &binding);
+            branch_ok = ds4_mtp_tree_state_scratch_restore_comp_rows(&st, s, (uint64_t)i) &&
+                        ds4_mtp_tree_state_bind_slot(s, &st, (uint64_t)i, &binding);
+            if (branch_ok) {
+                const double t0 = now_sec();
+                branch_ok = metal_graph_eval_token_raw_swa_with_raw_cache(&s->graph,
+                                                                          &e->model,
+                                                                          &e->weights,
+                                                                          root_ids[i],
+                                                                          start,
+                                                                          root_raw_cache,
+                                                                          one_raw_cap,
+                                                                          NULL);
+                branch_sec += now_sec() - t0;
+            }
+            if (branch_ok) {
+                branch_ok = ds4_mtp_tree_state_scratch_capture_slot(&st, s, (uint64_t)i);
+            }
+            ds4_mtp_tree_state_unbind(s, &binding);
+            if (!branch_ok) {
+                ds4_mtp_tree_raw_cache_free(root_raw_cache);
+                goto done;
+            }
+
+            for (int j = 0; j < child_width; j++) {
+                const int p = i * child_width + j;
+                uint64_t clone_bytes = 0;
+                const double clone0 = now_sec();
+                raw_ok = ds4_mtp_tree_raw_cache_clone(pair_raw_cache + (size_t)p * DS4_N_LAYER,
+                                                      root_raw_cache,
+                                                      one_raw_cap,
+                                                      &clone_bytes);
+                raw_copy_sec += now_sec() - clone0;
+                if (!raw_ok) {
+                    branch_ok = false;
+                    ds4_mtp_tree_raw_cache_free(root_raw_cache);
+                    goto done;
+                }
+                raw_bytes += clone_bytes;
+                pair_raw_cap[p] = one_raw_cap;
+            }
+            ds4_mtp_tree_raw_cache_free(root_raw_cache);
+        }
+    }
+
+    if (depth_batch_probe) {
+        uint64_t pair_slots[16];
+        int pair_tokens[16];
+        uint32_t pair_positions[16];
+        ds4_metal_tensor **pair_raw_rows[16];
+        for (int i = 0; i < root_width; i++) {
+            const uint64_t root_slot = (uint64_t)i;
+            for (int j = 0; j < child_width; j++) {
+                const int p = i * child_width + j;
+                const uint64_t pair_slot = (uint64_t)root_width + (uint64_t)p;
+                copy_ok = ds4_mtp_tree_state_scratch_copy_slot(&st, pair_slot, root_slot);
+                if (!copy_ok) {
+                    branch_ok = false;
+                    goto done;
+                }
+                pair_slots[p] = pair_slot;
+                pair_tokens[p] = child_ids[i][j];
+                pair_positions[p] = start + 1u;
+                pair_raw_rows[p] = pair_raw_cache + (size_t)p * DS4_N_LAYER;
+            }
+        }
+        branch_ok = ds4_mtp_tree_decode_rows_command_batch(s,
+                                                           &st,
+                                                           pair_slots,
+                                                           pair_tokens,
+                                                           pair_positions,
+                                                           pair_raw_rows,
+                                                           pair_raw_cap,
+                                                           (uint32_t)pair_count,
+                                                           NULL,
+                                                           &branch_sec,
+                                                           &depth_profile);
+        if (!branch_ok) goto done;
+    } else {
+        for (int i = 0; i < root_width; i++) {
+            const uint64_t root_slot = (uint64_t)i;
+            for (int j = 0; j < child_width; j++) {
+                const int p = i * child_width + j;
+                const uint64_t pair_slot = (uint64_t)root_width + (uint64_t)p;
+                copy_ok = ds4_mtp_tree_state_scratch_copy_slot(&st, pair_slot, root_slot);
+                if (!copy_ok) {
+                    branch_ok = false;
+                    goto done;
+                }
+
+                ds4_mtp_tree_state_unbind(s, &binding);
+                branch_ok = ds4_mtp_tree_state_scratch_restore_comp_rows(&st, s, pair_slot) &&
+                            ds4_mtp_tree_state_bind_slot(s, &st, pair_slot, &binding);
+                if (branch_ok) {
+                    const double t0 = now_sec();
+                    branch_ok = metal_graph_eval_token_raw_swa_with_raw_cache(&s->graph,
+                                                                              &e->model,
+                                                                              &e->weights,
+                                                                              child_ids[i][j],
+                                                                              start + 1u,
+                                                                              pair_raw_cache + (size_t)p * DS4_N_LAYER,
+                                                                              pair_raw_cap[p],
+                                                                              NULL);
+                    branch_sec += now_sec() - t0;
+                }
+                if (branch_ok) {
+                    branch_ok = ds4_mtp_tree_state_scratch_capture_slot(&st, s, pair_slot);
+                }
+                ds4_mtp_tree_state_unbind(s, &binding);
+                if (!branch_ok) goto done;
+            }
+        }
+    }
+
+    const double compact0 = now_sec();
+    for (int p = 0; p < pair_count; p++) {
+        copy_ok = ds4_mtp_tree_state_scratch_copy_slot(&st,
+                                                       (uint64_t)p,
+                                                       (uint64_t)root_width + (uint64_t)p);
+        if (!copy_ok) {
+            branch_ok = false;
+            break;
+        }
+    }
+    copy_sec += now_sec() - compact0;
+    if (!branch_ok) goto done;
+
+    if (depth_batch_probe) {
+        uint64_t grand_slots[16];
+        int grand_tokens_flat[16];
+        uint32_t grand_positions[16];
+        ds4_metal_tensor **grand_raw_rows[16];
+        uint32_t grand_raw_caps[16];
+        for (int i = 0; i < root_width; i++) {
+            for (int j = 0; j < child_width; j++) {
+                const int p = i * child_width + j;
+                const uint64_t parent_slot = (uint64_t)p;
+                for (int k = 0; k < grand_width; k++) {
+                    const int branch_index = p * grand_width + k;
+                    const uint64_t grand_slot =
+                        (uint64_t)pair_count + (uint64_t)branch_index;
+                    if (grand_slot >= st.peak_frontier_slots) {
+                        branch_ok = false;
+                        goto done;
+                    }
+                    copy_ok = ds4_mtp_tree_state_scratch_copy_slot(&st,
+                                                                   grand_slot,
+                                                                   parent_slot);
+                    if (!copy_ok) {
+                        branch_ok = false;
+                        goto done;
+                    }
+                    grand_slots[branch_index] = grand_slot;
+                    grand_tokens_flat[branch_index] = grand_ids[i][j][k];
+                    grand_positions[branch_index] = start + 2u;
+                    grand_raw_rows[branch_index] =
+                        pair_raw_cache + (size_t)p * DS4_N_LAYER;
+                    grand_raw_caps[branch_index] = pair_raw_cap[p];
+                }
+            }
+        }
+        branch_ok = ds4_mtp_tree_decode_rows_command_batch(s,
+                                                           &st,
+                                                           grand_slots,
+                                                           grand_tokens_flat,
+                                                           grand_positions,
+                                                           grand_raw_rows,
+                                                           grand_raw_caps,
+                                                           (uint32_t)branch_count,
+                                                           branch_logits,
+                                                           &branch_sec,
+                                                           &depth_profile);
+        if (!branch_ok) goto done;
+    }
+
+    for (int i = 0; i < root_width; i++) {
+        for (int j = 0; j < child_width; j++) {
+            const int p = i * child_width + j;
+            const uint64_t parent_slot = (uint64_t)p;
+            for (int k = 0; k < grand_width; k++) {
+                const int branch_index = p * grand_width + k;
+                const uint64_t grand_slot = (uint64_t)pair_count + (uint64_t)branch_index;
+                if (!depth_batch_probe) {
+                    if (grand_slot >= st.peak_frontier_slots) {
+                        branch_ok = false;
+                        goto done;
+                    }
+                    copy_ok = ds4_mtp_tree_state_scratch_copy_slot(&st, grand_slot, parent_slot);
+                    if (!copy_ok) {
+                        branch_ok = false;
+                        goto done;
+                    }
+                }
+
+                s->checkpoint.len = saved_len;
+                memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+                normal_ok = spec_frontier_restore(frontier, s);
+                if (normal_ok) {
+                    const double t0 = now_sec();
+                    normal_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                               &e->model,
+                                                               &e->weights,
+                                                               root_ids[i],
+                                                               start,
+                                                               NULL);
+                    if (normal_ok) {
+                        normal_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                                   &e->model,
+                                                                   &e->weights,
+                                                                   child_ids[i][j],
+                                                                   start + 1u,
+                                                                   NULL);
+                    }
+                    if (normal_ok) {
+                        normal_ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                                   &e->model,
+                                                                   &e->weights,
+                                                                   grand_ids[i][j][k],
+                                                                   start + 2u,
+                                                                   normal_logits);
+                    }
+                    normal_sec += now_sec() - t0;
+                }
+                if (!normal_ok) goto done;
+
+                if (!depth_batch_probe) {
+                    ds4_mtp_tree_state_unbind(s, &binding);
+                    branch_ok = ds4_mtp_tree_state_scratch_restore_comp_rows(&st, s, grand_slot) &&
+                                ds4_mtp_tree_state_bind_slot(s, &st, grand_slot, &binding);
+                    if (branch_ok) {
+                        const double t0 = now_sec();
+                        branch_ok = metal_graph_eval_token_raw_swa_with_raw_cache(&s->graph,
+                                                                                  &e->model,
+                                                                                  &e->weights,
+                                                                                  grand_ids[i][j][k],
+                                                                                  start + 2u,
+                                                                                  pair_raw_cache + (size_t)p * DS4_N_LAYER,
+                                                                                  pair_raw_cap[p],
+                                                                                  branch_logits);
+                        branch_sec += now_sec() - t0;
+                    }
+                    if (branch_ok) {
+                        branch_ok = ds4_mtp_tree_state_scratch_capture_slot(&st, s, grand_slot);
+                    }
+                    ds4_mtp_tree_state_unbind(s, &binding);
+                    if (!branch_ok) goto done;
+                }
+
+                const int normal_top = sample_argmax(normal_logits, DS4_N_VOCAB);
+                const float *branch_row = depth_batch_probe ?
+                    branch_logits + (size_t)branch_index * DS4_N_VOCAB :
+                    branch_logits;
+                const int branch_top = sample_argmax(branch_row, DS4_N_VOCAB);
+                const float delta = max_abs_diff(normal_logits, branch_row, DS4_N_VOCAB);
+                if (delta > max_delta) max_delta = delta;
+                if (normal_top != branch_top || delta > 1.0e-3f) {
+                    mismatches++;
+                    if (first_mismatch_root < 0) {
+                        first_mismatch_root = i;
+                        first_mismatch_child = j;
+                        first_mismatch_grand = k;
+                        first_normal_top = normal_top;
+                        first_branch_top = branch_top;
+                        first_delta = delta;
+                    }
+                }
+            }
+        }
+    }
+
+done:
+    ds4_mtp_tree_state_unbind(s, &binding);
+    fprintf(stderr,
+            "ds4: mtp tree-%s-probe shape=%s step=%llu/%llu start=%u "
+            "root_width=%d child_width=%d "
+            "grand_width=%d branches=%d mtp_ok=%d normal_ok=%d alloc_ok=%d "
+            "copy_ok=%d raw_ok=%d branch_ok=%d mismatches=%d max_delta=%.6g "
+            "first_mismatch=%d/%d/%d first_tops=%d/%d first_delta=%.6g "
+            "state_bytes=%.2f MiB raw_bytes=%.2f MiB raw_cap=%u "
+            "mtp=%.3fms normal=%.3fms alloc=%.3fms copy=%.3fms "
+            "raw_copy=%.3fms branch=%.3fms raw=%s\n",
+            depth_batch_probe ? "depth-batch" : "full",
+            shape_env,
+            (unsigned long long)probe_step,
+            (unsigned long long)probe_limit,
+            start,
+            root_width,
+            child_width,
+            grand_width,
+            branch_count,
+            mtp_ok ? 1 : 0,
+            normal_ok ? 1 : 0,
+            alloc_ok ? 1 : 0,
+            copy_ok ? 1 : 0,
+            raw_ok ? 1 : 0,
+            branch_ok ? 1 : 0,
+            mismatches,
+            max_delta,
+            first_mismatch_root,
+            first_mismatch_child,
+            first_mismatch_grand,
+            first_normal_top,
+            first_branch_top,
+            first_delta,
+            alloc_ok ? (double)st.bytes / (1024.0 * 1024.0) : 0.0,
+            (double)raw_bytes / (1024.0 * 1024.0),
+            branch_raw_cap,
+            mtp_sec * 1000.0,
+            normal_sec * 1000.0,
+            alloc_sec * 1000.0,
+            copy_sec * 1000.0,
+            raw_copy_sec * 1000.0,
+            branch_sec * 1000.0,
+            depth_batch_probe ? "branch-compact-depth-command-batch" :
+                "branch-compact-full");
+    if (depth_batch_probe) {
+        fprintf(stderr,
+                "ds4: mtp tree-depth-batch-profile shape=%s step=%llu/%llu "
+                "start=%u calls=%u rows=%u "
+                "view=%.3fms embed=%.3fms batch_embed_calls=%u "
+                "bind=%.3fms command_encode=%.3fms "
+                "execute=%.3fms head_encode=%.3fms head_execute=%.3fms read=%.3fms\n",
+                shape_env,
+                (unsigned long long)probe_step,
+                (unsigned long long)probe_limit,
+                start,
+                depth_profile.calls,
+                depth_profile.rows,
+                depth_profile.view_sec * 1000.0,
+                depth_profile.embed_sec * 1000.0,
+                depth_profile.batch_embed_calls,
+                depth_profile.bind_sec * 1000.0,
+                depth_profile.layer_encode_sec * 1000.0,
+                depth_profile.layer_execute_sec * 1000.0,
+                depth_profile.head_encode_sec * 1000.0,
+                depth_profile.head_execute_sec * 1000.0,
+                depth_profile.logits_read_sec * 1000.0);
+    }
+    if (!mtp_ok || !normal_ok || !branch_ok || mismatches != 0) {
+        s->mtp_oracle_reported = true;
+    }
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    (void)spec_frontier_restore(frontier, s);
+    g->mtp_n_raw = saved_mtp_n_raw;
+    if (root_raw_cache_batch) {
+        for (int i = 0; i < root_width; i++) {
+            ds4_mtp_tree_raw_cache_free(root_raw_cache_batch + (size_t)i * DS4_N_LAYER);
+        }
+    }
+    for (int p = 0; p < pair_count; p++) {
+        ds4_mtp_tree_raw_cache_free(pair_raw_cache + (size_t)p * DS4_N_LAYER);
+    }
+    ds4_mtp_tree_state_scratch_free(&st);
+    ds4_metal_tensor_free(grand_mtp_state);
+    ds4_metal_tensor_free(child_mtp_state);
+    free(root_raw_cache_batch);
+    free(pair_raw_cap);
+    free(pair_raw_cache);
+    free(branch_logits);
+    free(normal_logits);
+    free(mtp_logits);
+}
+
+static bool ds4_mtp_tree_target_replay_path(ds4_session *s,
+                                            ds4_spec_frontier *frontier,
+                                            const float *saved_logits,
+                                            int saved_len,
+                                            const int *tokens,
+                                            int token_n,
+                                            uint32_t start,
+                                            double *target_sec_out,
+                                            uint64_t *decode_count_out,
+                                            int *next_top_out) {
+    if (!s || !s->engine || !frontier || !saved_logits ||
+        !tokens || token_n <= 0 || !target_sec_out || !decode_count_out) {
+        return false;
+    }
+
+    ds4_engine *e = s->engine;
+    s->checkpoint.len = saved_len;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (!spec_frontier_restore(frontier, s)) return false;
+
+    for (int i = 0; i < token_n; i++) {
+        const double t0 = now_sec();
+        const bool ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                       &e->model,
+                                                       &e->weights,
+                                                       tokens[i],
+                                                       start + (uint32_t)i,
+                                                       s->logits);
+        *target_sec_out += now_sec() - t0;
+        if (!ok) return false;
+        (*decode_count_out)++;
+        token_vec_push(&s->checkpoint, tokens[i]);
+    }
+    if (next_top_out) *next_top_out = sample_argmax(s->logits, DS4_N_VOCAB);
+    return true;
+}
+
+static bool ds4_mtp_tree_target_verify_shape(ds4_session *s,
+                                             ds4_spec_frontier *frontier,
+                                             const float *saved_logits,
+                                             ds4_metal_tensor *root_mtp_state,
+                                             const float *root_mtp_logits,
+                                             uint32_t root_mtp_n_raw,
+                                             uint32_t start,
+                                             int actual_depth,
+                                             const int *target_path,
+                                             int shape_index,
+                                             uint64_t *nodes_out,
+                                             uint64_t *paths_out,
+                                             uint64_t *target_decodes_out,
+                                             int *accept_len_out,
+                                             double *target_sec_out,
+                                             double *mtp_sec_out) {
+    if (!s || !s->engine || !frontier || !saved_logits ||
+        !root_mtp_state || !root_mtp_logits || !target_path ||
+        shape_index < 0 || shape_index >= DS4_MTP_TREE_SHAPES ||
+        !nodes_out || !paths_out || !target_decodes_out ||
+        !accept_len_out || !target_sec_out || !mtp_sec_out ||
+        actual_depth <= 0) {
+        return false;
+    }
+
+    ds4_engine *e = s->engine;
+    ds4_metal_graph *g = &s->graph;
+    const int *fanout = ds4_mtp_tree_shape_fanout[shape_index];
+    const int root_k = fanout[0];
+    if (root_k <= 0 || root_k > 16) return false;
+
+    *nodes_out = 0;
+    *paths_out = 0;
+    *target_decodes_out = 0;
+    *accept_len_out = 0;
+    *target_sec_out = 0.0;
+    *mtp_sec_out = 0.0;
+
+    const int saved_len = s->checkpoint.len;
+    const bool saved_valid = s->checkpoint_valid;
+    const uint32_t saved_mtp_n_raw = g->mtp_n_raw;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    ds4_metal_tensor *child_mtp_state = ds4_metal_tensor_alloc(hc_bytes);
+    ds4_metal_tensor *scratch_mtp_state = ds4_metal_tensor_alloc(hc_bytes);
+    float *mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(mtp_logits[0]));
+    if (!child_mtp_state || !scratch_mtp_state || !mtp_logits) {
+        ds4_metal_tensor_free(scratch_mtp_state);
+        ds4_metal_tensor_free(child_mtp_state);
+        free(mtp_logits);
+        return false;
+    }
+
+    bool ok = true;
+    int root_ids[16];
+    int root_match = -1;
+    if (logits_top_k_ids(root_mtp_logits, DS4_N_VOCAB, root_ids, root_k) != root_k) {
+        ok = false;
+        goto done;
+    }
+    *nodes_out += (uint64_t)root_k;
+    for (int i = 0; i < root_k; i++) {
+        if (root_ids[i] == target_path[0]) {
+            root_match = i;
+            *accept_len_out = 1;
+            break;
+        }
+    }
+
+    uint32_t child_mtp_n_raw = root_mtp_n_raw + 1u;
+    if (child_mtp_n_raw > g->raw_window) child_mtp_n_raw = g->raw_window;
+    if (child_mtp_n_raw > g->raw_cap) child_mtp_n_raw = g->raw_cap;
+
+    for (int i = 0; ok && i < root_k; i++) {
+        int path[DS4_MTP_TREE_SHAPE_DEPTH] = { root_ids[i], -1, -1 };
+        int root_next_top = -1;
+        ok = ds4_mtp_tree_target_replay_path(s,
+                                             frontier,
+                                             saved_logits,
+                                             saved_len,
+                                             path,
+                                             1,
+                                             start,
+                                             target_sec_out,
+                                             target_decodes_out,
+                                             &root_next_top);
+        (*paths_out)++;
+        if (!ok) break;
+        if (i == root_match && actual_depth > 1 && root_next_top != target_path[1]) {
+            ok = false;
+            break;
+        }
+        if (actual_depth <= 1 || fanout[1] <= 0) continue;
+
+        int child_ids[16];
+        int ignored_top = -1;
+        g->mtp_n_raw = root_mtp_n_raw;
+        const double mtp0 = now_sec();
+        ok = metal_graph_eval_mtp_draft_from_hc(g,
+                                                &e->model,
+                                                &e->weights,
+                                                &e->mtp_model,
+                                                &e->mtp_weights,
+                                                root_mtp_state,
+                                                child_mtp_state,
+                                                root_ids[i],
+                                                start,
+                                                mtp_logits,
+                                                &ignored_top,
+                                                child_ids,
+                                                (uint32_t)fanout[1]);
+        *mtp_sec_out += now_sec() - mtp0;
+        if (!ok) break;
+        *nodes_out += (uint64_t)fanout[1];
+
+        int child_match = -1;
+        if (i == root_match) {
+            for (int j = 0; j < fanout[1]; j++) {
+                if (child_ids[j] == target_path[1]) {
+                    child_match = j;
+                    if (*accept_len_out < 2) *accept_len_out = 2;
+                    break;
+                }
+            }
+        }
+
+        for (int j = 0; ok && j < fanout[1]; j++) {
+            path[1] = child_ids[j];
+            int child_next_top = -1;
+            ok = ds4_mtp_tree_target_replay_path(s,
+                                                 frontier,
+                                                 saved_logits,
+                                                 saved_len,
+                                                 path,
+                                                 2,
+                                                 start,
+                                                 target_sec_out,
+                                                 target_decodes_out,
+                                                 &child_next_top);
+            (*paths_out)++;
+            if (!ok) break;
+            if (i == root_match && j == child_match &&
+                actual_depth > 2 && child_next_top != target_path[2]) {
+                ok = false;
+                break;
+            }
+            if (actual_depth <= 2 || fanout[2] <= 0) continue;
+
+            int grand_ids[16];
+            g->mtp_n_raw = child_mtp_n_raw;
+            const double mtp1 = now_sec();
+            ok = metal_graph_eval_mtp_draft_from_hc(g,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    &e->mtp_model,
+                                                    &e->mtp_weights,
+                                                    child_mtp_state,
+                                                    scratch_mtp_state,
+                                                    child_ids[j],
+                                                    start + 1u,
+                                                    mtp_logits,
+                                                    &ignored_top,
+                                                    grand_ids,
+                                                    (uint32_t)fanout[2]);
+            *mtp_sec_out += now_sec() - mtp1;
+            if (!ok) break;
+            *nodes_out += (uint64_t)fanout[2];
+
+            for (int k = 0; ok && k < fanout[2]; k++) {
+                path[2] = grand_ids[k];
+                int ignored_next_top = -1;
+                ok = ds4_mtp_tree_target_replay_path(s,
+                                                     frontier,
+                                                     saved_logits,
+                                                     saved_len,
+                                                     path,
+                                                     3,
+                                                     start,
+                                                     target_sec_out,
+                                                     target_decodes_out,
+                                                     &ignored_next_top);
+                (*paths_out)++;
+                if (!ok) break;
+                if (i == root_match && j == child_match &&
+                    grand_ids[k] == target_path[2] &&
+                    *accept_len_out < 3) {
+                    *accept_len_out = 3;
+                }
+            }
+        }
+    }
+
+done:
+    s->checkpoint.len = saved_len;
+    s->checkpoint_valid = saved_valid;
+    memcpy(s->logits, saved_logits, (size_t)DS4_N_VOCAB * sizeof(saved_logits[0]));
+    if (!spec_frontier_restore(frontier, s)) ok = false;
+    g->mtp_n_raw = saved_mtp_n_raw;
+    ds4_metal_tensor_free(scratch_mtp_state);
+    ds4_metal_tensor_free(child_mtp_state);
+    free(mtp_logits);
+    return ok;
+}
+
 /* Commit the prefix-1 state captured by the N=2 speculative verifier.
  *
  * The verifier has already advanced every layer through both draft tokens.  On
@@ -16342,6 +20951,33 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
                                        g->spec_prefix1_index_state_kv[il], 0, ib) != 0 &&
                  ds4_metal_tensor_copy(g->layer_index_state_score[il], 0,
                                        g->spec_prefix1_index_state_score[il], 0, ib) != 0;
+        }
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    else (void)ds4_metal_synchronize();
+    return ok;
+}
+
+static bool spec_frontier_commit_prefix2(ds4_session *s) {
+    ds4_metal_graph *g = &s->graph;
+    bool ok = ds4_metal_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+
+        g->layer_n_comp[il] = g->spec_prefix2_n_comp[il];
+        const uint64_t ab = ds4_metal_tensor_bytes(g->layer_attn_state_kv[il]);
+        ok = ds4_metal_tensor_copy(g->layer_attn_state_kv[il], 0,
+                                   g->spec_prefix2_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_metal_tensor_copy(g->layer_attn_state_score[il], 0,
+                                   g->spec_prefix2_attn_state_score[il], 0, ab) != 0;
+        if (ok && ratio == 4) {
+            g->layer_n_index_comp[il] = g->spec_prefix2_n_index_comp[il];
+            const uint64_t ib = ds4_metal_tensor_bytes(g->layer_index_state_kv[il]);
+            ok = ds4_metal_tensor_copy(g->layer_index_state_kv[il], 0,
+                                       g->spec_prefix2_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_metal_tensor_copy(g->layer_index_state_score[il], 0,
+                                       g->spec_prefix2_index_state_score[il], 0, ib) != 0;
         }
     }
     if (ok) ok = ds4_metal_end_commands() != 0;
@@ -16450,12 +21086,20 @@ static void ds4_mtp_speed_audit_check(ds4_session *s,
     free(saved_logits);
 }
 
+static bool ds4_token_in_top_ids(int token, const int *top_ids, int top_k) {
+    if (!top_ids || top_k <= 0) return false;
+    for (int i = 0; i < top_k; i++) {
+        if (top_ids[i] == token) return true;
+    }
+    return false;
+}
+
 static void ds4_mtp_tree_oracle_check(ds4_session *s, uint32_t start) {
     if (!s || !s->engine || !s->mtp_tree_oracle_enabled || !s->mtp_logits) return;
     ds4_engine *e = s->engine;
     if (!e->mtp_ready) return;
 
-    int depth = DS4_MTP_TREE_MAX_DEPTH;
+    int depth = 3;
     const char *depth_env = getenv("DS4_MTP_TREE_ORACLE_DEPTH");
     if (depth_env && depth_env[0]) {
         char *end = NULL;
@@ -16480,9 +21124,11 @@ static void ds4_mtp_tree_oracle_check(ds4_session *s, uint32_t start) {
     float *saved_mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(saved_mtp_logits[0]));
     int target_path[DS4_MTP_TREE_MAX_DEPTH];
     int ranks[DS4_MTP_TREE_MAX_DEPTH];
+    float mtp_margins[DS4_MTP_TREE_MAX_DEPTH];
     for (int i = 0; i < DS4_MTP_TREE_MAX_DEPTH; i++) {
         target_path[i] = -1;
         ranks[i] = DS4_MTP_TREE_K_BUCKETS ? ds4_mtp_tree_k_values[DS4_MTP_TREE_K_BUCKETS - 1] + 1 : 1;
+        mtp_margins[i] = DS4_NEG_INF;
     }
 
     const int saved_len = s->checkpoint.len;
@@ -16530,9 +21176,53 @@ static void ds4_mtp_tree_oracle_check(ds4_session *s, uint32_t start) {
         s->checkpoint_valid = false;
         goto restore;
     }
+    ds4_mtp_tree_root_batch_reuse_probe(s,
+                                        &frontier,
+                                        saved_logits,
+                                        saved_mtp_logits,
+                                        saved_len,
+                                        start);
+    ds4_mtp_tree_row_kernel_probe(s,
+                                  &frontier,
+                                  saved_logits,
+                                  saved_mtp_logits,
+                                  saved_len,
+                                  start);
+    ds4_mtp_tree_branch_swap_probe(s,
+                                   &frontier,
+                                   saved_logits,
+                                   saved_len,
+                                   start,
+                                   target_path[0]);
+    ds4_mtp_tree_sibling_probe(s,
+                               &frontier,
+                               saved_logits,
+                               saved_mtp_logits,
+                               saved_len,
+                               start);
+    ds4_mtp_tree_grandchild_probe(s,
+                                  &frontier,
+                                  saved_logits,
+                                  saved_mtp_state,
+                                  saved_mtp_logits,
+                                  frontier.mtp_n_raw,
+                                  saved_len,
+                                  start);
+    ds4_mtp_tree_full_probe(s,
+                            &frontier,
+                            saved_logits,
+                            saved_mtp_state,
+                            saved_mtp_logits,
+                            frontier.mtp_n_raw,
+                            saved_len,
+                            start);
 
     int max_k = ds4_mtp_tree_k_values[DS4_MTP_TREE_K_BUCKETS - 1];
     ranks[0] = logits_rank_for_token(saved_mtp_logits, DS4_N_VOCAB, target_path[0], max_k);
+    float mtp_v0 = DS4_NEG_INF;
+    float mtp_v1 = DS4_NEG_INF;
+    logits_top2(saved_mtp_logits, DS4_N_VOCAB, NULL, &mtp_v0, NULL, &mtp_v1);
+    mtp_margins[0] = mtp_v0 - mtp_v1;
     double mtp_eval_sec = 0.0;
     ds4_metal_tensor *prev_hc = g->mtp_state_hc;
     ds4_metal_tensor *out_hc = g->mtp_next_hc;
@@ -16555,6 +21245,8 @@ static void ds4_mtp_tree_oracle_check(ds4_session *s, uint32_t start) {
         mtp_eval_sec += now_sec() - mtp0;
         if (!ok) goto fail;
         ranks[i] = logits_rank_for_token(s->mtp_logits, DS4_N_VOCAB, target_path[i], max_k);
+        logits_top2(s->mtp_logits, DS4_N_VOCAB, NULL, &mtp_v0, NULL, &mtp_v1);
+        mtp_margins[i] = mtp_v0 - mtp_v1;
         ds4_metal_tensor *tmp = prev_hc;
         prev_hc = out_hc;
         out_hc = tmp;
@@ -16562,6 +21254,9 @@ static void ds4_mtp_tree_oracle_check(ds4_session *s, uint32_t start) {
 
     s->mtp_tree_oracle.steps++;
     s->mtp_tree_oracle.mtp_eval_sec += mtp_eval_sec;
+    s->mtp_tree_oracle.actual_depth_sum += (uint64_t)actual_depth;
+    const int root_margin_bucket = ds4_mtp_audit_margin_bucket(mtp_margins[0]);
+    s->mtp_tree_oracle.root_margin_steps[root_margin_bucket]++;
     bool path_ok[DS4_MTP_TREE_K_BUCKETS];
     int path_len[DS4_MTP_TREE_K_BUCKETS];
     for (int b = 0; b < DS4_MTP_TREE_K_BUCKETS; b++) {
@@ -16583,6 +21278,151 @@ static void ds4_mtp_tree_oracle_check(ds4_session *s, uint32_t start) {
     }
     for (int b = 0; b < DS4_MTP_TREE_K_BUCKETS; b++) {
         s->mtp_tree_oracle.path_len_sum[b] += (uint64_t)path_len[b];
+        const int k = ds4_mtp_tree_k_values[b];
+        uint64_t level_nodes = 1;
+        uint64_t total_nodes = 0;
+        for (int d = 0; d < actual_depth; d++) {
+            level_nodes *= (uint64_t)k;
+            total_nodes += level_nodes;
+        }
+        s->mtp_tree_oracle.full_tree_nodes_sum[b] += total_nodes;
+    }
+    for (int i = 0; i < DS4_MTP_TREE_SHAPES; i++) {
+        bool shape_ok = true;
+        int shape_len = 0;
+        uint64_t level_nodes = 1;
+        uint64_t total_nodes = 0;
+        for (int d = 0; d < actual_depth; d++) {
+            const int fanout =
+                d < DS4_MTP_TREE_SHAPE_DEPTH ?
+                ds4_mtp_tree_shape_fanout[i][d] : 0;
+            if (d < DS4_MTP_TREE_SHAPE_DEPTH) {
+                level_nodes *= (uint64_t)fanout;
+                total_nodes += level_nodes;
+            }
+            if (shape_ok && fanout > 0 && ranks[d] <= fanout) {
+                s->mtp_tree_oracle.shape_contains[i][d]++;
+                shape_len = d + 1;
+            } else {
+                shape_ok = false;
+            }
+        }
+        if (shape_len == actual_depth) s->mtp_tree_oracle.shape_full_depth[i]++;
+        s->mtp_tree_oracle.shape_len_sum[i] += (uint64_t)shape_len;
+        s->mtp_tree_oracle.shape_nodes_sum[i] += total_nodes;
+        s->mtp_tree_oracle.shape_root_len_sum[i][root_margin_bucket] += (uint64_t)shape_len;
+        if (shape_len == actual_depth) {
+            s->mtp_tree_oracle.shape_root_full_depth[i][root_margin_bucket]++;
+        }
+    }
+    for (int i = 0; i < DS4_MTP_TREE_DYNAMIC_POLICIES; i++) {
+        int fanout[DS4_MTP_TREE_SHAPE_DEPTH];
+        bool dynamic_ok = true;
+        int dynamic_len = 0;
+        uint64_t level_nodes = 1;
+        uint64_t total_nodes = 0;
+        ds4_mtp_tree_dynamic_policy_fanout(i, mtp_margins, actual_depth, fanout);
+        for (int d = 0; d < actual_depth; d++) {
+            const int k = d < DS4_MTP_TREE_SHAPE_DEPTH ? fanout[d] : 0;
+            if (d < DS4_MTP_TREE_SHAPE_DEPTH && k > 0) {
+                level_nodes *= (uint64_t)k;
+                total_nodes += level_nodes;
+            }
+            if (dynamic_ok && k > 0 && ranks[d] <= k) {
+                s->mtp_tree_oracle.dynamic_contains[i][d]++;
+                dynamic_len = d + 1;
+            } else {
+                dynamic_ok = false;
+            }
+        }
+        if (dynamic_len == actual_depth) s->mtp_tree_oracle.dynamic_full_depth[i]++;
+        s->mtp_tree_oracle.dynamic_len_sum[i] += (uint64_t)dynamic_len;
+        s->mtp_tree_oracle.dynamic_nodes_sum[i] += total_nodes;
+    }
+    if (getenv("DS4_MTP_TREE_BRANCH_ORACLE") != NULL) {
+        const int branch_policy = 4;
+        uint64_t branch_nodes = 0;
+        double branch_mtp_eval_sec = 0.0;
+        ok = ds4_mtp_tree_branch_dynamic_nodes(s,
+                                               saved_mtp_state,
+                                               saved_mtp_logits,
+                                               frontier.mtp_n_raw,
+                                               start,
+                                               actual_depth,
+                                               &branch_nodes,
+                                               &branch_mtp_eval_sec);
+        if (!ok) goto fail;
+
+        int fanout[DS4_MTP_TREE_SHAPE_DEPTH];
+        bool branch_ok = true;
+        int branch_len = 0;
+        ds4_mtp_tree_dynamic_policy_fanout(branch_policy, mtp_margins, actual_depth, fanout);
+        for (int d = 0; d < actual_depth; d++) {
+            const int k = d < DS4_MTP_TREE_SHAPE_DEPTH ? fanout[d] : 0;
+            if (branch_ok && k > 0 && ranks[d] <= k) {
+                branch_len = d + 1;
+            } else {
+                branch_ok = false;
+            }
+        }
+        s->mtp_tree_oracle.branch_dynamic_steps[branch_policy]++;
+        s->mtp_tree_oracle.branch_dynamic_len_sum[branch_policy] += (uint64_t)branch_len;
+        if (branch_len == actual_depth) s->mtp_tree_oracle.branch_dynamic_full_depth[branch_policy]++;
+        s->mtp_tree_oracle.branch_dynamic_nodes_sum[branch_policy] += branch_nodes;
+        s->mtp_tree_oracle.branch_dynamic_mtp_eval_sec += branch_mtp_eval_sec;
+    }
+    const char *target_verify_env = getenv("DS4_MTP_EXACT_TREE_VERIFY");
+    if (target_verify_env && target_verify_env[0]) {
+        const int shape_index = ds4_mtp_tree_shape_index_by_name(target_verify_env);
+        uint64_t verify_limit = 1;
+        const char *limit_env = getenv("DS4_MTP_EXACT_TREE_VERIFY_STEPS");
+        if (limit_env && limit_env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(limit_env, &end, 10);
+            if (end != limit_env && v > 0 && v < 1000000ull) {
+                verify_limit = (uint64_t)v;
+            }
+        }
+        if (shape_index >= 0 &&
+            s->mtp_tree_oracle.target_verify_steps[shape_index] < verify_limit)
+        {
+            uint64_t target_nodes = 0;
+            uint64_t target_paths = 0;
+            uint64_t target_decodes = 0;
+            int target_accept_len = 0;
+            double target_verify_sec = 0.0;
+            double target_verify_mtp_sec = 0.0;
+            const bool target_ok = ds4_mtp_tree_target_verify_shape(s,
+                                                                    &frontier,
+                                                                    saved_logits,
+                                                                    saved_mtp_state,
+                                                                    saved_mtp_logits,
+                                                                    frontier.mtp_n_raw,
+                                                                    start,
+                                                                    actual_depth,
+                                                                    target_path,
+                                                                    shape_index,
+                                                                    &target_nodes,
+                                                                    &target_paths,
+                                                                    &target_decodes,
+                                                                    &target_accept_len,
+                                                                    &target_verify_sec,
+                                                                    &target_verify_mtp_sec);
+            s->mtp_tree_oracle.target_verify_steps[shape_index]++;
+            if (!target_ok) s->mtp_tree_oracle.target_verify_failures[shape_index]++;
+            s->mtp_tree_oracle.target_verify_len_sum[shape_index] +=
+                (uint64_t)target_accept_len;
+            s->mtp_tree_oracle.target_verify_nodes_sum[shape_index] += target_nodes;
+            s->mtp_tree_oracle.target_verify_paths_sum[shape_index] += target_paths;
+            s->mtp_tree_oracle.target_verify_decode_sum[shape_index] += target_decodes;
+            s->mtp_tree_oracle.target_verify_target_sec[shape_index] += target_verify_sec;
+            s->mtp_tree_oracle.target_verify_mtp_sec[shape_index] += target_verify_mtp_sec;
+            if (!target_ok && !spec_frontier_restore(&frontier, s)) {
+                fprintf(stderr, "ds4: mtp tree-oracle exact-tree verify failed to restore state\n");
+                s->checkpoint_valid = false;
+                goto restore;
+            }
+        }
     }
     s->mtp_tree_oracle.oracle_sec += now_sec() - t0;
 
@@ -17677,6 +22517,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     s->mtp_draft_margin_valid = false;
+    s->mtp_draft_target_margin_valid = false;
     g->mtp_n_raw = 0;
     return 0;
 #endif
@@ -17927,13 +22768,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
-    if (opt->mtp_path && opt->mtp_path[0]) {
+    const bool mtp_spec_disabled = getenv("DS4_MTP_SPEC_DISABLE") != NULL;
+    if (opt->mtp_path && opt->mtp_path[0] && !mtp_spec_disabled) {
         model_open(&e->mtp_model, opt->mtp_path, opt->backend == DS4_BACKEND_METAL);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
                 opt->mtp_path,
                 e->mtp_draft_tokens);
+    } else if (opt->mtp_path && opt->mtp_path[0] && mtp_spec_disabled &&
+               getenv("DS4_MTP_SPEC_LOG"))
+    {
+        fprintf(stderr, "ds4: MTP support model open skipped because DS4_MTP_SPEC_DISABLE=1\n");
     }
 
 #ifndef DS4_NO_METAL
@@ -17958,7 +22804,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (e->mtp_ready &&
+        if (e->mtp_ready && !mtp_spec_disabled &&
             !ds4_metal_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
                                            e->mtp_model.tensor_data_pos,
@@ -17970,6 +22816,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+        if (e->mtp_ready && mtp_spec_disabled && getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr, "ds4: MTP Metal mapping skipped because DS4_MTP_SPEC_DISABLE=1\n");
         }
         fprintf(stderr, "ds4: Metal backend initialized for graph diagnostics\n");
     }
@@ -18004,6 +22853,45 @@ void ds4_engine_close(ds4_engine *e) {
     free(e);
 }
 
+#ifndef DS4_NO_METAL
+static uint32_t ds4_mtp_spec_logits_rows_for_engine(const ds4_engine *e) {
+    if (!e || !e->mtp_ready) return 0;
+
+    uint32_t rows = 2;
+    if (e->mtp_speed) {
+        rows = 16;
+    } else if (getenv("DS4_MTP_TREE_ORACLE") != NULL ||
+               getenv("DS4_MTP_TREE_STATE_PLAN") != NULL ||
+               getenv("DS4_MTP_TREE_BRANCH_ORACLE") != NULL ||
+               getenv("DS4_MTP_EXACT_TREE_VERIFY") != NULL ||
+               getenv("DS4_MTP_TREE_BATCH_PLAN") != NULL ||
+               getenv("DS4_MTP_TREE_STATE_ALLOC") != NULL ||
+               getenv("DS4_MTP_TREE_BRANCH_SWAP_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_RAW_SWAP_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_RAW_COMPACT_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_SLOT_PATH_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_SIBLING_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_GRANDCHILD_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_ROOT_BATCH_REUSE_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_ROW_KERNEL_PLAN") != NULL ||
+               getenv("DS4_MTP_TREE_ROW_KERNEL_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_FULL_PROBE") != NULL ||
+               getenv("DS4_MTP_TREE_DEPTH_BATCH_PROBE") != NULL) {
+        rows = 16;
+    } else if (getenv("DS4_MTP_EXACT_DEEP") != NULL) {
+        rows = 4;
+    }
+
+    const char *env = getenv("DS4_MTP_SPEC_LOGITS_ROWS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && v > 0 && v <= 16ul) rows = (uint32_t)v;
+    }
+    return rows;
+}
+#endif
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #ifdef DS4_NO_METAL
     (void)out;
@@ -18018,24 +22906,48 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     s->mtp_stats_print = getenv("DS4_MTP_STATS") != NULL;
-    s->mtp_adaptive_enabled = getenv("DS4_MTP_ADAPTIVE") != NULL;
+    const bool mtp_spec_disabled = getenv("DS4_MTP_SPEC_DISABLE") != NULL;
+    const bool enable_mtp_graph = e->mtp_ready && !mtp_spec_disabled;
+    s->mtp_adaptive_enabled =
+        getenv("DS4_MTP_ADAPTIVE") != NULL ||
+        (enable_mtp_graph && !e->mtp_speed && getenv("DS4_MTP_NO_ADAPTIVE") == NULL);
+    s->mtp_adaptive_cheap =
+        s->mtp_adaptive_enabled && getenv("DS4_MTP_ADAPTIVE_CHEAP") != NULL;
+    s->mtp_adaptive_cheap_full_skip =
+        s->mtp_adaptive_cheap && getenv("DS4_MTP_ADAPTIVE_CHEAP_FULL_SKIP") != NULL;
     s->mtp_speed_audit_enabled = getenv("DS4_MTP_SPEED_AUDIT") != NULL;
-    s->mtp_tree_oracle_enabled = getenv("DS4_MTP_TREE_ORACLE") != NULL;
+    s->mtp_tree_oracle_enabled =
+        getenv("DS4_MTP_TREE_ORACLE") != NULL ||
+        getenv("DS4_MTP_EXACT_TREE_VERIFY") != NULL ||
+        getenv("DS4_MTP_TREE_BATCH_PLAN") != NULL ||
+        getenv("DS4_MTP_TREE_STATE_ALLOC") != NULL ||
+        getenv("DS4_MTP_TREE_BRANCH_SWAP_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_RAW_SWAP_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_RAW_COMPACT_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_SLOT_PATH_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_SIBLING_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_GRANDCHILD_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_ROOT_BATCH_REUSE_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_ROW_KERNEL_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_FULL_PROBE") != NULL ||
+        getenv("DS4_MTP_TREE_DEPTH_BATCH_PROBE") != NULL;
     s->mtp_stats_enabled =
         s->mtp_stats_print ||
-        s->mtp_adaptive_enabled ||
         s->mtp_speed_audit_enabled ||
         s->mtp_tree_oracle_enabled;
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
+    const uint32_t spec_logits_rows = enable_mtp_graph ? ds4_mtp_spec_logits_rows_for_engine(e) : 0;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, enable_mtp_graph,
+                                   spec_logits_rows))
     {
         free(s);
         return 1;
     }
+    ds4_mtp_tree_row_kernel_plan_print(s);
     s->graph.quality = e->quality;
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-    if (e->mtp_ready) {
+    if (enable_mtp_graph) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
@@ -18080,6 +22992,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
         p->session->checkpoint_valid = true;
         p->session->mtp_draft_valid = false;
         p->session->mtp_draft_margin_valid = false;
+        p->session->mtp_draft_target_margin_valid = false;
     }
     if (p->user) p->user(p->user_ud, event, current, total);
 }
@@ -18111,6 +23024,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
     }
+    s->mtp_stop_generation = false;
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -18118,6 +23032,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     {
         s->mtp_draft_valid = false;
         s->mtp_draft_margin_valid = false;
+        s->mtp_draft_target_margin_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
         if (suffix > 0 && (uint32_t)suffix >= resume_min) {
@@ -18190,6 +23105,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     s->mtp_draft_margin_valid = false;
+    s->mtp_draft_target_margin_valid = false;
     s->graph.mtp_n_raw = 0;
     return 0;
 #endif
@@ -18260,19 +23176,29 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     bool mtp_skip_probe = false;
+    s->mtp_prefetched_second_valid = false;
+    s->mtp_prefetched_second_margin_valid = false;
     if (probe_mtp && s->mtp_adaptive_enabled && s->mtp_probe_skip > 0) {
         mtp_skip_probe = true;
         s->mtp_probe_skip--;
         if (s->mtp_stats_enabled) s->mtp_stats.mtp_adaptive_skip++;
     }
-    const bool mtp_should_draft =
+    const bool mtp_should_draft_base =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
         !mtp_skip_probe &&
         (e->mtp_draft_tokens > 1 || mtp_probe_log);
     if (probe_mtp && s->mtp_draft_valid) {
+        const bool mtp_probe_hit = s->mtp_draft_token == token;
+        if (s->mtp_stats_enabled && s->mtp_draft_target_margin_valid) {
+            int bucket = s->mtp_draft_target_margin_bucket;
+            if (bucket < 0) bucket = 0;
+            if (bucket >= DS4_MTP_AUDIT_MARGIN_BUCKETS) bucket = DS4_MTP_AUDIT_MARGIN_BUCKETS - 1;
+            s->mtp_stats.mtp_probe_target_margin_total[bucket]++;
+            if (mtp_probe_hit) s->mtp_stats.mtp_probe_target_margin_hit[bucket]++;
+        }
         if (mtp_probe_log) {
             s->mtp_probe_total++;
-            if (s->mtp_draft_token == token) s->mtp_probe_hit++;
+            if (mtp_probe_hit) s->mtp_probe_hit++;
             fprintf(stderr,
                     "ds4: mtp probe token=%d draft=%d hit=%llu/%llu\n",
                     token,
@@ -18282,42 +23208,220 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         s->mtp_draft_valid = false;
         s->mtp_draft_margin_valid = false;
+        s->mtp_draft_target_margin_valid = false;
+        s->mtp_draft_top_k = 0;
     }
-    const bool mtp_collect_stats = s->mtp_stats_enabled || s->mtp_adaptive_enabled;
+    const bool mtp_collect_stats =
+        s->mtp_stats_enabled ||
+        (s->mtp_adaptive_enabled && !s->mtp_adaptive_cheap && probe_mtp);
+    bool mtp_should_draft = mtp_should_draft_base;
+    if (!mtp_should_draft) {
+        const double target_t0 = mtp_collect_stats ? now_sec() : 0.0;
+        if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                            (uint32_t)token,
+                                            (uint32_t)s->checkpoint.len,
+                                            s->logits))
+        {
+            snprintf(err, errlen, "Metal decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        if (mtp_collect_stats) {
+            s->mtp_stats.target_eval_count++;
+            s->mtp_stats.target_eval_sec += now_sec() - target_t0;
+        }
+        token_vec_push(&s->checkpoint, token);
+        return 0;
+    }
+    const bool exact_target_first_forced =
+        getenv("DS4_MTP_EXACT_TARGET_FIRST") != NULL;
+    const bool exact_target_first_disabled =
+        getenv("DS4_MTP_NO_EXACT_TARGET_FIRST") != NULL;
+    const bool exact_target_first_default =
+        !exact_target_first_disabled &&
+        getenv("DS4_MTP_EXACT_DEEP") == NULL &&
+        getenv("DS4_MTP_EXACT_TREE_REPLAY") == NULL &&
+        getenv("DS4_MTP_EXACT_TREE_SHAPE") == NULL &&
+        getenv("DS4_MTP_EXACT_FIRST_TOPK") == NULL &&
+        getenv("DS4_MTP_FULL_LOGITS") == NULL &&
+        getenv("DS4_MTP_FIRST_MARGIN_SKIP") == NULL &&
+        !s->mtp_speed_audit_enabled &&
+        !s->mtp_tree_oracle_enabled;
+    const bool exact_target_first_probe =
+        !e->mtp_speed &&
+        !e->quality &&
+        !exact_target_first_disabled &&
+        (exact_target_first_forced || exact_target_first_default);
+    bool target_margin_valid = false;
+    int target_margin_bucket = 0;
+    const char *target_margin_skip_env = getenv("DS4_MTP_TARGET_MARGIN_SKIP");
+    const bool target_margin_skip_allowed =
+        !e->mtp_speed || e->quality || getenv("DS4_MTP_STRICT") != NULL;
+    double target_margin_skip_threshold = exact_target_first_probe ? 5.0 : 2.0;
+    bool target_margin_skip_active =
+        target_margin_skip_allowed &&
+        !e->mtp_speed &&
+        !e->quality &&
+        getenv("DS4_MTP_NO_TARGET_MARGIN_SKIP") == NULL;
+    if (target_margin_skip_allowed && target_margin_skip_env && target_margin_skip_env[0]) {
+        char *end = NULL;
+        const double threshold = strtod(target_margin_skip_env, &end);
+        if (end != target_margin_skip_env) {
+            target_margin_skip_threshold = threshold;
+            target_margin_skip_active = true;
+        }
+    }
+    const bool target_margin_audit =
+        getenv("DS4_MTP_TARGET_MARGIN_AUDIT") != NULL ||
+        target_margin_skip_active;
+    int mtp_top = -1;
+    int mtp_top_ids[16];
+    for (int i = 0; i < 16; i++) mtp_top_ids[i] = -1;
+    int target_top_for_mtp = -1;
+    uint32_t mtp_probe_top_k = 1;
+    if (mtp_should_draft && !e->mtp_speed && !e->quality && !exact_target_first_probe) {
+        const char *topk_env = getenv("DS4_MTP_EXACT_FIRST_TOPK");
+        const char *tree_shape_env = getenv("DS4_MTP_EXACT_TREE_SHAPE");
+        if ((!topk_env || !topk_env[0]) && tree_shape_env && tree_shape_env[0]) {
+            int shape_fanout[DS4_MTP_TREE_SHAPE_DEPTH];
+            if (ds4_mtp_tree_shape_by_name(tree_shape_env, shape_fanout)) {
+                mtp_probe_top_k = (uint32_t)shape_fanout[0];
+            }
+        }
+        if ((!topk_env || !topk_env[0]) &&
+            mtp_probe_top_k == 1 &&
+            getenv("DS4_MTP_EXACT_TREE_REPLAY") != NULL)
+        {
+            topk_env = getenv("DS4_MTP_EXACT_TREE_TOPK");
+            if (!topk_env || !topk_env[0]) topk_env = "2";
+        }
+        if (topk_env && topk_env[0]) {
+            char *end = NULL;
+            long v = strtol(topk_env, &end, 10);
+            if (end != topk_env && v > 1) {
+                if (v > 16) v = 16;
+                mtp_probe_top_k = (uint32_t)v;
+            }
+        }
+    }
+    const bool mtp_probe_need_logits =
+        mtp_should_draft &&
+        (getenv("DS4_MTP_FULL_LOGITS") != NULL ||
+         getenv("DS4_MTP_MIN_MARGIN") != NULL ||
+         getenv("DS4_MTP_FIRST_MARGIN_SKIP") != NULL ||
+         s->mtp_speed_audit_enabled ||
+         s->mtp_tree_oracle_enabled ||
+         (e->mtp_speed && e->mtp_margin > 0.0f));
+    const bool fused_probe =
+        mtp_should_draft &&
+        !exact_target_first_probe &&
+        getenv("DS4_MTP_FUSED_PROBE") != NULL &&
+        getenv("DS4_MTP_NO_FUSED_PROBE") == NULL &&
+        !target_margin_audit &&
+        !s->mtp_adaptive_enabled;
+    const bool target_first_fused_probe =
+        mtp_should_draft &&
+        exact_target_first_probe &&
+        getenv("DS4_MTP_EXACT_TARGET_FIRST_FUSED") != NULL;
+    const uint32_t target_first_fused_mtp_n_raw = s->graph.mtp_n_raw;
     const double target_t0 = mtp_collect_stats ? now_sec() : 0.0;
-    if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                        (uint32_t)token,
-                                        (uint32_t)s->checkpoint.len,
-                                        s->logits))
-    {
-        snprintf(err, errlen, "Metal decode failed");
-        s->checkpoint_valid = false;
-        return 1;
+    if (fused_probe || target_first_fused_probe) {
+        if (!metal_graph_eval_token_raw_swa_fused_mtp(&s->graph,
+                                                      &e->model,
+                                                      &e->weights,
+                                                      &e->mtp_model,
+                                                      &e->mtp_weights,
+                                                      token,
+                                                      (uint32_t)s->checkpoint.len,
+                                                      s->logits,
+                                                      mtp_probe_need_logits ? s->mtp_logits : NULL,
+                                                      target_first_fused_probe ? NULL : &mtp_top,
+                                                      (!target_first_fused_probe && mtp_probe_top_k > 1) ? mtp_top_ids : NULL,
+                                                      target_first_fused_probe ? 1u : mtp_probe_top_k))
+        {
+            snprintf(err, errlen, "Metal fused decode/MTP probe failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+    } else {
+        if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                            (uint32_t)token,
+                                            (uint32_t)s->checkpoint.len,
+                                            s->logits))
+        {
+            snprintf(err, errlen, "Metal decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
     }
     if (mtp_collect_stats) {
         s->mtp_stats.target_eval_count++;
         s->mtp_stats.target_eval_sec += now_sec() - target_t0;
+        if (fused_probe || target_first_fused_probe) s->mtp_stats.mtp_probe_count++;
     }
     token_vec_push(&s->checkpoint, token);
+    if (mtp_should_draft && (target_margin_audit || exact_target_first_probe)) {
+        int target_top = -1;
+        int target_second = -1;
+        float target_v0 = 0.0f;
+        float target_v1 = 0.0f;
+        logits_top2(s->logits, DS4_N_VOCAB, &target_top, &target_v0, &target_second, &target_v1);
+        target_top_for_mtp = target_top;
+        const float target_margin = target_v0 - target_v1;
+        target_margin_bucket = ds4_mtp_audit_margin_bucket(target_margin);
+        target_margin_valid = target_margin_audit;
+        if (target_margin_skip_active && target_margin < (float)target_margin_skip_threshold) {
+            mtp_should_draft = false;
+            if (target_first_fused_probe) s->graph.mtp_n_raw = target_first_fused_mtp_n_raw;
+            if (s->mtp_stats_enabled) s->mtp_stats.mtp_target_margin_skip++;
+        }
+    }
     if (mtp_should_draft) {
-        int mtp_top = -1;
-        const bool mtp_probe_need_logits =
-            getenv("DS4_MTP_FULL_LOGITS") != NULL ||
-            getenv("DS4_MTP_MIN_MARGIN") != NULL ||
-            s->mtp_speed_audit_enabled ||
-            s->mtp_tree_oracle_enabled ||
-            (e->mtp_speed && e->mtp_margin > 0.0f);
         const double probe_t0 = mtp_collect_stats ? now_sec() : 0.0;
-        bool probe_ok = metal_graph_eval_mtp_draft(&s->graph,
-                                                   &e->model,
-                                                   &e->weights,
-                                                   &e->mtp_model,
-                                                   &e->mtp_weights,
-                                                   token,
-                                                   (uint32_t)(s->checkpoint.len - 1),
-                                                   mtp_probe_need_logits ? s->mtp_logits : NULL,
-                                                   &mtp_top);
-        if (mtp_collect_stats) {
+        const bool target_first_pair_probe =
+            exact_target_first_probe &&
+            getenv("DS4_MTP_EXACT_TARGET_FIRST_PAIR") != NULL &&
+            getenv("DS4_MTP_EXACT_SECOND_TOPK") == NULL &&
+            getenv("DS4_MTP_EXACT_SECOND_TOPK_REPLAY") == NULL &&
+            getenv("DS4_MTP_EXACT_SECOND_TOPK_BRANCH") == NULL &&
+            e->mtp_draft_tokens == 2;
+        int prefetched_second_top = -1;
+        bool probe_ok = fused_probe || target_first_fused_probe;
+        if (target_first_pair_probe) {
+            if (target_top_for_mtp < 0) {
+                target_top_for_mtp = sample_argmax(s->logits, DS4_N_VOCAB);
+            }
+            probe_ok = metal_graph_eval_mtp_target_first_pair(&s->graph,
+                                                              &e->model,
+                                                              &e->weights,
+                                                              &e->mtp_model,
+                                                              &e->mtp_weights,
+                                                              token,
+                                                              (uint32_t)(s->checkpoint.len - 1),
+                                                              target_top_for_mtp,
+                                                              (uint32_t)s->checkpoint.len,
+                                                              s->mtp_logits,
+                                                              &prefetched_second_top);
+        } else if (!fused_probe && !target_first_fused_probe) {
+            probe_ok = metal_graph_eval_mtp_draft(&s->graph,
+                                                  &e->model,
+                                                  &e->weights,
+                                                  &e->mtp_model,
+                                                  &e->mtp_weights,
+                                                  token,
+                                                  (uint32_t)(s->checkpoint.len - 1),
+                                                  (!exact_target_first_probe && mtp_probe_need_logits) ? s->mtp_logits : NULL,
+                                                  exact_target_first_probe ? NULL : &mtp_top,
+                                                  (!exact_target_first_probe && mtp_probe_top_k > 1) ? mtp_top_ids : NULL,
+                                                  mtp_probe_top_k);
+        }
+        if (probe_ok && exact_target_first_probe) {
+            if (target_top_for_mtp < 0) {
+                target_top_for_mtp = sample_argmax(s->logits, DS4_N_VOCAB);
+            }
+            mtp_top = target_top_for_mtp;
+        }
+        if (mtp_collect_stats && !fused_probe && !target_first_fused_probe) {
             s->mtp_stats.mtp_probe_count++;
             s->mtp_stats.mtp_probe_sec += now_sec() - probe_t0;
         }
@@ -18332,6 +23436,34 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             } else {
                 s->mtp_draft_token = mtp_top;
                 s->mtp_draft_margin_valid = false;
+            }
+            s->mtp_draft_top_k = 0;
+            s->mtp_draft_target_margin_valid = false;
+            if (target_first_pair_probe) {
+                int second_top0 = -1;
+                float second_v0 = 0.0f, second_v1 = 0.0f;
+                logits_top2(s->mtp_logits,
+                            DS4_N_VOCAB,
+                            &second_top0,
+                            &second_v0,
+                            NULL,
+                            &second_v1);
+                s->mtp_prefetched_second_token =
+                    prefetched_second_top >= 0 ? prefetched_second_top : second_top0;
+                s->mtp_prefetched_second_margin = second_v0 - second_v1;
+                s->mtp_prefetched_second_margin_valid = true;
+                s->mtp_prefetched_second_valid =
+                    s->mtp_prefetched_second_token >= 0;
+            }
+            if (target_margin_valid) {
+                s->mtp_draft_target_margin_bucket = target_margin_bucket;
+                s->mtp_draft_target_margin_valid = true;
+            }
+            if (mtp_probe_top_k > 1) {
+                s->mtp_draft_top_k = (int)mtp_probe_top_k;
+                for (uint32_t i = 0; i < mtp_probe_top_k; i++) {
+                    s->mtp_draft_top_ids[i] = mtp_top_ids[i];
+                }
             }
             s->mtp_draft_valid = true;
         } else if (getenv("DS4_MTP_PROBE")) {
@@ -18745,6 +23877,7 @@ done:
     s->checkpoint_valid = rc == 0;
     s->mtp_draft_valid = false;
     s->mtp_draft_margin_valid = false;
+    s->mtp_draft_target_margin_valid = false;
     spec_frontier_free(&frontier);
     free(seq_runner);
     free(seq_margin);
@@ -18809,8 +23942,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
     if (s->mtp_draft_margin_valid) mtp_margins[0] = s->mtp_draft_margin;
+    const bool first_probe_target_margin_valid = s->mtp_draft_target_margin_valid;
+    int first_probe_target_margin_bucket = s->mtp_draft_target_margin_bucket;
+    int first_probe_top_k = s->mtp_draft_top_k;
+    int first_probe_top_ids[16];
+    for (int i = 0; i < 16; i++) first_probe_top_ids[i] = s->mtp_draft_top_ids[i];
     s->mtp_draft_valid = false;
     s->mtp_draft_margin_valid = false;
+    s->mtp_draft_target_margin_valid = false;
+    s->mtp_draft_top_k = 0;
     const bool strict_mtp =
         !e->mtp_speed || e->quality || getenv("DS4_MTP_STRICT") != NULL;
     float mtp_margin_threshold = e->mtp_margin;
@@ -18824,8 +23964,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         strict_mtp &&
         mtp_margin_threshold > 0.0f &&
         getenv("DS4_MTP_NO_EXACT_MARGIN_SKIP") == NULL;
+    double first_margin_skip_threshold = 0.0;
+    bool first_margin_skip =
+        strict_mtp && getenv("DS4_MTP_FIRST_MARGIN_SKIP") != NULL;
+    const char *first_margin_skip_env = getenv("DS4_MTP_FIRST_MARGIN_SKIP");
+    if (first_margin_skip_env && first_margin_skip_env[0]) {
+        char *end = NULL;
+        const double v = strtod(first_margin_skip_env, &end);
+        if (end != first_margin_skip_env && v >= 0.0) {
+            first_margin_skip_threshold = v;
+        } else {
+            first_margin_skip = false;
+        }
+    }
     const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
-    const bool mtp_collect_stats = s->mtp_stats_enabled || s->mtp_adaptive_enabled;
+    const bool mtp_collect_stats =
+        s->mtp_stats_enabled ||
+        (s->mtp_adaptive_enabled && !s->mtp_adaptive_cheap);
     const bool mtp_measure = mtp_timing || mtp_collect_stats;
     const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
     const bool mtp_need_logits = mtp_conf_log ||
@@ -18881,6 +24036,183 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (s->mtp_tree_oracle_enabled) {
         ds4_mtp_tree_oracle_check(s, (uint32_t)s->checkpoint.len);
     }
+    if (s->mtp_stats_enabled && first_probe_target_margin_valid) {
+        if (first_probe_target_margin_bucket < 0) first_probe_target_margin_bucket = 0;
+        if (first_probe_target_margin_bucket >= DS4_MTP_AUDIT_MARGIN_BUCKETS) {
+            first_probe_target_margin_bucket = DS4_MTP_AUDIT_MARGIN_BUCKETS - 1;
+        }
+        s->mtp_stats.mtp_probe_target_margin_total[first_probe_target_margin_bucket]++;
+        if (target_first == drafts[0]) {
+            s->mtp_stats.mtp_probe_target_margin_hit[first_probe_target_margin_bucket]++;
+        }
+    }
+    const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
+    /*
+     * MTP has its own raw SWA cache. Recursive drafting writes speculative
+     * future rows into it; after verification, rows beyond the accepted prefix
+     * must become invisible.  We do not copy/rollback the cache body because the
+     * next draft attempt will overwrite future slots.  A counter is enough.
+     */
+#define DS4_MTP_KEEP_ACCEPTED(n_) do { \
+        uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
+        if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
+        s->graph.mtp_n_raw = keep_; \
+    } while (0)
+
+    int exact_tree_shape_fanout[DS4_MTP_TREE_SHAPE_DEPTH] = { 0, 0, 0 };
+    const char *exact_tree_shape_env = getenv("DS4_MTP_EXACT_TREE_SHAPE");
+    const bool exact_tree_shape =
+        exact_tree_shape_env &&
+        ds4_mtp_tree_shape_by_name(exact_tree_shape_env, exact_tree_shape_fanout);
+    const bool exact_tree_replay =
+        getenv("DS4_MTP_EXACT_TREE_REPLAY") != NULL || exact_tree_shape;
+    const int exact_tree_first_k =
+        exact_tree_shape ? exact_tree_shape_fanout[0] : first_probe_top_k;
+
+    if (strict_mtp &&
+        !e->mtp_speed &&
+        !e->quality &&
+        exact_tree_replay &&
+        exact_tree_first_k > 0 &&
+        first_probe_top_k >= exact_tree_first_k &&
+        ds4_token_in_top_ids(target_first, first_probe_top_ids, exact_tree_first_k))
+    {
+        int tree_depth_limit = exact_tree_shape ? DS4_MTP_TREE_SHAPE_DEPTH : 4;
+        const char *tree_depth_env = getenv("DS4_MTP_EXACT_TREE_DEPTH");
+        if (tree_depth_env && tree_depth_env[0]) {
+            char *end = NULL;
+            long v = strtol(tree_depth_env, &end, 10);
+            if (end != tree_depth_env && v > 0 && v <= 16) tree_depth_limit = (int)v;
+        }
+        if (exact_tree_shape && tree_depth_limit > DS4_MTP_TREE_SHAPE_DEPTH) {
+            tree_depth_limit = DS4_MTP_TREE_SHAPE_DEPTH;
+        }
+        int tree_top_k = first_probe_top_k;
+        const char *tree_topk_env = getenv("DS4_MTP_EXACT_TREE_TOPK");
+        if (tree_topk_env && tree_topk_env[0]) {
+            char *end = NULL;
+            long v = strtol(tree_topk_env, &end, 10);
+            if (end != tree_topk_env && v > 0 && v <= 16) tree_top_k = (int)v;
+        }
+        if (tree_top_k > first_probe_top_k) tree_top_k = first_probe_top_k;
+        if (tree_depth_limit > max_tokens - n_accept) tree_depth_limit = max_tokens - n_accept;
+        if (tree_depth_limit > accepted_cap - n_accept) tree_depth_limit = accepted_cap - n_accept;
+        int room_after_prompt = s->ctx_size - s->checkpoint.len;
+        if (tree_depth_limit > room_after_prompt) tree_depth_limit = room_after_prompt;
+
+        const int tree_start = s->checkpoint.len;
+        int tree_accept = 0;
+        int cur_token = target_first;
+        ds4_metal_tensor *prev_hc = s->graph.mtp_state_hc;
+        ds4_metal_tensor *out_hc = s->graph.mtp_next_hc;
+        double tree_target_sec = 0.0;
+        double tree_mtp_sec = 0.0;
+
+        while (tree_accept < tree_depth_limit) {
+            const double target0 = mtp_measure ? now_sec() : 0.0;
+            bool ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     cur_token,
+                                                     (uint32_t)(tree_start + tree_accept),
+                                                     s->logits);
+            if (mtp_measure) tree_target_sec += now_sec() - target0;
+            if (!ok) {
+                snprintf(err, errlen, "Metal decode failed");
+                s->checkpoint_valid = false;
+                DS4_MTP_KEEP_ACCEPTED(tree_accept);
+                return -1;
+            }
+            token_vec_push(&s->checkpoint, cur_token);
+            accepted[n_accept++] = cur_token;
+            tree_accept++;
+            if (cur_token == eos_token ||
+                tree_accept >= tree_depth_limit ||
+                n_accept >= accepted_cap ||
+                n_accept >= max_tokens)
+            {
+                break;
+            }
+
+            int mtp_top = -1;
+            int mtp_top_ids[16];
+            for (int i = 0; i < 16; i++) mtp_top_ids[i] = -1;
+            const int next_top_k =
+                exact_tree_shape ? exact_tree_shape_fanout[tree_accept] : tree_top_k;
+            if (next_top_k <= 0) break;
+            const double mtp0 = mtp_measure ? now_sec() : 0.0;
+            ok = metal_graph_eval_mtp_draft_from_hc(&s->graph,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    &e->mtp_model,
+                                                    &e->mtp_weights,
+                                                    prev_hc,
+                                                    out_hc,
+                                                    cur_token,
+                                                    (uint32_t)(tree_start + tree_accept - 1),
+                                                    NULL,
+                                                    &mtp_top,
+                                                    mtp_top_ids,
+                                                    (uint32_t)next_top_k);
+            (void)mtp_top;
+            if (mtp_measure) tree_mtp_sec += now_sec() - mtp0;
+            if (!ok) break;
+
+            const int next_target = sample_argmax(s->logits, DS4_N_VOCAB);
+            if (!ds4_token_in_top_ids(next_target, mtp_top_ids, next_top_k)) break;
+            cur_token = next_target;
+            ds4_metal_tensor *tmp = prev_hc;
+            prev_hc = out_hc;
+            out_hc = tmp;
+        }
+
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        DS4_MTP_KEEP_ACCEPTED(tree_accept);
+        const double done = mtp_measure ? now_sec() : 0.0;
+        ds4_mtp_stats_record_step(s,
+                                  DS4_MTP_STATS_MICRO,
+                                  tree_accept,
+                                  tree_accept,
+                                  tree_mtp_sec,
+                                  tree_target_sec,
+                                  0.0,
+                                  0.0,
+                                  mtp_measure ? done - mtp_t0 : 0.0);
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing exact-tree-replay shape=%s topk=%d committed=%d target=%.3f ms mtp=%.3f ms total=%.3f ms\n",
+                    exact_tree_shape ? exact_tree_shape_env : "uniform",
+                    tree_top_k,
+                    tree_accept,
+                    tree_target_sec * 1000.0,
+                    tree_mtp_sec * 1000.0,
+                    (done - mtp_t0) * 1000.0);
+        }
+        return n_accept;
+    }
+
+    if (strict_mtp && target_first != drafts[0] && first_probe_top_k > 1) {
+        bool first_in_probe_topk = false;
+        for (int k = 0; k < first_probe_top_k; k++) {
+            if (first_probe_top_ids[k] == target_first) {
+                first_in_probe_topk = true;
+                break;
+            }
+        }
+        if (first_in_probe_topk) {
+            if (s->mtp_stats_enabled) s->mtp_stats.mtp_first_rescue++;
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                fprintf(stderr,
+                        "ds4: mtp exact first-token topk rescue target=%d mtp_top=%d k=%d\n",
+                        target_first,
+                        drafts[0],
+                        first_probe_top_k);
+            }
+            drafts[0] = target_first;
+            mtp_margins[0] = 1.0e30f;
+        }
+    }
     const bool exact_force_first =
         strict_mtp && getenv("DS4_MTP_EXACT_FORCE_FIRST") != NULL;
     if (target_first != drafts[0] &&
@@ -18918,6 +24250,28 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 drafts[0],
                 target_first);
     }
+    if (first_margin_skip &&
+        mtp_margins[0] >= 0.0f &&
+        mtp_margins[0] < (float)first_margin_skip_threshold)
+    {
+        ds4_mtp_stats_record_step(s,
+                                  DS4_MTP_STATS_MARGIN_SKIP,
+                                  1,
+                                  0,
+                                  0.0,
+                                  0.0,
+                                  0.0,
+                                  0.0,
+                                  mtp_measure ? now_sec() - mtp_t0 : 0.0);
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr,
+                    "ds4: mtp exact first-margin-skip margin=%.3f threshold=%.3f draft=%d\n",
+                    mtp_margins[0],
+                    first_margin_skip_threshold,
+                    drafts[0]);
+        }
+        return n_accept;
+    }
     if (drafts[0] == eos_token) draft_cap = 1;
     int speed_alt_topk = 0;
     if (!strict_mtp) {
@@ -18930,6 +24284,36 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 speed_alt_topk = (int)v;
             }
         }
+    }
+    int exact_second_topk = 0;
+    if (strict_mtp) {
+        const char *second_topk_env = getenv("DS4_MTP_EXACT_SECOND_TOPK");
+        if (!second_topk_env || !second_topk_env[0]) {
+            second_topk_env = getenv("DS4_MTP_EXACT_SECOND_TOPK_REPLAY");
+        }
+        if (!second_topk_env || !second_topk_env[0]) {
+            second_topk_env = getenv("DS4_MTP_EXACT_SECOND_TOPK_BRANCH");
+        }
+        if (second_topk_env && second_topk_env[0]) {
+            char *end = NULL;
+            long v = strtol(second_topk_env, &end, 10);
+            if (end != second_topk_env && v > 1) {
+                if (v > 16) v = 16;
+                exact_second_topk = (int)v;
+            }
+        }
+    }
+    int mtp_second_top_k = 0;
+    int mtp_second_top_ids[16];
+    for (int i = 0; i < 16; i++) mtp_second_top_ids[i] = -1;
+    if (draft_n < draft_cap && s->mtp_prefetched_second_valid) {
+        drafts[draft_n] = s->mtp_prefetched_second_token;
+        if (s->mtp_prefetched_second_margin_valid) {
+            mtp_margins[draft_n] = s->mtp_prefetched_second_margin;
+        }
+        draft_n++;
+        s->mtp_prefetched_second_valid = false;
+        s->mtp_prefetched_second_margin_valid = false;
     }
     int speed_alt_ngram = 3;
     int speed_alt_window = 64;
@@ -18952,25 +24336,22 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         long v = strtol(alt_window_env, &end, 10);
         if (end != alt_window_env && v >= speed_alt_ngram && v <= 512) speed_alt_window = (int)v;
     }
-    const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
-    /*
-     * MTP has its own raw SWA cache. Recursive drafting writes speculative
-     * future rows into it; after verification, rows beyond the accepted prefix
-     * must become invisible.  We do not copy/rollback the cache body because the
-     * next draft attempt will overwrite future slots.  A counter is enough.
-     */
-#define DS4_MTP_KEEP_ACCEPTED(n_) do { \
-        uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
-        if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
-        s->graph.mtp_n_raw = keep_; \
-    } while (0)
-
     for (; draft_n < draft_cap; draft_n++) {
         ds4_metal_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
         ds4_metal_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
         int mtp_top = -1;
         int mtp_top_ids[16];
         for (int i = 0; i < 16; i++) mtp_top_ids[i] = -1;
+        uint32_t draft_top_k = 1;
+        int *draft_top_ids = NULL;
+        if (!strict_mtp && speed_alt_topk > 1) {
+            draft_top_k = (uint32_t)speed_alt_topk;
+            draft_top_ids = mtp_top_ids;
+        }
+        if (strict_mtp && draft_n == 1 && exact_second_topk > 1) {
+            draft_top_k = (uint32_t)exact_second_topk;
+            draft_top_ids = mtp_top_ids;
+        }
         if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
                                                 &e->model,
                                                 &e->weights,
@@ -18982,10 +24363,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 (uint32_t)(s->checkpoint.len + draft_n - 1),
                                                 mtp_need_logits ? s->mtp_logits : NULL,
                                                 &mtp_top,
-                                                speed_alt_topk > 1 ? mtp_top_ids : NULL,
-                                                speed_alt_topk > 1 ? (uint32_t)speed_alt_topk : 1))
+                                                draft_top_ids,
+                                                draft_top_k))
         {
             return n_accept;
+        }
+        if (strict_mtp && draft_n == 1 && exact_second_topk > 1) {
+            mtp_second_top_k = (int)draft_top_k;
+            for (int k = 0; k < mtp_second_top_k; k++) {
+                mtp_second_top_ids[k] = mtp_top_ids[k];
+            }
         }
         if (mtp_need_logits) {
             int top0 = -1, top1 = -1;
@@ -19329,6 +24716,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         memset(&frontier, 0, sizeof(frontier));
         float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
         float *prefix1_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(prefix1_logits[0]));
+        const bool exact_prefix2 = getenv("DS4_MTP_EXACT_PREFIX2") != NULL;
+        float *prefix2_logits = exact_prefix2 ? xmalloc((size_t)DS4_N_VOCAB * sizeof(prefix2_logits[0])) : NULL;
         int row_tops[4] = { -1, -1, -1, -1 };
         const int start = s->checkpoint.len;
         const double snapshot_t0 = mtp_measure ? now_sec() : 0.0;
@@ -19344,6 +24733,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                    (uint32_t)start,
                                                    row_tops,
                                                    prefix1_logits,
+                                                   prefix2_logits,
                                                    row_logits);
         }
         const double verify_done = mtp_measure ? now_sec() : 0.0;
@@ -19385,6 +24775,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                             (done - mtp_t0) * 1000.0);
                 }
                 spec_frontier_free(&frontier);
+                free(prefix2_logits);
                 free(prefix1_logits);
                 free(row_logits);
                 return n_accept;
@@ -19411,6 +24802,47 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                               0.0,
                                               prefix_done - mtp_t0);
                     spec_frontier_free(&frontier);
+                    free(prefix2_logits);
+                    free(prefix1_logits);
+                    free(row_logits);
+                    return n_accept;
+                }
+            }
+            if (commit_drafts == 2 && prefix2_logits) {
+                const double prefix_t0 = mtp_measure ? now_sec() : 0.0;
+                bool prefix_ok = spec_frontier_commit_prefix2(s);
+                const double prefix_done = mtp_measure ? now_sec() : 0.0;
+                if (prefix_ok) {
+                    memcpy(s->logits, prefix2_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                    for (int i = 0; i < 2 && n_accept < accepted_cap; i++) {
+                        token_vec_push(&s->checkpoint, drafts[i]);
+                        accepted[n_accept++] = drafts[i];
+                        if (drafts[i] == eos_token) break;
+                    }
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    DS4_MTP_KEEP_ACCEPTED(2);
+                    ds4_mtp_stats_record_step(s,
+                                              DS4_MTP_STATS_MICRO,
+                                              draft_n,
+                                              2,
+                                              mtp_t_after_draft - mtp_t0,
+                                              verify_done - snapshot_done,
+                                              (snapshot_done - snapshot_t0) + (prefix_done - prefix_t0),
+                                              0.0,
+                                              prefix_done - mtp_t0);
+                    if (mtp_timing) {
+                        fprintf(stderr,
+                                "ds4: mtp timing exactn-prefix2 drafted=%d committed=2 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms\n",
+                                draft_n,
+                                (mtp_t_after_draft - mtp_t0) * 1000.0,
+                                (snapshot_done - snapshot_t0) * 1000.0,
+                                (verify_done - snapshot_done) * 1000.0,
+                                (prefix_done - prefix_t0) * 1000.0,
+                                (prefix_done - mtp_t0) * 1000.0);
+                    }
+                    spec_frontier_free(&frontier);
+                    free(prefix2_logits);
                     free(prefix1_logits);
                     free(row_logits);
                     return n_accept;
@@ -19448,6 +24880,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                               replay_done - verify_done,
                                               replay_done - mtp_t0);
                     spec_frontier_free(&frontier);
+                    free(prefix2_logits);
                     free(prefix1_logits);
                     free(row_logits);
                     return n_accept;
@@ -19457,6 +24890,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         s->checkpoint.len = start;
         if (have_frontier) (void)spec_frontier_restore(&frontier, s);
         spec_frontier_free(&frontier);
+        free(prefix2_logits);
         free(prefix1_logits);
         free(row_logits);
         if (getenv("DS4_MTP_SPEC_LOG")) {
@@ -19467,7 +24901,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     /*
      * Keep the old sequential-shape N=2 verifier available as a diagnostic.
      * The normal strict N=2 path now uses the exact row-preserving batch
-     * verifier below, with prefix-1 capture for cheap one-token commits.
+     * verifier below.  It skips prefix-1 capture by default and replays the
+     * first token only on the rare partial-accept path; set
+     * DS4_MTP_N2_CAPTURE_PREFIX1=1 to restore the older capture behavior.
      */
     const bool use_decode2_exact =
         draft_n == 2 &&
@@ -19575,6 +25011,299 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp decode2 verifier failed, falling back to sequential\n");
         }
+    }
+
+    const bool use_n2_split_head =
+        draft_n == 2 &&
+        strict_mtp &&
+        !use_decode2_exact &&
+        getenv("DS4_MTP_NO_EXACT_N2_SPLIT_HEAD") == NULL &&
+        getenv("DS4_MTP_BATCH_VERIFY") == NULL;
+    if (use_n2_split_head) {
+        int row0_top = -1;
+        ds4_verify_n2_split_profile split_prof;
+        const bool split_profile = getenv("DS4_MTP_N2_PROFILE") != NULL;
+        const bool split_second_topk_rescue =
+            mtp_second_top_k > 1 &&
+            (getenv("DS4_MTP_EXACT_SECOND_TOPK") != NULL ||
+             getenv("DS4_MTP_EXACT_SECOND_TOPK_REPLAY") != NULL ||
+             getenv("DS4_MTP_EXACT_SECOND_TOPK_BRANCH") != NULL);
+        const bool split_second_topk_replay =
+            split_second_topk_rescue &&
+            getenv("DS4_MTP_EXACT_SECOND_TOPK_REPLAY") != NULL;
+        const bool split_second_topk_branch =
+            split_second_topk_rescue &&
+            getenv("DS4_MTP_EXACT_SECOND_TOPK_BRANCH") != NULL;
+        const bool split_capture_prefix1 =
+            (split_second_topk_rescue && !split_second_topk_replay) ||
+            (getenv("DS4_MTP_N2_CAPTURE_PREFIX1") != NULL &&
+             getenv("DS4_MTP_N2_REPLAY_PREFIX1") == NULL);
+        bool split_capture_prefix1_margin = false;
+        const char *split_capture_margin_env = getenv("DS4_MTP_N2_CAPTURE_PREFIX1_MARGIN");
+        if (!split_capture_prefix1 &&
+            split_capture_margin_env &&
+            split_capture_margin_env[0] &&
+            mtp_margins[1] >= 0.0f)
+        {
+            char *end = NULL;
+            const double threshold = strtod(split_capture_margin_env, &end);
+            if (end != split_capture_margin_env &&
+                threshold >= 0.0 &&
+                mtp_margins[1] < (float)threshold)
+            {
+                split_capture_prefix1_margin = true;
+            }
+        }
+        const bool split_capture_prefix1_effective =
+            split_capture_prefix1 || split_capture_prefix1_margin;
+        bool split_eager_row1 =
+            getenv("DS4_MTP_N2_EAGER_ROW1_HEAD") != NULL;
+        const char *split_eager_margin_env = getenv("DS4_MTP_N2_EAGER_ROW1_MARGIN");
+        if (split_eager_margin_env && split_eager_margin_env[0]) {
+            char *end = NULL;
+            const double threshold = strtod(split_eager_margin_env, &end);
+            if (end != split_eager_margin_env &&
+                threshold >= 0.0 &&
+                mtp_margins[1] >= (float)threshold)
+            {
+                split_eager_row1 = true;
+            }
+        }
+        const int start = s->checkpoint.len;
+        ds4_spec_frontier split_branch_frontier;
+        memset(&split_branch_frontier, 0, sizeof(split_branch_frontier));
+        bool split_branch_have_frontier = false;
+        if (split_second_topk_branch) {
+            split_branch_have_frontier = spec_frontier_snapshot(&split_branch_frontier, s);
+            if (!split_branch_have_frontier) {
+                snprintf(err, errlen, "MTP split-head branch snapshot failed");
+                s->checkpoint_valid = false;
+                DS4_MTP_KEEP_ACCEPTED(0);
+                return -1;
+            }
+        }
+        for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+        const double verify_t0 = mtp_measure ? now_sec() : 0.0;
+        bool ok = metal_graph_verify_suffix_n2_split_head(&s->graph,
+                                                          &e->model,
+                                                          &e->weights,
+                                                          &s->checkpoint,
+                                                          (uint32_t)start,
+                                                          split_capture_prefix1_effective,
+                                                          split_eager_row1,
+                                                          &row0_top,
+                                                          s->logits,
+                                                          split_profile ? &split_prof : NULL);
+        const double verify_done = mtp_measure ? now_sec() : 0.0;
+        if (!ok) {
+            s->checkpoint.len = start;
+            snprintf(err, errlen, "MTP split-head verifier failed");
+            s->checkpoint_valid = false;
+            DS4_MTP_KEEP_ACCEPTED(0);
+            spec_frontier_free(&split_branch_frontier);
+            return -1;
+        }
+
+        if (row0_top == drafts[1]) {
+            accepted[n_accept++] = drafts[0];
+            if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            DS4_MTP_KEEP_ACCEPTED(2);
+            const double done = mtp_measure ? now_sec() : 0.0;
+            ds4_mtp_stats_record_step(s,
+                                      DS4_MTP_STATS_MICRO,
+                                      draft_n,
+                                      2,
+                                      mtp_t_after_draft - mtp_t0,
+                                      verify_done - verify_t0,
+                                      0.0,
+                                      0.0,
+                                      done - mtp_t0);
+            if (mtp_timing) {
+                fprintf(stderr,
+                        "ds4: mtp timing split-head drafted=2 committed=2 draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                        (mtp_t_after_draft - mtp_t0) * 1000.0,
+                        (verify_done - verify_t0) * 1000.0,
+                        (done - mtp_t0) * 1000.0);
+            }
+            if (split_profile) {
+                fprintf(stderr,
+                        "ds4: mtp profile split-head committed=2 upload=%.3f ms layers=%.3f ms row0_head=%.3f ms row0_top_read=%.3f ms row1_head=%.3f ms logits_read=%.3f ms total=%.3f ms\n",
+                        split_prof.upload_sec * 1000.0,
+                        split_prof.layer_sec * 1000.0,
+                        split_prof.row0_head_sec * 1000.0,
+                        split_prof.row0_top_read_sec * 1000.0,
+                        split_prof.row1_head_sec * 1000.0,
+                        split_prof.logits_read_sec * 1000.0,
+                        split_prof.total_sec * 1000.0);
+            }
+            spec_frontier_free(&split_branch_frontier);
+            return n_accept;
+        }
+
+        s->checkpoint.len = start;
+        if (split_second_topk_rescue &&
+            row0_top != drafts[1] &&
+            ds4_token_in_top_ids(row0_top, mtp_second_top_ids, mtp_second_top_k))
+        {
+            const double prefix_t0 = mtp_measure ? now_sec() : 0.0;
+            double branch_verify_sec = 0.0;
+            if (split_second_topk_branch) {
+                s->checkpoint.len = start;
+                ok = split_branch_have_frontier &&
+                     spec_frontier_restore(&split_branch_frontier, s);
+                if (ok) {
+                    token_vec_push(&s->checkpoint, drafts[0]);
+                    token_vec_push(&s->checkpoint, row0_top);
+                    int branch_row0_top = -1;
+                    const double branch_t0 = mtp_measure ? now_sec() : 0.0;
+                    ok = metal_graph_verify_suffix_n2_split_head(&s->graph,
+                                                                 &e->model,
+                                                                 &e->weights,
+                                                                 &s->checkpoint,
+                                                                 (uint32_t)start,
+                                                                 false,
+                                                                 false,
+                                                                 &branch_row0_top,
+                                                                 s->logits,
+                                                                 NULL);
+                    const double branch_done = mtp_measure ? now_sec() : 0.0;
+                    branch_verify_sec = branch_done - branch_t0;
+                    if (ok && branch_row0_top != row0_top) ok = false;
+                }
+            } else if (split_second_topk_replay) {
+                ok = true;
+            } else {
+                ok = spec_frontier_commit_prefix1(s);
+            }
+            const double prefix_done = mtp_measure ? now_sec() : 0.0;
+            const double replay_t0 = mtp_measure ? now_sec() : 0.0;
+            if (ok && !split_second_topk_branch && split_second_topk_replay) {
+                ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    drafts[0],
+                                                    (uint32_t)start,
+                                                    NULL);
+            }
+            if (ok && !split_second_topk_branch) {
+                ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    row0_top,
+                                                    (uint32_t)(start + 1),
+                                                    s->logits);
+            }
+            const double replay_done = mtp_measure ? now_sec() : 0.0;
+            if (!ok) {
+                snprintf(err, errlen, "MTP split-head second-topk rescue failed");
+                s->checkpoint.len = start;
+                s->checkpoint_valid = false;
+                DS4_MTP_KEEP_ACCEPTED(0);
+                spec_frontier_free(&split_branch_frontier);
+                return -1;
+            }
+            if (!split_second_topk_branch) {
+                token_vec_push(&s->checkpoint, drafts[0]);
+                token_vec_push(&s->checkpoint, row0_top);
+            }
+            accepted[n_accept++] = drafts[0];
+            if (n_accept < accepted_cap) accepted[n_accept++] = row0_top;
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            DS4_MTP_KEEP_ACCEPTED(1);
+            const double done = mtp_measure ? now_sec() : 0.0;
+            ds4_mtp_stats_record_step(s,
+                                      DS4_MTP_STATS_MICRO,
+                                      draft_n,
+                                      2,
+                                      mtp_t_after_draft - mtp_t0,
+                                      (verify_done - verify_t0) + branch_verify_sec,
+                                      split_second_topk_branch ? 0.0 : prefix_done - prefix_t0,
+                                      replay_done - replay_t0,
+                                      done - mtp_t0);
+            if (mtp_timing) {
+                fprintf(stderr,
+                        "ds4: mtp timing split-head-second-topk drafted=2 committed=2 row0_top=%d old_draft1=%d topk=%d draft=%.3f ms verify=%.3f ms branch=%.3f ms prefix=%.3f ms replay=%.3f ms total=%.3f ms\n",
+                        row0_top,
+                        drafts[1],
+                        mtp_second_top_k,
+                        (mtp_t_after_draft - mtp_t0) * 1000.0,
+                        (verify_done - verify_t0) * 1000.0,
+                        branch_verify_sec * 1000.0,
+                        split_second_topk_branch ? 0.0 : (prefix_done - prefix_t0) * 1000.0,
+                        (replay_done - replay_t0) * 1000.0,
+                        (done - mtp_t0) * 1000.0);
+            }
+            spec_frontier_free(&split_branch_frontier);
+            return n_accept;
+        }
+
+        const double prefix_t0 = mtp_measure ? now_sec() : 0.0;
+        if (split_capture_prefix1_effective) {
+            ok = spec_frontier_commit_prefix1(s);
+        } else {
+            ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                drafts[0],
+                                                (uint32_t)start,
+                                                s->logits);
+        }
+        const double prefix_done = mtp_measure ? now_sec() : 0.0;
+        if (!ok) {
+            if (split_capture_prefix1_effective) {
+                snprintf(err, errlen, "MTP split-head prefix commit failed");
+            } else {
+                snprintf(err, errlen, "MTP split-head prefix replay failed");
+            }
+            s->checkpoint_valid = false;
+            DS4_MTP_KEEP_ACCEPTED(0);
+            spec_frontier_free(&split_branch_frontier);
+            return -1;
+        }
+        token_vec_push(&s->checkpoint, drafts[0]);
+        accepted[n_accept++] = drafts[0];
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        DS4_MTP_KEEP_ACCEPTED(1);
+        const double done = mtp_measure ? now_sec() : 0.0;
+        ds4_mtp_stats_record_step(s,
+                                  DS4_MTP_STATS_MICRO,
+                                  draft_n,
+                                  1,
+                                  mtp_t_after_draft - mtp_t0,
+                                  verify_done - verify_t0,
+                                  split_capture_prefix1_effective ? prefix_done - prefix_t0 : 0.0,
+                                  split_capture_prefix1_effective ? 0.0 : prefix_done - prefix_t0,
+                                  done - mtp_t0);
+        if (mtp_timing) {
+            fprintf(stderr,
+                    "ds4: mtp timing split-head drafted=2 committed=1 row0_top=%d draft1=%d draft=%.3f ms verify=%.3f ms prefix=%.3f ms replay=%d total=%.3f ms margin_capture=%d margin=%.3f\n",
+                    row0_top,
+                    drafts[1],
+                    (mtp_t_after_draft - mtp_t0) * 1000.0,
+                    (verify_done - verify_t0) * 1000.0,
+                    (prefix_done - prefix_t0) * 1000.0,
+                    split_capture_prefix1_effective ? 0 : 1,
+                    (done - mtp_t0) * 1000.0,
+                    split_capture_prefix1_margin ? 1 : 0,
+                    mtp_margins[1]);
+        }
+        if (split_profile) {
+            fprintf(stderr,
+                    "ds4: mtp profile split-head committed=1 upload=%.3f ms layers=%.3f ms row0_head=%.3f ms row0_top_read=%.3f ms row1_head=%.3f ms logits_read=%.3f ms total=%.3f ms\n",
+                    split_prof.upload_sec * 1000.0,
+                    split_prof.layer_sec * 1000.0,
+                    split_prof.row0_head_sec * 1000.0,
+                    split_prof.row0_top_read_sec * 1000.0,
+                    split_prof.row1_head_sec * 1000.0,
+                    split_prof.logits_read_sec * 1000.0,
+                    split_prof.total_sec * 1000.0);
+        }
+        spec_frontier_free(&split_branch_frontier);
+        return n_accept;
     }
 
     if (!use_decode2_exact)
@@ -20045,6 +25774,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
     s->mtp_draft_margin_valid = false;
+    s->mtp_draft_target_margin_valid = false;
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
@@ -20053,6 +25783,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
     s->mtp_draft_margin_valid = false;
+    s->mtp_draft_target_margin_valid = false;
 }
 
 int ds4_session_pos(ds4_session *s) {

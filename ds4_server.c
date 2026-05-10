@@ -7126,6 +7126,11 @@ static void generate_job(server *s, job *j) {
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    const bool mtp_spec_configured =
+        ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
+        getenv("DS4_MTP_NO_SPECULATE") == NULL;
+    const bool mtp_stop_direct = getenv("DS4_MTP_ADAPTIVE_STOP_DIRECT") != NULL;
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
@@ -7152,9 +7157,8 @@ static void generate_job(server *s, job *j) {
         int ntok = 0;
         const bool use_mtp_spec =
             temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
-        if (use_mtp_spec) {
+            mtp_spec_configured;
+        if (use_mtp_spec && (!mtp_stop_direct || !ds4_session_mtp_stopped(s->session))) {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
                                                        max_tokens - completion,

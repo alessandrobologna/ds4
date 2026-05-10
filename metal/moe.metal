@@ -1064,10 +1064,11 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
         (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
     device float *dst_up_f32 =
         (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+    const uint64_t pair = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *dst_mid_f32 =
-        (device float *)(dst_mid + (uint64_t)idx * act.mid_row_stride);
+        (device float *)(dst_mid + pair * act.mid_row_stride);
     device const float *route_w =
-        (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+        (device const float *)(weights + pair * act.weight_stride);
 
     const float c = act.clamp_value;
     const float route_weight = route_w[0];
@@ -1220,8 +1221,9 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
     device float *gate_f32 = (device float *)dst_gate_cur;
     device float *up_f32 = (device float *)dst_up_cur;
-    device float *mid_f32 = (device float *)(dst_mid + (uint64_t)idx * act.mid_row_stride);
-    device const float *route_w = (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+    const uint64_t pair = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *mid_f32 = (device float *)(dst_mid + pair * act.mid_row_stride);
+    device const float *route_w = (device const float *)(weights + pair * act.weight_stride);
     const float c = act.clamp_value;
     const float route_weight = route_w[0];
 

@@ -1219,6 +1219,40 @@ slower: baseline `36.47 TPS`, disabled `36.43 TPS`, exact `35.44 TPS`
 path. The only worthwhile implementation remains a real depth-batched target
 tree verifier; replay can be retired as a speed candidate.
 
+The final exact-tree falsifier used the existing `4x2x2` depth-batch verifier
+as the lower-bound measurement for the current implementation. It does not
+commit, does not use replay for the branch path, and reports the target branch
+verifier cost separately from MTP tree construction and normal serial replay:
+
+```sh
+DS4_MTP_TREE_DEPTH_BATCH_PROBE=4x2x2 \
+DS4_MTP_TREE_PROBE_STEPS=5 \
+DS4_MTP_NO_ADAPTIVE=1 \
+DS4_MTP_NO_TARGET_MARGIN_SKIP=1 \
+./ds4_test --mtp-oracle
+```
+
+Artifact: `/tmp/ds4-final-tree-lb-20260510-181233.{out,err}`. The q4 probe
+remained exact (`mismatches=0`, `max_delta=0`), but the branch verifier was far
+outside the useful range:
+
+| Metric | Median |
+| --- | ---: |
+| target branch layer-ish verifier | `794.054 ms` |
+| target branch with output head/read | `807.840 ms` |
+| Metal layer execute bucket | `762.577 ms` |
+| command encode | `30.480 ms` |
+| output head execute | `13.447 ms` |
+
+For the dense-oracle static `4x2x2` contained length of `2.032`, the required
+round cost is about `44.7 ms` for a projected `1.25x` and `37.3 ms` for
+`1.5x` on a `27.5 ms/token` baseline. The measured verifier bucket is `17.8x`
+over the `1.25x` threshold and `21.3x` over the `1.5x` threshold, before adding
+draft/commit overhead. This falsifies the current exact MTP/tree speed path for
+this sidecar. Further exact work should stop unless a different drafter
+materially improves contained length or a new verifier architecture can prove a
+radically lower target-row cost before integration.
+
 `DS4_MTP_EXACT_TREE_VERIFY=<shape>` is now the next diagnostic-only oracle for
 that verifier design. It does not change the generation path. For a limited
 number of oracle steps (`DS4_MTP_EXACT_TREE_VERIFY_STEPS`, default `1`), it

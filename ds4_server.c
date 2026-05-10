@@ -8734,6 +8734,7 @@ static bool generation_state_start_decode(generation_state *g) {
             g->finish = "error";
             return false;
         }
+        g->response_started = true;
         if (j->req.api == API_RESPONSES &&
             !responses_sse_start_live(j->fd, &j->req, g->id, &g->responses_live)) {
             snprintf(g->err, sizeof(g->err), "client stream write failed");
@@ -8933,7 +8934,12 @@ static void generation_state_finish(generation_state *g) {
                    g->finish ? g->finish : "error",
                    g->err,
                    now_sec() - g->t0);
-        if (!strcmp(g->finish ? g->finish : "error", "error")) {
+        const bool is_error = !strcmp(g->finish ? g->finish : "error", "error");
+        if (is_error) {
+            if (!g->err[0]) {
+                snprintf(g->err, sizeof(g->err), "batch request failed before response started");
+            }
+            (void)http_error(j->fd, 500, g->err);
             ds4_batch_mark_slot_error(s->batch, g->slot);
         }
         ds4_batch_release_slot(s->batch, g->slot);
@@ -9400,7 +9406,6 @@ static bool batch_prefill_shared_prefix_many(server *s, batch_request *reqs) {
             snprintf(g->err, sizeof(g->err), "%s", src->err);
             ds4_batch_mark_slot_error(s->batch, g->slot);
             trace_event(s, g->trace_id, "batch prefill fanout failed: %s", g->err);
-            http_error(g->j->fd, 500, g->err);
             reqs[g->slot].phase = BATCH_REQ_DONE;
         }
         return true;
@@ -9417,7 +9422,6 @@ static bool batch_prefill_shared_prefix_many(server *s, batch_request *reqs) {
             snprintf(g->err, sizeof(g->err), "%s", err);
             ds4_batch_mark_slot_error(s->batch, g->slot);
             trace_event(s, g->trace_id, "batch prefill fanout clone failed: %s", g->err);
-            http_error(g->j->fd, 500, g->err);
             reqs[g->slot].phase = BATCH_REQ_DONE;
         }
     }
@@ -9622,7 +9626,6 @@ static bool batch_prefill_many(server *s, batch_request *reqs) {
             snprintf(g->err, sizeof(g->err), "%s", err);
             ds4_batch_mark_slot_error(s->batch, g->slot);
             trace_event(s, g->trace_id, "batch segmented prefill failed: %s", g->err);
-            http_error(g->j->fd, 500, g->err);
             reqs[g->slot].phase = BATCH_REQ_DONE;
         }
         return true;
@@ -9699,7 +9702,6 @@ static bool batch_prefill_one(server *s, batch_request *reqs) {
             ds4_batch_set_progress(s->batch, g->slot, NULL, NULL);
             ds4_batch_mark_slot_error(s->batch, g->slot);
             trace_event(s, g->trace_id, "batch prefill failed: %s", g->err);
-            http_error(j->fd, 500, g->err);
             g->finish = "error";
             ds4_tokens_free(&prefix);
             br->phase = BATCH_REQ_DONE;

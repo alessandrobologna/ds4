@@ -676,12 +676,10 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
     orders->v[orders->len++] = order;
 }
 
-#ifdef DS4_SERVER_TEST
 static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
     int idx = tool_schema_orders_find_index(orders, name);
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
-#endif
 
 static void tool_schema_orders_append_move(tool_schema_orders *dst, tool_schema_orders *src) {
     for (int i = 0; i < src->len; i++) {
@@ -2125,6 +2123,43 @@ static void append_json_object_or_empty(buf *b, const char *json) {
     }
     buf_putc(b, '}');
     json_args_free(&args);
+}
+
+static void append_json_object_ordered_or_empty(buf *b, const char *json,
+                                                const tool_schema_order *order) {
+    json_args args = {0};
+    if (!json_args_parse(json, &args)) {
+        buf_puts(b, "{}");
+        return;
+    }
+    buf_putc(b, '{');
+    bool wrote = false;
+    if (order) {
+        for (int i = 0; i < order->len; i++) {
+            int idx = json_args_find_unused(&args, order->prop[i]);
+            if (idx < 0) continue;
+            if (wrote) buf_putc(b, ',');
+            append_json_arg_pair(b, &args.v[idx]);
+            args.v[idx].used = true;
+            wrote = true;
+        }
+    }
+    for (int i = 0; i < args.len; i++) {
+        if (args.v[i].used) continue;
+        if (wrote) buf_putc(b, ',');
+        append_json_arg_pair(b, &args.v[i]);
+        wrote = true;
+    }
+    buf_putc(b, '}');
+    json_args_free(&args);
+}
+
+static void append_ordered_json_string(buf *b, const char *json,
+                                       const tool_schema_order *order) {
+    buf tmp = {0};
+    append_json_object_ordered_or_empty(&tmp, json, order);
+    json_escape(b, tmp.ptr ? tmp.ptr : "{}");
+    buf_free(&tmp);
 }
 
 static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {

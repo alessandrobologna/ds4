@@ -8801,7 +8801,6 @@ static bool generation_state_start_decode(generation_state *g) {
         }
         if (g->openai_live_chat) openai_stream_start(&j->req, &g->openai_live);
     }
-    g->response_started = true;
 
     g->max_tokens = j->req.max_tokens;
     const int room = ds4_batch_ctx(s->batch) - ds4_batch_pos(s->batch, g->slot);
@@ -8970,37 +8969,37 @@ static bool generation_state_accept_token(generation_state *g, int token) {
 static void generation_state_finish(generation_state *g) {
     server *s = g->srv;
     job *j = g->j;
-    if (!g->response_started) {
+    const char *finish = g->finish ? g->finish : "error";
+    if (g_stop_requested && strcmp(finish, "error") != 0) {
+        g->finish = "error";
+        finish = g->finish;
+        snprintf(g->err, sizeof(g->err), "shutdown requested");
+    }
+    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+        g->saw_tool_start && !g->saw_tool_end && strcmp(finish, "error") != 0)
+    {
+        g->finish = "error";
+        finish = g->finish;
+        snprintf(g->err, sizeof(g->err), "unterminated tool call");
+    }
+    if (!g->response_started && !strcmp(finish, "error")) {
         server_log(DS4_LOG_GENERATION,
                    "ds4-server: batch slot=%d %s ctx=%s finish=%s error=\"%s\" %.3fs",
                    g->slot,
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
                    g->ctx_span,
-                   g->finish ? g->finish : "error",
+                   finish,
                    g->err,
                    now_sec() - g->t0);
-        const bool is_error = !strcmp(g->finish ? g->finish : "error", "error");
-        if (is_error) {
-            if (!g->err[0]) {
-                snprintf(g->err, sizeof(g->err), "batch request failed before response started");
-            }
-            (void)http_error(j->fd, 500, g->err);
-            ds4_batch_mark_slot_error(s->batch, g->slot);
+        if (!g->err[0]) {
+            snprintf(g->err, sizeof(g->err), "batch request failed before response started");
         }
+        (void)http_error(j->fd, 500, g->err);
+        ds4_batch_mark_slot_error(s->batch, g->slot);
         ds4_batch_release_slot(s->batch, g->slot);
         buf_free(&g->text);
         signal_job_done(j);
         return;
-    }
-    if (g_stop_requested && strcmp(g->finish, "error") != 0) {
-        g->finish = "error";
-        snprintf(g->err, sizeof(g->err), "shutdown requested");
-    }
-    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
-        g->saw_tool_start && !g->saw_tool_end && strcmp(g->finish, "error") != 0)
-    {
-        g->finish = "error";
-        snprintf(g->err, sizeof(g->err), "unterminated tool call");
     }
     if (g->completion > g->last_decode_log_completion) {
         log_decode_progress(j->req.kind, g->ctx_span, g->completion,

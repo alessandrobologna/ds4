@@ -9909,7 +9909,11 @@ static void *batch_worker_main(void *arg) {
         if (!batch_has_active(reqs, s->max_slots)) {
             job *j = dequeue(s);
             if (!j) break;
-            (void)batch_admit_job(s, reqs, j);
+            if (!batch_admit_job(s, reqs, j)) {
+                http_error(j->fd, 503, "server has no available batch slots");
+                signal_job_done(j);
+                continue;
+            }
             batch_admit_waiting(s, reqs);
         }
 

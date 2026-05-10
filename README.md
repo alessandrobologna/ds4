@@ -152,11 +152,12 @@ Start with `--max-slots N` to admit up to `N` independent live inference slots:
 
 The default `--max-slots > 1` backend is `shared-decode`: it uses a batch-owned
 Metal graph with slot-indexed KV/frontier storage, layer-major decode work
-across active slots, and batched dense/output-head work. `--batch-backend
-session-slots` remains available as the conservative reference fallback with
-independent session/KV slots behind the same scheduler. Both modes keep the same
-logical per-slot payload format as serialized mode so disk KV files remain
-reusable across serialized, `session-slots`, and `shared-decode` runs.
+across active slots, and batched dense/output-head work.
+`--batch-backend session-slots` remains available as the conservative reference
+fallback with independent session/KV slots behind the same scheduler. Both modes
+keep the same logical per-slot payload format as serialized mode so disk KV
+files remain reusable across serialized, `session-slots`, and `shared-decode`
+runs.
 
 MTP drafting is rejected with `--max-slots > 1`. Disk KV checkpoints remain
 supported and keep the same content-addressed token-prefix files used by

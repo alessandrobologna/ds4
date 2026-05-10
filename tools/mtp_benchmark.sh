@@ -127,8 +127,11 @@ unique_hashes_for_mode() {
     awk -F, -v mode="$mode" '$1 == mode { print $5 }' "$CSV" | sort -u | wc -l | tr -d ' '
 }
 
+MODES=(baseline disabled exact speed)
 for run in $(seq 1 "$RUNS"); do
-    for mode in baseline disabled exact speed; do
+    offset=$(( (run - 1) % ${#MODES[@]} ))
+    for i in "${!MODES[@]}"; do
+        mode="${MODES[$(( (i + offset) % ${#MODES[@]} ))]}"
         run_mode "$mode" "$run"
     done
 done

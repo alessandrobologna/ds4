@@ -9757,8 +9757,9 @@ static bool batch_prefill_one(server *s, batch_request *reqs) {
         };
         snprintf(progress.ctx, sizeof(progress.ctx), "%s", g->ctx_span);
         ds4_batch_set_progress(s->batch, g->slot, server_progress_cb, &progress);
-        if (ds4_batch_sync(s->batch, g->slot, &prefix, g->err, sizeof(g->err)) != 0) {
-            ds4_batch_set_progress(s->batch, g->slot, NULL, NULL);
+        int sync_rc = ds4_batch_sync(s->batch, g->slot, &prefix, g->err, sizeof(g->err));
+        ds4_batch_set_progress(s->batch, g->slot, NULL, NULL);
+        if (sync_rc != 0) {
             ds4_batch_mark_slot_error(s->batch, g->slot);
             trace_event(s, g->trace_id, "batch prefill failed: %s", g->err);
             g->finish = "error";

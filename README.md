@@ -44,6 +44,15 @@ quant layouts and tables, CPU quant/dot logic, and certain Metal kernels. For th
 reason, and because we are genuinely grateful, we keep the GGML authors copyright
 notice in our `LICENSE` file.
 
+## Status
+
+The code and GGUF files are to be considered of **alpha quality** because
+inference and model serving is a complicated matter and all this exists
+only for a few days. It will take months to reach a more stable form.
+However, we try to keep the project in a usable state, and we are making
+progresses. If you have issues, make sure to use `--trace` to log the
+sessions, and open issues including the full trace.
+
 ## Model Weights
 
 This implementation only works with the DeepSeek V4 Flash GGUFs published for

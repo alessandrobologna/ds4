@@ -677,6 +677,69 @@ done:
     ds4_tokens_free(&prompt);
 }
 
+static void test_batch_shared_batched_prefill_equivalence(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt_a = {0};
+    ds4_tokens prompt_b = {0};
+    ds4_encode_chat_prompt(engine, "", "Give one short note about batched prompt prefill.",
+                           DS4_THINK_NONE, &prompt_a);
+    ds4_encode_chat_prompt(engine, "", "Give one short note about isolated slot caches.",
+                           DS4_THINK_NONE, &prompt_b);
+
+    char err[160];
+    ds4_session *session_a = NULL;
+    ds4_session *session_b = NULL;
+    ds4_batch *batch = NULL;
+    TEST_ASSERT(ds4_session_create(&session_a, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_create(&session_b, engine, 4096) == 0);
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 2, "shared-decode") == 0);
+    if (!session_a || !session_b || !batch) goto done;
+
+    ds4_batch_claim_slot(batch, 0);
+    ds4_batch_claim_slot(batch, 1);
+    ds4_batch_invalidate_slot(batch, 0);
+    ds4_batch_invalidate_slot(batch, 1);
+    TEST_ASSERT(ds4_session_sync(session_a, &prompt_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(session_b, &prompt_b, err, sizeof(err)) == 0);
+
+    int pos_a = 0;
+    int pos_b = 0;
+    while (pos_a < prompt_a.len || pos_b < prompt_b.len) {
+        ds4_batch_step steps[2];
+        int refresh[2] = {0};
+        int n = 0;
+        if (pos_a < prompt_a.len) {
+            steps[n] = (ds4_batch_step){ .slot = 0, .token = prompt_a.v[pos_a] };
+            refresh[n] = pos_a + 1 == prompt_a.len;
+            n++;
+        }
+        if (pos_b < prompt_b.len) {
+            steps[n] = (ds4_batch_step){ .slot = 1, .token = prompt_b.v[pos_b] };
+            refresh[n] = pos_b + 1 == prompt_b.len;
+            n++;
+        }
+        TEST_ASSERT(ds4_batch_prefill(batch, steps, refresh, n, err, sizeof(err)) == 0);
+        if (pos_a < prompt_a.len) pos_a++;
+        if (pos_b < prompt_b.len) pos_b++;
+    }
+
+    test_compare_session_batch_top_with_tolerance("batched prefill slot0",
+                                                  session_a, batch, 0,
+                                                  5e-1f, 2e-1f, 1, 0);
+    test_compare_session_batch_top_with_tolerance("batched prefill slot1",
+                                                  session_b, batch, 1,
+                                                  5e-1f, 2e-1f, 1, 0);
+
+done:
+    ds4_batch_free(batch);
+    ds4_session_free(session_b);
+    ds4_session_free(session_a);
+    ds4_tokens_free(&prompt_b);
+    ds4_tokens_free(&prompt_a);
+}
+
 static void test_batch_shared_long_boundary_isolation(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
@@ -1069,6 +1132,7 @@ done:
 
 static void test_batch_shared_correctness(void) {
     test_batch_shared_one_row_equivalence();
+    test_batch_shared_batched_prefill_equivalence();
     test_batch_shared_slot_isolation();
     test_batch_shared_long_boundary_isolation();
     test_batch_shared_payload_roundtrip();

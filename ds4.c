@@ -15313,6 +15313,22 @@ static int ds4_batch_eval_top_shared_decode(ds4_batch *b, const ds4_batch_step *
     ds4_batch_set_err(err, errlen, "Metal support is not compiled in");
     return 1;
 }
+
+static int ds4_batch_prefill_session_slots(ds4_batch *b, const ds4_batch_step *steps,
+                                           const int *refresh_logits, int n_steps,
+                                           char *err, size_t errlen) {
+    (void)b; (void)steps; (void)refresh_logits; (void)n_steps;
+    ds4_batch_set_err(err, errlen, "Metal support is not compiled in");
+    return 1;
+}
+
+static int ds4_batch_prefill_shared_decode(ds4_batch *b, const ds4_batch_step *steps,
+                                           const int *refresh_logits, int n_steps,
+                                           char *err, size_t errlen) {
+    (void)b; (void)steps; (void)refresh_logits; (void)n_steps;
+    ds4_batch_set_err(err, errlen, "Metal support is not compiled in");
+    return 1;
+}
 #else
 
 static uint32_t metal_graph_token_split_layers(void) {
@@ -15365,6 +15381,56 @@ static int ds4_batch_prepare_decode_steps(
     return 0;
 }
 
+static int ds4_batch_prepare_prefill_steps(
+        ds4_batch             *b,
+        const ds4_batch_step  *steps,
+        int                    n_steps,
+        ds4_session          **session,
+        ds4_batch_slot_state **state,
+        char                  *err,
+        size_t                 errlen) {
+    if (!b || !steps || n_steps < 0) {
+        ds4_batch_set_err(err, errlen, "invalid batch prefill request");
+        return 1;
+    }
+    if (n_steps == 0) return 0;
+    if (n_steps > b->max_slots || n_steps > 64) {
+        ds4_batch_set_err(err, errlen, "batch prefill has too many steps");
+        return 1;
+    }
+
+    bool seen[64] = {0};
+    for (int i = 0; i < n_steps; i++) {
+        const int slot = steps[i].slot;
+        if (slot < 0 || slot >= b->max_slots || slot >= 64 || seen[slot]) {
+            ds4_batch_set_err(err, errlen, "invalid or duplicate batch prefill slot");
+            return 1;
+        }
+        ds4_session *s = b->slot[slot];
+        ds4_batch_slot_state *st = ds4_batch_state(b, slot);
+        if (!s || !st || !st->occupied || st->error || st->eval_in_flight ||
+            s->checkpoint.len >= s->ctx_size) {
+            ds4_batch_set_err(err, errlen, "batch slot is not prefill-ready");
+            return 1;
+        }
+        if (!s->checkpoint_valid) {
+            if (s->checkpoint.len != 0) {
+                ds4_batch_set_err(err, errlen, "batch prefill slot has invalid checkpoint");
+                return 1;
+            }
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            ds4_batch_clear_slot_counters(st);
+            memset(s->graph.layer_n_comp, 0, sizeof(s->graph.layer_n_comp));
+            memset(s->graph.layer_n_index_comp, 0, sizeof(s->graph.layer_n_index_comp));
+        }
+        seen[slot] = true;
+        session[i] = s;
+        state[i] = st;
+    }
+    return 0;
+}
+
 static void ds4_batch_steps_in_flight(ds4_batch_slot_state **state, int n_steps, bool value) {
     for (int i = 0; i < n_steps; i++) {
         if (state[i]) state[i]->eval_in_flight = value;
@@ -15399,6 +15465,15 @@ static void ds4_batch_finish_top_step(ds4_session *s, ds4_batch_slot_state *st, 
     st->payload_valid = false;
     st->dirty = true;
     st->error = false;
+}
+
+static void ds4_batch_finish_prefill_step(ds4_session *s, ds4_batch_slot_state *st,
+                                          int token, bool refreshed_logits) {
+    if (refreshed_logits) {
+        ds4_batch_finish_full_logits_step(s, st, token);
+    } else {
+        ds4_batch_finish_top_step(s, st, token);
+    }
 }
 
 static int ds4_batch_eval_top_single_slot(ds4_batch *b, const ds4_batch_step *step,
@@ -16411,6 +16486,136 @@ static int ds4_batch_eval_top_shared_decode(ds4_batch *b, const ds4_batch_step *
     }
     return 0;
 }
+
+static bool ds4_batch_step_wants_logits(const int *refresh_logits, int i) {
+    return refresh_logits && refresh_logits[i] != 0;
+}
+
+static bool ds4_batch_any_step_wants_logits(const int *refresh_logits, int n_steps) {
+    if (!refresh_logits) return false;
+    for (int i = 0; i < n_steps; i++) {
+        if (refresh_logits[i] != 0) return true;
+    }
+    return false;
+}
+
+static int ds4_batch_prefill_session_slots(ds4_batch *b, const ds4_batch_step *steps,
+                                           const int *refresh_logits, int n_steps,
+                                           char *err, size_t errlen) {
+    ds4_session *session[64] = {0};
+    ds4_batch_slot_state *state[64] = {0};
+    if (ds4_batch_prepare_prefill_steps(b, steps, n_steps, session, state, err, errlen) != 0) {
+        return 1;
+    }
+    if (n_steps == 0) return 0;
+
+    ds4_engine *e = b->engine;
+    ds4_batch_steps_in_flight(state, n_steps, true);
+    bool ok = ds4_metal_begin_commands() != 0;
+    for (int i = 0; ok && i < n_steps; i++) {
+        ds4_session *s = session[i];
+        ok = metal_graph_encode_token_raw_swa(&s->graph,
+                                              &e->model,
+                                              &e->weights,
+                                              steps[i].token,
+                                              (uint32_t)s->checkpoint.len,
+                                              ds4_batch_step_wants_logits(refresh_logits, i),
+                                              true);
+    }
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    if (!ok) {
+        ds4_batch_fail_steps(b, steps, session, n_steps);
+        ds4_batch_set_err(err, errlen, "Metal batched prefill failed");
+        if (ds4_metal_synchronize() == 0) {
+            fprintf(stderr, "ds4: Metal synchronize after batched prefill failure also failed\n");
+        }
+        return 1;
+    }
+
+    for (int i = 0; i < n_steps; i++) {
+        ds4_session *s = session[i];
+        const bool wants_logits = ds4_batch_step_wants_logits(refresh_logits, i);
+        if (wants_logits &&
+            ds4_metal_tensor_read(s->graph.logits, 0, s->logits,
+                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0)
+        {
+            ds4_batch_fail_steps(b, steps, session, n_steps);
+            ds4_batch_set_err(err, errlen, "Metal batched prefill logits read failed");
+            return 1;
+        }
+        ds4_batch_finish_prefill_step(s, state[i], steps[i].token, wants_logits);
+    }
+    return 0;
+}
+
+static int ds4_batch_prefill_shared_decode(ds4_batch *b, const ds4_batch_step *steps,
+                                           const int *refresh_logits, int n_steps,
+                                           char *err, size_t errlen) {
+    ds4_session *session[64] = {0};
+    ds4_batch_slot_state *state[64] = {0};
+    if (ds4_batch_prepare_prefill_steps(b, steps, n_steps, session, state, err, errlen) != 0) {
+        return 1;
+    }
+    if (n_steps == 0) return 0;
+
+    ds4_engine *e = b->engine;
+    ds4_metal_graph saved[64];
+    bool attached[64] = {0};
+    if (!ds4_batch_attach_shared_steps(b, steps, saved, attached, n_steps)) {
+        ds4_batch_set_err(err, errlen, "Metal shared slot graph view allocation failed");
+        return 1;
+    }
+
+    const bool any_logits = ds4_batch_any_step_wants_logits(refresh_logits, n_steps);
+    ds4_metal_graph *out_graph = &b->shared_graph;
+    if (any_logits && !metal_graph_ensure_spec_logits(out_graph, (uint32_t)n_steps)) {
+        ds4_batch_detach_shared_steps(b, steps, saved, attached, n_steps, false);
+        ds4_batch_set_err(err, errlen, "Metal shared prefill logits allocation failed");
+        return 1;
+    }
+
+    ds4_batch_steps_in_flight(state, n_steps, true);
+    bool ok = ds4_metal_begin_commands() != 0;
+    if (ok) ok = ds4_batch_encode_shared_decode_rows(b, steps, session, n_steps, true);
+    if (ok && any_logits) ok = metal_graph_encode_output_head_batch(out_graph,
+                                                                    &e->model,
+                                                                    &e->weights,
+                                                                    (uint32_t)n_steps,
+                                                                    e->weights.output->dim[1]);
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    if (!ok) {
+        ds4_batch_detach_shared_steps(b, steps, saved, attached, n_steps, false);
+        ds4_batch_fail_steps(b, steps, session, n_steps);
+        ds4_batch_set_err(err, errlen, "Metal shared prefill failed");
+        if (ds4_metal_synchronize() == 0) {
+            fprintf(stderr, "ds4: Metal synchronize after shared prefill failure also failed\n");
+        }
+        return 1;
+    }
+
+    if (any_logits) {
+        for (int i = 0; i < n_steps; i++) {
+            if (!ds4_batch_step_wants_logits(refresh_logits, i)) continue;
+            ds4_session *s = session[i];
+            if (ds4_metal_tensor_read(out_graph->spec_logits,
+                                      (uint64_t)i * DS4_N_VOCAB * sizeof(float),
+                                      s->logits,
+                                      (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {
+                ds4_batch_detach_shared_steps(b, steps, saved, attached, n_steps, false);
+                ds4_batch_fail_steps(b, steps, session, n_steps);
+                ds4_batch_set_err(err, errlen, "Metal shared prefill logits read failed");
+                return 1;
+            }
+        }
+    }
+
+    ds4_batch_detach_shared_steps(b, steps, saved, attached, n_steps, true);
+    for (int i = 0; i < n_steps; i++) {
+        ds4_batch_finish_prefill_step(session[i], state[i], steps[i].token,
+                                      ds4_batch_step_wants_logits(refresh_logits, i));
+    }
+    return 0;
+}
 #endif
 
 int ds4_batch_eval(ds4_batch *b, const ds4_batch_step *steps, int n_steps, char *err, size_t errlen) {
@@ -16426,6 +16631,15 @@ int ds4_batch_eval_top(ds4_batch *b, const ds4_batch_step *steps, int n_steps,
         return ds4_batch_eval_top_shared_decode(b, steps, n_steps, top_tokens, err, errlen);
     }
     return ds4_batch_eval_top_session_slots(b, steps, n_steps, top_tokens, err, errlen);
+}
+
+int ds4_batch_prefill(ds4_batch *b, const ds4_batch_step *steps,
+                      const int *refresh_logits, int n_steps,
+                      char *err, size_t errlen) {
+    if (b && b->backend == DS4_BATCH_BACKEND_SHARED_DECODE) {
+        return ds4_batch_prefill_shared_decode(b, steps, refresh_logits, n_steps, err, errlen);
+    }
+    return ds4_batch_prefill_session_slots(b, steps, refresh_logits, n_steps, err, errlen);
 }
 
 void ds4_batch_invalidate_slot(ds4_batch *b, int slot) {

@@ -201,6 +201,11 @@ int ds4_batch_eval(ds4_batch *b, const ds4_batch_step *steps, int n_steps, char 
  * The slot checkpoint advances, but the CPU logits row is not refreshed. */
 int ds4_batch_eval_top(ds4_batch *b, const ds4_batch_step *steps, int n_steps,
                        int *top_tokens, char *err, size_t errlen);
+/* Advance one prompt token per slot.  refresh_logits is optional; when present,
+ * nonzero entries refresh that slot's CPU logits row after the step. */
+int ds4_batch_prefill(ds4_batch *b, const ds4_batch_step *steps,
+                      const int *refresh_logits, int n_steps,
+                      char *err, size_t errlen);
 void ds4_batch_invalidate_slot(ds4_batch *b, int slot);
 void ds4_batch_rewind_slot(ds4_batch *b, int slot, int pos);
 int ds4_batch_pos(ds4_batch *b, int slot);

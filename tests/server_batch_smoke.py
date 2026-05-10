@@ -270,6 +270,8 @@ def server_argv(
         ]
         if backend:
             argv += ["--batch-backend", backend]
+        if args.experimental_batched_prefill:
+            argv += ["--experimental-batched-prefill"]
     if kv_dir:
         argv += [
             "--kv-disk-dir",
@@ -294,6 +296,17 @@ def max_logged_batch(lines: list[str]) -> int:
     best = 0
     for line in lines:
         if "batch backend=" not in line:
+            continue
+        match = re.search(r" batch=(\d+)", line)
+        if match:
+                best = max(best, int(match.group(1)))
+    return best
+
+
+def max_logged_prefill_batch(lines: list[str]) -> int:
+    best = 0
+    for line in lines:
+        if "batch backend=" not in line or "prefill=" not in line:
             continue
         match = re.search(r" batch=(\d+)", line)
         if match:
@@ -361,6 +374,23 @@ def benchmark_workload(args: argparse.Namespace, workload: str) -> tuple[str, in
     raise CheckError(f"unknown benchmark workload: {workload}")
 
 
+def benchmark_prompts(args: argparse.Namespace, workload: str, clients: int) -> tuple[list[str], int]:
+    prompt, max_tokens = benchmark_workload(args, workload)
+    prompts = [prompt for _ in range(clients)]
+    if workload == "prefill" and args.prefill_unique_prefix:
+        prompts = [
+            f"Unique request prefix {i:02d}: this request starts differently before the long body.\n{prompt}"
+            for i in range(clients)
+        ]
+    if workload == "prefill" and args.prefill_unique_suffix:
+        prompts = [
+            prompt +
+            f"\nUnique request suffix {i:02d}: answer for client {i} only after the shared context."
+            for i in range(clients)
+        ]
+    return prompts, max_tokens
+
+
 def benchmark_once(
     args: argparse.Namespace, workload: str, label: str, clients: int, trial: int
 ) -> dict:
@@ -371,7 +401,7 @@ def benchmark_once(
     else:
         max_slots = max(clients, args.batch_slots_min)
         backend = label
-    prompt, max_tokens = benchmark_workload(args, workload)
+    prompts, max_tokens = benchmark_prompts(args, workload, clients)
     argv = server_argv(
         args,
         port,
@@ -383,7 +413,7 @@ def benchmark_once(
         started = time.monotonic()
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=clients)
         futures = {
-            pool.submit(run_chat, port, prompt, max_tokens, args.request_timeout): i
+            pool.submit(run_chat, port, prompts[i], max_tokens, args.request_timeout): i
             for i in range(clients)
         }
         try:
@@ -440,6 +470,9 @@ def benchmark_once(
             "metric_name": metric_name,
             "metric": metric,
             "max_batch": max_logged_batch(server.lines),
+            "max_prefill_batch": max_logged_prefill_batch(server.lines),
+            "prefill_fanout": count_logs(server.lines, "prefill=fanout"),
+            "prefill_chunk": count_logs(server.lines, "prefill=chunk"),
         }
 
 
@@ -463,6 +496,39 @@ def run_benchmark(args: argparse.Namespace) -> None:
             for label in labels:
                 for trial in range(1, args.trials + 1):
                     row = benchmark_once(args, workload, label, clients, trial)
+                    if (
+                        args.expect_prefill_fanout
+                        and workload == "prefill"
+                        and label == "shared-decode"
+                        and clients > 1
+                        and row["prefill_fanout"] <= 0
+                    ):
+                        raise CheckError(
+                            "expected shared-decode prefill fanout logs for "
+                            f"clients={clients} trial={trial}, saw none"
+                        )
+                    if (
+                        args.expect_prefill_batch
+                        and workload == "prefill"
+                        and label == "shared-decode"
+                        and clients > 1
+                        and row["max_prefill_batch"] < 2
+                    ):
+                        raise CheckError(
+                            "expected shared-decode prefill batching for "
+                            f"clients={clients} trial={trial}, max_prefill_batch={row['max_prefill_batch']}"
+                        )
+                    if (
+                        args.expect_prefill_chunk
+                        and workload == "prefill"
+                        and label == "shared-decode"
+                        and clients > 1
+                        and row["prefill_chunk"] <= 0
+                    ):
+                        raise CheckError(
+                            "expected shared-decode row prefill chunk logs for "
+                            f"clients={clients} trial={trial}, saw none"
+                        )
                     rows.append(row)
                     print(
                         "server-batch-benchmark: "
@@ -471,7 +537,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
                         f"prompt_tokens={row['prompt_tokens']} "
                         f"completion_tokens={row['completion_tokens']} "
                         f"wall={row['wall']:.3f}s reqs_per_sec={row['reqs_per_sec']:.3f} "
-                        f"max_batch={row['max_batch']}",
+                        f"max_batch={row['max_batch']} "
+                        f"max_prefill_batch={row['max_prefill_batch']} "
+                        f"prefill_fanout={row['prefill_fanout']} "
+                        f"prefill_chunk={row['prefill_chunk']}",
                         flush=True,
                     )
 
@@ -522,6 +591,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--labels", default="serialized,session-slots,shared-decode")
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--progress", action="store_true")
+    parser.add_argument("--experimental-batched-prefill", action="store_true")
+    parser.add_argument(
+        "--prefill-unique-suffix",
+        action="store_true",
+        help="For prefill benchmarks, keep the long prefix shared but add a unique per-client suffix.",
+    )
+    parser.add_argument(
+        "--prefill-unique-prefix",
+        action="store_true",
+        help="For prefill benchmarks, make each prompt diverge near the start.",
+    )
+    parser.add_argument(
+        "--expect-prefill-fanout",
+        action="store_true",
+        help="Fail shared-decode prefill benchmark trials with clients > 1 unless fanout is observed.",
+    )
+    parser.add_argument(
+        "--expect-prefill-batch",
+        action="store_true",
+        help="Fail shared-decode prefill benchmark trials with clients > 1 unless any prefill batch is observed.",
+    )
+    parser.add_argument(
+        "--expect-prefill-chunk",
+        action="store_true",
+        help="Fail shared-decode prefill benchmark trials with clients > 1 unless row prefill chunking is observed.",
+    )
     args = parser.parse_args(argv)
     if args.mode == "smoke" and args.backend not in {"shared-decode", "session-slots"}:
         parser.error("--backend must be shared-decode or session-slots")

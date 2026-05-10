@@ -168,6 +168,15 @@ Deterministic non-thinking requests use a top-token decode path that avoids host
 readback of the full vocabulary row after every generated token; slots that have
 only this top-token state are not written to disk until full logits are refreshed.
 
+`--experimental-batched-prefill` adds early shared-decode prefill experiments.
+Concurrent prompts with a shared token prefix are prefetched once per common
+prefix chunk and fanned out through the same slot payload format used by disk KV.
+Non-identical prompts can also advance bounded chunks by issuing one shared row
+batch per prompt token across active slots when no decode-ready slot is waiting.
+Full logits are refreshed at final prompt tokens and cache-save boundaries so
+disk KV compatibility is preserved, but the mode remains opt-in while this path
+is still being validated.
+
 Supported endpoints:
 
 - `GET /v1/models`
@@ -583,6 +592,9 @@ DS4_TEST_MODEL=/path/to/ds4flash.gguf ./ds4_test --batch-correctness
 DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batch-smoke
 DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batch-benchmark
 DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 1,2,4,8
+DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 1,4,8 --labels serialized,shared-decode --experimental-batched-prefill
+DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 4,8 --labels serialized,shared-decode --experimental-batched-prefill --prefill-unique-suffix --expect-prefill-fanout
+DS4_TEST_MODEL=/path/to/ds4flash.gguf DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS=32 python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 2 --labels shared-decode --experimental-batched-prefill --prefill-unique-prefix --expect-prefill-batch --expect-prefill-chunk
 ```
 
 `server-batch-smoke` starts `ds4-server --max-slots 2 --kv-disk-dir ...` for

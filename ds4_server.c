@@ -3967,6 +3967,51 @@ static bool parse_generated_message(const char *text, char **content_out,
     }
 }
 
+static const char *tool_parse_failure_recovery_finish(const char *finish) {
+    /* Once DSML failed to parse there is no executable tool call to report.
+     * Preserve a true length stop, because callers can distinguish truncation
+     * from a completed turn.  Every other non-error tool-parse failure becomes
+     * a normal assistant stop with the raw model text returned as content. */
+    if (finish && !strcmp(finish, "length")) return "length";
+    return "stop";
+}
+
+static bool parse_generated_message_for_response(const char *text,
+                                                 bool has_tools,
+                                                 bool saw_tool_start,
+                                                 const char **finish_io,
+                                                 char *err,
+                                                 size_t errlen,
+                                                 char **content_out,
+                                                 char **reasoning_out,
+                                                 tool_calls *calls,
+                                                 bool *recovered_out) {
+    if (recovered_out) *recovered_out = false;
+
+    bool parsed_ok = parse_generated_message(text ? text : "", content_out,
+                                             reasoning_out, calls);
+    if (parsed_ok) return true;
+
+    free(*content_out);
+    free(*reasoning_out);
+    *content_out = xstrdup(text ? text : "");
+    *reasoning_out = NULL;
+    tool_calls_free(calls);
+
+    /* A malformed tool block is model output, not a server failure.  Returning
+     * the sampled text as a regular assistant message keeps the API response
+     * valid and gives the caller enough transcript context to retry or recover
+     * on a later turn, instead of terminating the whole session on
+     * finish_reason="error". */
+    const char *finish = finish_io && *finish_io ? *finish_io : "stop";
+    if (has_tools && saw_tool_start && strcmp(finish, "error") != 0) {
+        if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
+        if (err && errlen) snprintf(err, errlen, "invalid tool call");
+        if (recovered_out) *recovered_out = true;
+    }
+    return false;
+}
+
 static void append_json_object_string(buf *b, const char *json) {
     buf tmp = {0};
     append_json_object_or_empty(&tmp, json);
@@ -9166,19 +9211,27 @@ static void generate_job(server *s, job *j) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     const char *final_finish = finish;
+    bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
-        bool parsed_ok = parse_generated_message(text.ptr ? text.ptr : "", &parsed_content,
-                                                 &parsed_reasoning, &parsed_calls);
-        if (!parsed_ok) {
-            free(parsed_content);
-            free(parsed_reasoning);
-            parsed_content = xstrdup(text.ptr ? text.ptr : "");
-            parsed_reasoning = NULL;
-            tool_calls_free(&parsed_calls);
-            if (j->req.has_tools && saw_tool_start && strcmp(final_finish, "error") != 0) {
-                final_finish = "error";
-                snprintf(err, sizeof(err), "invalid tool call");
-            }
+        bool parsed_ok = parse_generated_message_for_response(
+            text.ptr ? text.ptr : "",
+            j->req.has_tools,
+            saw_tool_start,
+            &final_finish,
+            err,
+            sizeof(err),
+            &parsed_content,
+            &parsed_reasoning,
+            &parsed_calls,
+            &recovered_tool_parse_failure);
+        if (!parsed_ok && recovered_tool_parse_failure) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s invalid tool call returned as assistant text finish=%s",
+                       ctx_span,
+                       final_finish);
+            trace_event(s, trace_id,
+                        "invalid tool call returned as assistant text finish=%s",
+                        final_finish);
         }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
@@ -12899,6 +12952,42 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     tool_calls_free(&calls);
 }
 
+static void test_tool_parse_failure_returns_recoverable_finish(void) {
+    const char *generated =
+        "trying a tool\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START ">\n"
+        DS4_TOOL_CALLS_END;
+
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *finish = "tool_calls";
+    bool recovered = false;
+
+    TEST_ASSERT(!parse_generated_message_for_response(generated,
+                                                       true,
+                                                       true,
+                                                       &finish,
+                                                       err,
+                                                       sizeof(err),
+                                                       &content,
+                                                       &reasoning,
+                                                       &calls,
+                                                       &recovered));
+    TEST_ASSERT(recovered);
+    TEST_ASSERT(!strcmp(finish, "stop"));
+    TEST_ASSERT(!strcmp(err, "invalid tool call"));
+    TEST_ASSERT(content && strstr(content, DS4_TOOL_CALLS_START) != NULL);
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 0);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
@@ -14124,6 +14213,7 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
+    test_tool_parse_failure_returns_recoverable_finish();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();

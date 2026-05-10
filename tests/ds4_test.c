@@ -558,6 +558,526 @@ static void test_tool_call_quality(void) {
     test_close_engine(true);
 }
 
+static void test_compare_session_batch_top_with_tolerance(const char *label, ds4_session *session,
+                                                          ds4_batch *batch, int slot,
+                                                          float logit_tolerance,
+                                                          float logprob_tolerance,
+                                                          int id_checked,
+                                                          int score_checked) {
+    uint64_t rng = 1234;
+    const int session_token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+    rng = 1234;
+    const int batch_token = ds4_batch_sample(batch, slot, 0.0f, 0, 1.0f, 0.0f, &rng);
+    if (session_token != batch_token) {
+        fprintf(stderr, "ds4-test: %s argmax mismatch session=%d batch=%d slot=%d\n",
+                label, session_token, batch_token, slot);
+        TEST_ASSERT(false);
+    }
+
+    ds4_token_score session_scores[12];
+    ds4_token_score batch_scores[12];
+    const int ns = ds4_session_top_logprobs(session, session_scores, 12);
+    const int nb = ds4_batch_top_logprobs(batch, slot, batch_scores, 12);
+    TEST_ASSERT(ns == nb);
+    const int n = ns < nb ? ns : nb;
+    TEST_ASSERT(n >= 8);
+    for (int i = 0; i < n && i < 8; i++) {
+        if (i >= id_checked && i >= score_checked) continue;
+        if (session_scores[i].id != batch_scores[i].id) {
+            fprintf(stderr,
+                    "ds4-test: %s top[%d] id mismatch sid=%d bid=%d slogit=%g blogit=%g slp=%g blp=%g\n",
+                    label, i,
+                    session_scores[i].id, batch_scores[i].id,
+                    session_scores[i].logit, batch_scores[i].logit,
+                    session_scores[i].logprob, batch_scores[i].logprob);
+            TEST_ASSERT(false);
+            return;
+        }
+        if (i < score_checked &&
+            (fabsf(session_scores[i].logit - batch_scores[i].logit) > logit_tolerance ||
+             fabsf(session_scores[i].logprob - batch_scores[i].logprob) > logprob_tolerance))
+        {
+            fprintf(stderr,
+                    "ds4-test: %s top[%d] score mismatch sid=%d bid=%d slogit=%g blogit=%g slp=%g blp=%g\n",
+                    label, i,
+                    session_scores[i].id, batch_scores[i].id,
+                    session_scores[i].logit, batch_scores[i].logit,
+                    session_scores[i].logprob, batch_scores[i].logprob);
+            TEST_ASSERT(false);
+            return;
+        }
+    }
+}
+
+static void test_compare_session_batch_top(const char *label, ds4_session *session,
+                                           ds4_batch *batch, int slot) {
+    test_compare_session_batch_top_with_tolerance(label, session, batch, slot, 1e-3f, 1e-3f, 8, 8);
+}
+
+static void test_encode_chat_prompt_min_tokens(ds4_engine *engine, const char *seed,
+                                               int min_tokens, ds4_tokens *out) {
+    buf user = {0};
+    for (int i = 0; i < 512 && out->len < min_tokens; i++) {
+        buf_printf(&user,
+                   "%s boundary sample %d: cache slots must keep raw, compressed, and indexer state isolated.\n",
+                   seed,
+                   i);
+        ds4_tokens_free(out);
+        ds4_encode_chat_prompt(engine, "", user.ptr ? user.ptr : seed,
+                               DS4_THINK_NONE, out);
+    }
+    TEST_ASSERT(out->len >= min_tokens);
+    buf_free(&user);
+}
+
+static FILE *test_save_session_payload(ds4_session *session, uint64_t *payload_bytes) {
+    char err[160];
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return NULL;
+    *payload_bytes = ds4_session_payload_bytes(session);
+    TEST_ASSERT(*payload_bytes > 0);
+    TEST_ASSERT(ds4_session_save_payload(session, fp, err, sizeof(err)) == 0);
+    rewind(fp);
+    return fp;
+}
+
+static void test_batch_shared_one_row_equivalence(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, "", "Write one terse sentence about slot-local KV state.",
+                           DS4_THINK_NONE, &prompt);
+
+    char err[160];
+    ds4_session *session = NULL;
+    ds4_batch *batch = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 4096) == 0);
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 3, "shared-decode") == 0);
+    if (!session || !batch) goto done;
+
+    ds4_batch_claim_slot(batch, 2);
+    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 2, &prompt, err, sizeof(err)) == 0);
+    test_compare_session_batch_top("shared slot2 prefill", session, batch, 2);
+
+    for (int i = 0; i < 4; i++) {
+        uint64_t rng = 99;
+        const int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        ds4_batch_step step = { .slot = 2, .token = token };
+        TEST_ASSERT(ds4_session_eval(session, token, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_batch_eval(batch, &step, 1, err, sizeof(err)) == 0);
+        test_compare_session_batch_top("shared slot2 decode", session, batch, 2);
+    }
+
+done:
+    ds4_batch_free(batch);
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+}
+
+static void test_batch_shared_long_boundary_isolation(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt_a = {0};
+    ds4_tokens prompt_b = {0};
+    test_encode_chat_prompt_min_tokens(engine, "Long slot A", 150, &prompt_a);
+    ds4_encode_chat_prompt(engine, "", "Short slot B: answer with one compact color list.",
+                           DS4_THINK_NONE, &prompt_b);
+
+    char err[160];
+    ds4_session *session_a = NULL;
+    ds4_session *session_b = NULL;
+    ds4_batch *batch = NULL;
+    TEST_ASSERT(ds4_session_create(&session_a, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_create(&session_b, engine, 4096) == 0);
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 3, "shared-decode") == 0);
+    if (!session_a || !session_b || !batch) goto done;
+
+    ds4_batch_claim_slot(batch, 2);
+    ds4_batch_claim_slot(batch, 0);
+    TEST_ASSERT(ds4_session_sync(session_a, &prompt_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(session_b, &prompt_b, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 2, &prompt_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 0, &prompt_b, err, sizeof(err)) == 0);
+    test_compare_session_batch_top("long boundary slot2 prefill", session_a, batch, 2);
+
+    for (int i = 0; i < 3; i++) {
+        uint64_t rng = 901;
+        const int token_a = ds4_session_sample(session_a, 0.0f, 0, 1.0f, 0.0f, &rng);
+        rng = 902;
+        const int token_b = ds4_session_sample(session_b, 0.0f, 0, 1.0f, 0.0f, &rng);
+        ds4_batch_step steps[2];
+        if ((i & 1) == 0) {
+            steps[0] = (ds4_batch_step){ .slot = 0, .token = token_b };
+            steps[1] = (ds4_batch_step){ .slot = 2, .token = token_a };
+        } else {
+            steps[0] = (ds4_batch_step){ .slot = 2, .token = token_a };
+            steps[1] = (ds4_batch_step){ .slot = 0, .token = token_b };
+        }
+        TEST_ASSERT(ds4_session_eval(session_a, token_a, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_eval(session_b, token_b, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_batch_eval(batch, steps, 2, err, sizeof(err)) == 0);
+        test_compare_session_batch_top_with_tolerance("long boundary slot2 decode",
+                                                      session_a, batch, 2,
+                                                      5e-1f, 2e-1f, 1, 1);
+        test_compare_session_batch_top_with_tolerance("long boundary slot0 decode",
+                                                      session_b, batch, 0,
+                                                      5e-1f, 2e-1f, 1, 1);
+    }
+
+done:
+    ds4_batch_free(batch);
+    ds4_session_free(session_b);
+    ds4_session_free(session_a);
+    ds4_tokens_free(&prompt_b);
+    ds4_tokens_free(&prompt_a);
+}
+
+static void test_batch_shared_slot_isolation(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt_a = {0};
+    ds4_tokens prompt_b = {0};
+    ds4_encode_chat_prompt(engine, "", "Give a compact definition of cache isolation.",
+                           DS4_THINK_NONE, &prompt_a);
+    ds4_encode_chat_prompt(engine, "", "Name three colors, comma separated.",
+                           DS4_THINK_NONE, &prompt_b);
+
+    char err[160];
+    ds4_session *session_a = NULL;
+    ds4_batch *batch = NULL;
+    TEST_ASSERT(ds4_session_create(&session_a, engine, 4096) == 0);
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 3, "shared-decode") == 0);
+    if (!session_a || !batch) goto done;
+
+    ds4_batch_claim_slot(batch, 0);
+    ds4_batch_claim_slot(batch, 2);
+    TEST_ASSERT(ds4_session_sync(session_a, &prompt_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 2, &prompt_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 0, &prompt_b, err, sizeof(err)) == 0);
+    test_compare_session_batch_top("shared isolation prefill", session_a, batch, 2);
+
+    for (int i = 0; i < 4; i++) {
+        uint64_t rng = 77;
+        const int token_a = ds4_session_sample(session_a, 0.0f, 0, 1.0f, 0.0f, &rng);
+        rng = 88;
+        const int token_b = ds4_batch_sample(batch, 0, 0.0f, 0, 1.0f, 0.0f, &rng);
+        ds4_batch_step steps[2];
+        if ((i & 1) == 0) {
+            steps[0] = (ds4_batch_step){ .slot = 2, .token = token_a };
+            steps[1] = (ds4_batch_step){ .slot = 0, .token = token_b };
+        } else {
+            steps[0] = (ds4_batch_step){ .slot = 0, .token = token_b };
+            steps[1] = (ds4_batch_step){ .slot = 2, .token = token_a };
+        }
+        TEST_ASSERT(ds4_session_eval(session_a, token_a, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_batch_eval(batch, steps, 2, err, sizeof(err)) == 0);
+        /*
+         * With two active decode rows the batched q8 kernels take a different
+         * accumulation path from the single-session matvec path.  The slot
+         * isolation invariant is same top choices with bounded score drift; the
+         * one-row shared-decode test above keeps strict logits equivalence.
+         */
+        test_compare_session_batch_top_with_tolerance("shared isolation decode",
+                                                      session_a,
+                                                      batch,
+                                                      2,
+                                                      5e-1f,
+                                                      2e-1f,
+                                                      1,
+                                                      1);
+    }
+
+done:
+    ds4_batch_free(batch);
+    ds4_session_free(session_a);
+    ds4_tokens_free(&prompt_a);
+    ds4_tokens_free(&prompt_b);
+}
+
+static void test_batch_shared_payload_roundtrip(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, "", "Explain disk KV cache reuse in five words.",
+                           DS4_THINK_NONE, &prompt);
+
+    char err[160];
+    ds4_session *source = NULL;
+    ds4_session *restored = NULL;
+    ds4_batch *batch = NULL;
+    FILE *fp1 = NULL;
+    FILE *fp2 = NULL;
+
+    TEST_ASSERT(ds4_session_create(&source, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_create(&restored, engine, 4096) == 0);
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 2, "shared-decode") == 0);
+    if (!source || !restored || !batch) goto done;
+
+    ds4_batch_claim_slot(batch, 1);
+    TEST_ASSERT(ds4_session_sync(source, &prompt, err, sizeof(err)) == 0);
+
+    fp1 = tmpfile();
+    TEST_ASSERT(fp1 != NULL);
+    if (!fp1) goto done;
+    const uint64_t session_payload_bytes = ds4_session_payload_bytes(source);
+    TEST_ASSERT(session_payload_bytes > 0);
+    TEST_ASSERT(ds4_session_save_payload(source, fp1, err, sizeof(err)) == 0);
+    rewind(fp1);
+    TEST_ASSERT(ds4_batch_load_slot_payload(batch, 1, fp1, session_payload_bytes,
+                                            err, sizeof(err)) == 0);
+    test_compare_session_batch_top("serialized-to-shared payload", source, batch, 1);
+
+    fp2 = tmpfile();
+    TEST_ASSERT(fp2 != NULL);
+    if (!fp2) goto done;
+    const uint64_t batch_payload_bytes = ds4_batch_slot_payload_bytes(batch, 1);
+    TEST_ASSERT(batch_payload_bytes == session_payload_bytes);
+    TEST_ASSERT(ds4_batch_save_slot_payload(batch, 1, fp2, err, sizeof(err)) == 0);
+    rewind(fp2);
+    TEST_ASSERT(ds4_session_load_payload(restored, fp2, batch_payload_bytes,
+                                         err, sizeof(err)) == 0);
+    test_compare_session_batch_top("shared-to-serialized payload", restored, batch, 1);
+
+    ds4_batch_invalidate_slot(batch, 1);
+    TEST_ASSERT(!ds4_batch_slot_can_save(batch, 1));
+    TEST_ASSERT(ds4_batch_sample(batch, 1, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){0}) < 0);
+
+done:
+    if (fp1) fclose(fp1);
+    if (fp2) fclose(fp2);
+    ds4_batch_free(batch);
+    ds4_session_free(restored);
+    ds4_session_free(source);
+    ds4_tokens_free(&prompt);
+}
+
+static void test_batch_shared_top_path_payload_guard(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, "", "Return one word about top-only decode.",
+                           DS4_THINK_NONE, &prompt);
+
+    char err[160];
+    ds4_batch *batch = NULL;
+    FILE *fp = NULL;
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 2, "shared-decode") == 0);
+    if (!batch) goto done;
+
+    ds4_batch_claim_slot(batch, 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 0, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_slot_can_save(batch, 0));
+
+    uint64_t rng = 111;
+    const int token = ds4_batch_sample(batch, 0, 0.0f, 0, 1.0f, 0.0f, &rng);
+    TEST_ASSERT(token >= 0);
+    ds4_batch_step step = { .slot = 0, .token = token };
+    int top_token = -1;
+    TEST_ASSERT(ds4_batch_eval_top(batch, &step, 1, &top_token, err, sizeof(err)) == 0);
+    TEST_ASSERT(top_token >= 0);
+    TEST_ASSERT(!ds4_batch_slot_logits_valid(batch, 0));
+    TEST_ASSERT(!ds4_batch_slot_payload_valid(batch, 0));
+    TEST_ASSERT(!ds4_batch_slot_can_save(batch, 0));
+    TEST_ASSERT(ds4_batch_slot_payload_bytes(batch, 0) == 0);
+    fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (fp) TEST_ASSERT(ds4_batch_save_slot_payload(batch, 0, fp, err, sizeof(err)) != 0);
+
+done:
+    if (fp) fclose(fp);
+    ds4_batch_free(batch);
+    ds4_tokens_free(&prompt);
+}
+
+static void test_batch_shared_same_payload_two_slots_diverge(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, "", "Continue with a short sentence about shared prefix loading.",
+                           DS4_THINK_NONE, &prompt);
+
+    char err[160];
+    ds4_session *source = NULL;
+    ds4_session *session_a = NULL;
+    ds4_session *session_b = NULL;
+    ds4_batch *batch = NULL;
+    FILE *fp = NULL;
+    uint64_t payload_bytes = 0;
+
+    TEST_ASSERT(ds4_session_create(&source, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_create(&session_a, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_create(&session_b, engine, 4096) == 0);
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 2, "shared-decode") == 0);
+    if (!source || !session_a || !session_b || !batch) goto done;
+
+    TEST_ASSERT(ds4_session_sync(source, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(session_a, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(session_b, &prompt, err, sizeof(err)) == 0);
+    fp = test_save_session_payload(source, &payload_bytes);
+    if (!fp) goto done;
+
+    ds4_batch_claim_slot(batch, 0);
+    ds4_batch_claim_slot(batch, 1);
+    TEST_ASSERT(ds4_batch_load_slot_payload(batch, 0, fp, payload_bytes,
+                                            err, sizeof(err)) == 0);
+    rewind(fp);
+    TEST_ASSERT(ds4_batch_load_slot_payload(batch, 1, fp, payload_bytes,
+                                            err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_common_prefix(batch, 0, &prompt) == prompt.len);
+    TEST_ASSERT(ds4_batch_common_prefix(batch, 1, &prompt) == prompt.len);
+
+    ds4_token_score scores[4];
+    const int n_scores = ds4_session_top_logprobs(source, scores, 4);
+    TEST_ASSERT(n_scores >= 2);
+    const int token_a = scores[0].id;
+    const int token_b = scores[1].id;
+    TEST_ASSERT(token_a != token_b);
+
+    TEST_ASSERT(ds4_session_eval(session_a, token_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(session_b, token_b, err, sizeof(err)) == 0);
+    ds4_batch_step steps[2] = {
+        { .slot = 1, .token = token_b },
+        { .slot = 0, .token = token_a },
+    };
+    TEST_ASSERT(ds4_batch_eval(batch, steps, 2, err, sizeof(err)) == 0);
+    test_compare_session_batch_top_with_tolerance("same payload slot0 diverged",
+                                                  session_a, batch, 0,
+                                                  5e-1f, 2e-1f, 1, 1);
+    test_compare_session_batch_top_with_tolerance("same payload slot1 diverged",
+                                                  session_b, batch, 1,
+                                                  5e-1f, 2e-1f, 1, 1);
+
+done:
+    if (fp) fclose(fp);
+    ds4_batch_free(batch);
+    ds4_session_free(session_b);
+    ds4_session_free(session_a);
+    ds4_session_free(source);
+    ds4_tokens_free(&prompt);
+}
+
+static void test_batch_shared_corrupt_payload_invalidates_only_target(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, "", "Explain corrupt cache isolation briefly.",
+                           DS4_THINK_NONE, &prompt);
+
+    char err[160];
+    ds4_session *source = NULL;
+    ds4_batch *batch = NULL;
+    FILE *fp = NULL;
+    FILE *bad = NULL;
+    uint64_t payload_bytes = 0;
+
+    TEST_ASSERT(ds4_session_create(&source, engine, 4096) == 0);
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 2, "shared-decode") == 0);
+    if (!source || !batch) goto done;
+
+    TEST_ASSERT(ds4_session_sync(source, &prompt, err, sizeof(err)) == 0);
+    fp = test_save_session_payload(source, &payload_bytes);
+    if (!fp) goto done;
+
+    ds4_batch_claim_slot(batch, 0);
+    ds4_batch_claim_slot(batch, 1);
+    TEST_ASSERT(ds4_batch_load_slot_payload(batch, 0, fp, payload_bytes,
+                                            err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_slot_can_save(batch, 0));
+
+    bad = tmpfile();
+    TEST_ASSERT(bad != NULL);
+    if (!bad) goto done;
+    const uint32_t junk = 0x12345678u;
+    TEST_ASSERT(fwrite(&junk, 1, sizeof(junk), bad) == sizeof(junk));
+    rewind(bad);
+    TEST_ASSERT(ds4_batch_load_slot_payload(batch, 1, bad, payload_bytes,
+                                            err, sizeof(err)) != 0);
+    TEST_ASSERT(!ds4_batch_slot_logits_valid(batch, 1));
+    TEST_ASSERT(!ds4_batch_slot_payload_valid(batch, 1));
+    TEST_ASSERT(!ds4_batch_slot_can_save(batch, 1));
+    TEST_ASSERT(ds4_batch_sample(batch, 1, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){1}) < 0);
+    TEST_ASSERT(ds4_batch_slot_can_save(batch, 0));
+    test_compare_session_batch_top("corrupt load preserved slot0", source, batch, 0);
+
+done:
+    if (bad) fclose(bad);
+    if (fp) fclose(fp);
+    ds4_batch_free(batch);
+    ds4_session_free(source);
+    ds4_tokens_free(&prompt);
+}
+
+static void test_batch_shared_reset_reuse_after_payload_load(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_tokens prompt_a = {0};
+    ds4_tokens prompt_b = {0};
+    ds4_encode_chat_prompt(engine, "", "Persist this prefix, then replace it.",
+                           DS4_THINK_NONE, &prompt_a);
+    ds4_encode_chat_prompt(engine, "", "Use an unrelated reused slot safely.",
+                           DS4_THINK_NONE, &prompt_b);
+
+    char err[160];
+    ds4_session *source_a = NULL;
+    ds4_session *baseline_b = NULL;
+    ds4_batch *batch = NULL;
+    FILE *fp = NULL;
+    uint64_t payload_bytes = 0;
+
+    TEST_ASSERT(ds4_session_create(&source_a, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_create(&baseline_b, engine, 4096) == 0);
+    TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 2, "shared-decode") == 0);
+    if (!source_a || !baseline_b || !batch) goto done;
+
+    TEST_ASSERT(ds4_session_sync(source_a, &prompt_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(baseline_b, &prompt_b, err, sizeof(err)) == 0);
+    fp = test_save_session_payload(source_a, &payload_bytes);
+    if (!fp) goto done;
+
+    ds4_batch_claim_slot(batch, 1);
+    const uint64_t gen_a = ds4_batch_slot_generation(batch, 1);
+    TEST_ASSERT(ds4_batch_load_slot_payload(batch, 1, fp, payload_bytes,
+                                            err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_common_prefix(batch, 1, &prompt_a) == prompt_a.len);
+
+    ds4_batch_release_slot(batch, 1);
+    ds4_batch_claim_slot(batch, 1);
+    const uint64_t gen_b = ds4_batch_slot_generation(batch, 1);
+    TEST_ASSERT(gen_b != gen_a);
+    TEST_ASSERT(ds4_batch_sync(batch, 1, &prompt_b, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_common_prefix(batch, 1, &prompt_a) < prompt_a.len);
+    test_compare_session_batch_top("payload slot reset reuse", baseline_b, batch, 1);
+
+done:
+    if (fp) fclose(fp);
+    ds4_batch_free(batch);
+    ds4_session_free(baseline_b);
+    ds4_session_free(source_a);
+    ds4_tokens_free(&prompt_b);
+    ds4_tokens_free(&prompt_a);
+}
+
+static void test_batch_shared_correctness(void) {
+    test_batch_shared_one_row_equivalence();
+    test_batch_shared_slot_isolation();
+    test_batch_shared_long_boundary_isolation();
+    test_batch_shared_payload_roundtrip();
+    test_batch_shared_top_path_payload_guard();
+    test_batch_shared_same_payload_two_slots_diverge();
+    test_batch_shared_corrupt_payload_invalidates_only_target();
+    test_batch_shared_reset_reuse_after_payload_load();
+}
+
 #endif
 
 static void test_server_unit_group(void) {
@@ -578,6 +1098,7 @@ static const ds4_test_entry test_entries[] = {
     {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
+    {"--batch-correctness", "batch-correctness", "shared-decode slot isolation and disk KV equivalence", test_batch_shared_correctness},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},

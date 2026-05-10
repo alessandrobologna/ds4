@@ -138,14 +138,35 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
-so stateless clients that resend a longer version of the same prompt can reuse
-the shared prefix instead of pre-filling from token zero.
+The server is Metal-only. By default it keeps one mutable graph/KV checkpoint
+in memory, so stateless clients that resend a longer version of the same prompt
+can reuse the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
-serialized through one Metal worker. The current server does not batch multiple
-independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+serialized through one Metal worker unless the multi-slot scheduler is enabled.
+Start with `--max-slots N` to admit up to `N` independent live inference slots:
+
+```sh
+./ds4-server --ctx 100000 --max-slots 4 --batch-wait-us 500
+```
+
+The default `--max-slots > 1` backend is `shared-decode`: it uses a batch-owned
+Metal graph with slot-indexed KV/frontier storage, layer-major decode work
+across active slots, and batched dense/output-head work. `--batch-backend
+session-slots` remains available as the conservative reference fallback with
+independent session/KV slots behind the same scheduler. Both modes keep the same
+logical per-slot payload format as serialized mode so disk KV files remain
+reusable across serialized, `session-slots`, and `shared-decode` runs.
+
+MTP drafting is rejected with `--max-slots > 1`. Disk KV checkpoints remain
+supported and keep the same content-addressed token-prefix files used by
+serialized mode. `session-slots` memory use scales with full per-slot session
+graphs; `shared-decode` shares layer work tensors while persistent KV/frontier
+storage still scales with the number of slots. Prompt prefill is advanced in
+bounded chunks; generation then interleaves one sampled token per decode-ready slot.
+Deterministic non-thinking requests use a top-token decode path that avoids host
+readback of the full vocabulary row after every generated token; slots that have
+only this top-token state are not written to disk until full logits are refreshed.
 
 Supported endpoints:
 
@@ -385,11 +406,12 @@ token stream with cached token prefixes. The live in-memory checkpoint covers
 the current session; the disk KV cache makes useful prefixes survive session
 switches and server restarts.
 
-For RAM reasons there is currently only one live KV cache in memory. When a new
-unrelated session replaces it, the old checkpoint can only be resumed without
+In serialized mode there is one live KV cache in memory. When a new unrelated
+session replaces it, the old checkpoint can only be resumed without
 re-processing if it was written to the disk KV cache. In other words, memory
 cache handles the active session; disk cache is the resume mechanism for
-different sessions.
+different sessions. Batch mode keeps multiple isolated live slots and can load
+or save the same content-addressed prefix files into any idle slot.
 
 Enable it with:
 
@@ -553,6 +575,23 @@ make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+
+Model-backed batch checks use `DS4_TEST_MODEL`:
+
+```sh
+DS4_TEST_MODEL=/path/to/ds4flash.gguf ./ds4_test --batch-correctness
+DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batch-smoke
+DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batch-benchmark
+DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 1,2,4,8
+```
+
+`server-batch-smoke` starts `ds4-server --max-slots 2 --kv-disk-dir ...` for
+both `session-slots` and `shared-decode`, warms a disk KV prefix, sends two
+concurrent streaming requests, and fails if the logs do not show disk KV hits
+plus a decode batch of two. The benchmark prints three-trial median aggregate
+completion tokens/sec for serialized, `session-slots`, and `shared-decode`
+backends with one, two, four, and eight clients. The same harness can run a
+prefill-heavy workload and reports prompt tokens/sec for that mode.
 
 ## Debugging Notes
 

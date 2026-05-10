@@ -18,7 +18,9 @@ NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all clean test
+DS4_TEST_MODEL ?= ds4flash.gguf
+
+.PHONY: all clean test server-batch-smoke server-batch-benchmark
 
 all: ds4 ds4-server
 
@@ -74,6 +76,13 @@ ds4_test: ds4_test.o rax.o $(CORE_OBJS)
 
 test: ds4_test
 	./ds4_test
+
+server-batch-smoke: ds4-server
+	python3 tests/server_batch_smoke.py smoke --server ./ds4-server --model "$(DS4_TEST_MODEL)" --backend session-slots
+	python3 tests/server_batch_smoke.py smoke --server ./ds4-server --model "$(DS4_TEST_MODEL)" --backend shared-decode
+
+server-batch-benchmark: ds4-server
+	python3 tests/server_batch_smoke.py benchmark --server ./ds4-server --model "$(DS4_TEST_MODEL)"
 
 clean:
 	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test *.o

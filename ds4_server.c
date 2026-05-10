@@ -4,11 +4,11 @@
 /* OpenAI/Anthropic compatible local server.
  *
  * HTTP is intentionally simple: each client connection is handled by a small
- * blocking thread that parses one request, then queues a job to the single
- * Metal worker.  The worker owns the ds4_session and therefore owns all live KV
- * cache state.  That keeps session reuse, disk checkpointing, and future
- * batching decisions in one place instead of spreading graph mutations across
- * client threads. */
+ * blocking thread that parses one request, then queues a job to the Metal
+ * worker.  The worker owns either the serialized ds4_session or the multi-slot
+ * ds4_batch runtime and therefore owns all live KV cache state.  That keeps
+ * session reuse, disk checkpointing, and batching decisions in one place
+ * instead of spreading graph mutations across client threads. */
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -64,6 +64,12 @@ static void die(const char *msg) {
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
+    if (!p) die("out of memory");
+    return p;
+}
+
+static void *xcalloc(size_t n, size_t sz) {
+    void *p = calloc(n ? n : 1, sz ? sz : 1);
     if (!p) die("out of memory");
     return p;
 }
@@ -5965,6 +5971,9 @@ typedef struct {
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    ds4_batch *batch;
+    int max_slots;
+    int batch_wait_us;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -5982,6 +5991,12 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static int server_ctx(const server *s) {
+    if (!s) return 0;
+    if (s->batch) return ds4_batch_ctx(s->batch);
+    return ds4_session_ctx(s->session);
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -7116,8 +7131,63 @@ static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *t
     (void)ok;
 }
 
-static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
-                                       int store_len, const char *reason) {
+typedef struct {
+    ds4_session *session;
+    ds4_batch *batch;
+    int slot;
+} kv_live_state;
+
+static kv_live_state kv_live_session(ds4_session *session) {
+    return (kv_live_state){ .session = session, .slot = -1 };
+}
+
+static kv_live_state kv_live_batch_slot(ds4_batch *batch, int slot) {
+    return (kv_live_state){ .batch = batch, .slot = slot };
+}
+
+static int kv_live_ctx(kv_live_state live) {
+    return live.batch ? ds4_batch_ctx(live.batch) : ds4_session_ctx(live.session);
+}
+
+static const ds4_tokens *kv_live_tokens(kv_live_state live) {
+    return live.batch ? ds4_batch_tokens(live.batch, live.slot) : ds4_session_tokens(live.session);
+}
+
+static uint64_t kv_live_payload_bytes(kv_live_state live) {
+    return live.batch ?
+        ds4_batch_slot_payload_bytes(live.batch, live.slot) :
+        ds4_session_payload_bytes(live.session);
+}
+
+static bool kv_live_can_save(kv_live_state live) {
+    return live.batch ? ds4_batch_slot_can_save(live.batch, live.slot) : live.session != NULL;
+}
+
+static uint64_t kv_live_generation(kv_live_state live) {
+    return live.batch ? ds4_batch_slot_generation(live.batch, live.slot) : 0;
+}
+
+static int kv_live_save_payload(kv_live_state live, FILE *fp, char *err, size_t errlen) {
+    return live.batch ?
+        ds4_batch_save_slot_payload(live.batch, live.slot, fp, err, errlen) :
+        ds4_session_save_payload(live.session, fp, err, errlen);
+}
+
+static int kv_live_load_payload(kv_live_state live, FILE *fp, uint64_t payload_bytes,
+                                char *err, size_t errlen) {
+    return live.batch ?
+        ds4_batch_load_slot_payload(live.batch, live.slot, fp, payload_bytes, err, errlen) :
+        ds4_session_load_payload(live.session, fp, payload_bytes, err, errlen);
+}
+
+static void kv_live_invalidate(kv_live_state live) {
+    if (live.batch) ds4_batch_invalidate_slot(live.batch, live.slot);
+    else ds4_session_invalidate(live.session);
+}
+
+static bool kv_cache_store_state_prefix(server *s, kv_live_state live,
+                                        const ds4_tokens *tokens,
+                                        int store_len, const char *reason) {
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
@@ -7136,10 +7206,19 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         return false;
     }
     char err[160] = {0};
+    if (!kv_live_can_save(live)) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache skipped tokens=%d reason=%s because live checkpoint is not snapshot-safe",
+                   store_tokens.len,
+                   reason);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
     /* Disk cache persistence must observe the graph exactly as-is.  If callers
      * want a shorter prefix, they first prefill to that prefix and only then call
      * this function.  This keeps cache population from doing hidden inference. */
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *live_tokens = kv_live_tokens(live);
     if (!live_tokens ||
         live_tokens->len != store_tokens.len ||
         !ds4_tokens_starts_with(live_tokens, &store_tokens))
@@ -7154,7 +7233,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         return false;
     }
 
-    uint64_t payload_bytes = ds4_session_payload_bytes(s->session);
+    uint64_t payload_bytes = kv_live_payload_bytes(live);
     if (payload_bytes == 0) {
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -7171,7 +7250,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         return false;
     }
 
-    if (kv_cache_existing_compatible(kc, path, quant_bits, ds4_session_ctx(s->session))) {
+    if (kv_cache_existing_compatible(kc, path, quant_bits, kv_live_ctx(live))) {
         kv_cache_rewrite_tool_map(s, path, text);
         free(text);
         free(path);
@@ -7180,7 +7259,11 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     }
 
     buf tmpb = {0};
-    buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
+    buf_printf(&tmpb, "%s.tmp.%ld.%d.%llu",
+               path,
+               (long)getpid(),
+               live.batch ? live.slot : -1,
+               (unsigned long long)kv_live_generation(live));
     char *tmp = buf_take(&tmpb);
     const double save_t0 = now_sec();
     FILE *fp = fopen(tmp, "wb");
@@ -7198,7 +7281,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     uint8_t h[KV_CACHE_FIXED_HEADER];
     kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), 0,
                    (uint32_t)store_tokens.len, 0,
-                   (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
+                   (uint32_t)kv_live_ctx(live), now, now, payload_bytes);
     uint8_t tb[4];
     le_put32(tb, (uint32_t)text_len);
     uint64_t tool_map_bytes = 0;
@@ -7206,12 +7289,12 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_save_payload(s->session, fp, err, sizeof(err)) == 0 &&
+              kv_live_save_payload(live, fp, err, sizeof(err)) == 0 &&
               kv_tool_map_write(s, fp, text, &tool_map_bytes);
     if (ok && tool_map_bytes > 0) {
         kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), KV_EXT_TOOL_MAP,
                        (uint32_t)store_tokens.len, 0,
-                       (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
+                       (uint32_t)kv_live_ctx(live), now, now, payload_bytes);
         ok = fseeko(fp, 0, SEEK_SET) == 0 &&
              fwrite(h, 1, sizeof(h), fp) == sizeof(h);
     }
@@ -7247,6 +7330,18 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     free(path);
     ds4_tokens_free(&store_tokens);
     return ok;
+}
+
+static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
+                                       int store_len, const char *reason) {
+    return kv_cache_store_state_prefix(s, kv_live_session(s->session),
+                                       tokens, store_len, reason);
+}
+
+static bool kv_cache_store_batch_slot_prefix(server *s, int slot, const ds4_tokens *tokens,
+                                             int store_len, const char *reason) {
+    return kv_cache_store_state_prefix(s, kv_live_batch_slot(s->batch, slot),
+                                       tokens, store_len, reason);
 }
 
 static void kv_cache_store_current(server *s, const char *reason) {
@@ -7288,13 +7383,15 @@ static int kv_cache_find_prefix(kv_disk_cache *kc, const ds4_tokens *prompt, int
     return best;
 }
 
-static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **loaded_path_out) {
+static int kv_cache_try_load_tokens_state(server *s, kv_live_state live,
+                                          const ds4_tokens *prompt,
+                                          char **loaded_path_out) {
     if (loaded_path_out) *loaded_path_out = NULL;
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
     if (quant_bits != 2 && quant_bits != 4) return 0;
-    int idx = kv_cache_find_prefix(kc, prompt, quant_bits, ds4_session_ctx(s->session));
+    int idx = kv_cache_find_prefix(kc, prompt, quant_bits, kv_live_ctx(live));
     if (idx < 0) return 0;
 
     kv_entry e = kc->entry[idx];
@@ -7311,20 +7408,20 @@ static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **
     if (header_ok && fseeko(fp, (off_t)text_bytes, SEEK_CUR) != 0) header_ok = false;
     char err[160] = {0};
     int loaded = 0;
-    if (header_ok && ds4_session_load_payload(s->session, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
-        const ds4_tokens *loaded_tokens = ds4_session_tokens(s->session);
+    if (header_ok && kv_live_load_payload(live, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
+        const ds4_tokens *loaded_tokens = kv_live_tokens(live);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens &&
             ds4_tokens_starts_with(prompt, loaded_tokens))
         {
             loaded = (int)hdr.tokens;
             if (hdr.ext_flags & KV_EXT_TOOL_MAP) kv_tool_map_load_from_pos(s, fp, NULL);
         } else {
-            ds4_session_invalidate(s->session);
+            kv_live_invalidate(live);
             unlink(path);
             server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt token prefix %s", path);
         }
     } else {
-        ds4_session_invalidate(s->session);
+        kv_live_invalidate(live);
         server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache load failed %s: %s load=%.1f ms",
                    path,
                    header_ok ? err : "invalid header",
@@ -7352,8 +7449,22 @@ static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **
     return loaded;
 }
 
+static int kv_cache_try_load_state(server *s, kv_live_state live,
+                                   const request *req, char **loaded_path_out) {
+    return kv_cache_try_load_tokens_state(s, live, &req->prompt, loaded_path_out);
+}
+
+static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **loaded_path_out) {
+    return kv_cache_try_load_tokens_state(s, kv_live_session(s->session), prompt, loaded_path_out);
+}
+
 static int kv_cache_try_load(server *s, const request *req, char **loaded_path_out) {
-    return kv_cache_try_load_tokens(s, &req->prompt, loaded_path_out);
+    return kv_cache_try_load_state(s, kv_live_session(s->session), req, loaded_path_out);
+}
+
+static int kv_cache_try_load_batch_slot(server *s, int slot, const request *req,
+                                        char **loaded_path_out) {
+    return kv_cache_try_load_state(s, kv_live_batch_slot(s->batch, slot), req, loaded_path_out);
 }
 
 /* =========================================================================
@@ -7662,6 +7773,7 @@ typedef struct {
     req_kind kind;
     int prompt_tokens;
     int cached_tokens;
+    int batch_slot;
     char ctx[48];
     bool has_tools;
     double t0;
@@ -7774,7 +7886,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double now = now_sec();
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+        if (p->srv && p->batch_slot < 0 && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
         return;
     }
     int display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
@@ -7806,7 +7918,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+    if (p->srv && p->batch_slot < 0 && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -7956,6 +8068,7 @@ static void generate_job(server *s, job *j) {
         .kind = j->req.kind,
         .prompt_tokens = j->req.prompt.len,
         .cached_tokens = cached,
+        .batch_slot = -1,
         .has_tools = j->req.has_tools,
         .t0 = t0,
     };
@@ -8461,6 +8574,520 @@ static void generate_job(server *s, job *j) {
     buf_free(&text);
 }
 
+typedef enum {
+    BATCH_REQ_EMPTY = 0,
+    BATCH_REQ_PREFILL,
+    BATCH_REQ_DECODE,
+    BATCH_REQ_DONE,
+} batch_req_phase;
+
+typedef struct {
+    server *srv;
+    job *j;
+    int slot;
+    uint64_t slot_generation;
+    int cached;
+    int prefill_pos;
+    int cold_store_len;
+    int continued_last_store_tokens;
+    uint64_t trace_id;
+    char ctx_span[48];
+    char req_flags[64];
+    char id[96];
+    char err[160];
+    const char *finish;
+    double t0;
+    double decode_t0;
+    double last_decode_log_t;
+    int last_decode_log_completion;
+    int completion;
+    int max_tokens;
+    size_t plain_stream_pos;
+    size_t stop_scan_from;
+    bool structured_stream;
+    bool openai_live_chat;
+    bool response_started;
+    anthropic_stream anthropic_live;
+    openai_stream openai_live;
+    responses_stream responses_live;
+    buf text;
+    bool saw_tool_start;
+    bool saw_tool_end;
+    bool saw_orphan_tool_end;
+    size_t tool_scan_from;
+    int next_tool_progress;
+    int next_decode_log;
+    uint64_t rng;
+    thinking_state thinking;
+    bool greedy_top_path;
+    bool next_token_valid;
+    int next_token;
+} generation_state;
+
+typedef struct {
+    batch_req_phase phase;
+    generation_state gen;
+} batch_request;
+
+static int batch_prefill_chunk_tokens(void) {
+    const char *env = getenv("DS4_BATCH_PREFILL_CHUNK_TOKENS");
+    if (env && env[0]) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0 && v <= INT_MAX) return (int)v;
+    }
+    return 2048;
+}
+
+static void signal_job_done(job *j) {
+    pthread_mutex_lock(&j->mu);
+    j->done = true;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+static void generation_state_begin(server *s, generation_state *g, job *j, int slot,
+                                   int cached, const char *cache_source,
+                                   int disk_cached, const char *disk_path) {
+    memset(g, 0, sizeof(*g));
+    ds4_batch_claim_slot(s->batch, slot);
+    g->srv = s;
+    g->j = j;
+    g->slot = slot;
+    g->slot_generation = ds4_batch_slot_generation(s->batch, slot);
+    g->cached = cached;
+    g->prefill_pos = cached;
+    g->continued_last_store_tokens = cached;
+    g->finish = "length";
+    g->t0 = now_sec();
+    g->err[0] = '\0';
+    request_ctx_span(g->ctx_span, sizeof(g->ctx_span), cached, j->req.prompt.len);
+    log_flags(g->req_flags, sizeof(g->req_flags), j->req.has_tools, false, false, false);
+
+    trace_cache_diag cache_diag = {0};
+    if (s->trace) {
+        const ds4_tokens *live = ds4_batch_tokens(s->batch, slot);
+        trace_cache_capture(&cache_diag, live, &j->req.prompt,
+                            live ? live->len : 0, cached);
+    }
+    g->trace_id = trace_begin(s, j, cached, &cache_diag,
+                              cache_source ? cache_source : (cached > 0 ? "slot" : "none"),
+                              disk_cached, disk_path);
+    if (cached == 0 &&
+        s->kv.enabled &&
+        j->req.prompt.len >= s->kv.opt.min_tokens &&
+        s->kv.opt.cold_max_tokens > 0 &&
+        j->req.prompt.len <= s->kv.opt.cold_max_tokens)
+    {
+        g->cold_store_len = kv_cache_store_len(&s->kv, j->req.prompt.len);
+    }
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: batch slot=%d %s ctx=%s%s%s prompt start",
+               slot,
+               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               g->ctx_span,
+               g->req_flags[0] ? " " : "",
+               g->req_flags);
+}
+
+static bool generation_state_slot_current(const generation_state *g) {
+    if (!g || !g->srv || !g->srv->batch || g->slot < 0) return false;
+    return ds4_batch_slot_occupied(g->srv->batch, g->slot) &&
+           ds4_batch_slot_generation(g->srv->batch, g->slot) == g->slot_generation;
+}
+
+static bool generation_state_require_slot_current(generation_state *g, const char *where) {
+    if (generation_state_slot_current(g)) return true;
+    if (g) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "stale batch slot generation");
+        if (g->srv) trace_event(g->srv, g->trace_id, "stale batch slot rejected during %s", where);
+    }
+    return false;
+}
+
+static bool generation_state_start_decode(generation_state *g) {
+    server *s = g->srv;
+    job *j = g->j;
+    if (!generation_state_require_slot_current(g, "start-decode")) return false;
+    ds4_batch_set_progress(s->batch, g->slot, NULL, NULL);
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: batch slot=%d %s ctx=%s%s%s prompt done %.3fs",
+               g->slot,
+               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               g->ctx_span,
+               g->req_flags[0] ? " " : "",
+               g->req_flags,
+               now_sec() - g->t0);
+
+    snprintf(g->id, sizeof(g->id), "%s-%llu",
+             j->req.api == API_RESPONSES ? "resp" :
+             (j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl"),
+             (unsigned long long)++s->seq);
+
+    g->structured_stream = request_uses_structured_stream(&j->req);
+    g->openai_live_chat = request_uses_openai_live_stream(&j->req);
+    if (j->req.stream) {
+        if (!sse_headers(j->fd)) {
+            snprintf(g->err, sizeof(g->err), "client stream write failed");
+            g->finish = "error";
+            return false;
+        }
+        if (j->req.api == API_RESPONSES &&
+            !responses_sse_start_live(j->fd, &j->req, g->id, &g->responses_live)) {
+            snprintf(g->err, sizeof(g->err), "client stream write failed");
+            g->finish = "error";
+            return false;
+        }
+        if (j->req.api == API_ANTHROPIC &&
+            !anthropic_sse_start_live(j->fd, &j->req, g->id,
+                                      j->req.prompt.len, &g->anthropic_live)) {
+            snprintf(g->err, sizeof(g->err), "client stream write failed");
+            g->finish = "error";
+            return false;
+        }
+        if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
+            !sse_chunk(j->fd, &j->req, g->id, NULL, NULL)) {
+            snprintf(g->err, sizeof(g->err), "client stream write failed");
+            g->finish = "error";
+            return false;
+        }
+        if (g->openai_live_chat) openai_stream_start(&j->req, &g->openai_live);
+    }
+    g->response_started = true;
+
+    g->max_tokens = j->req.max_tokens;
+    const int room = ds4_batch_ctx(s->batch) - ds4_batch_pos(s->batch, g->slot);
+    if (g->max_tokens < 0) g->max_tokens = 0;
+    if (g->max_tokens > room) g->max_tokens = room;
+    g->rng = j->req.seed ? j->req.seed :
+        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+    g->decode_t0 = now_sec();
+    g->last_decode_log_t = g->decode_t0;
+    g->next_decode_log = 50;
+    g->next_tool_progress = 128;
+    g->thinking = thinking_state_from_prompt(&j->req);
+    g->greedy_top_path = !j->req.has_tools &&
+                         !ds4_think_mode_enabled(j->req.think_mode) &&
+                         j->req.temperature <= 0.0f;
+    trace_event(s, g->trace_id, "batch prefill done; decode_max=%d ctx_room=%d slot=%d",
+                g->max_tokens, room, g->slot);
+    return true;
+}
+
+static void batch_kv_cache_note_store(generation_state *g, int tokens) {
+    if (tokens > g->continued_last_store_tokens) g->continued_last_store_tokens = tokens;
+}
+
+static void kv_cache_maybe_store_batch_continued(server *s, generation_state *g) {
+    kv_disk_cache *kc = &s->kv;
+    if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return;
+    if (!generation_state_slot_current(g)) return;
+    if (!ds4_batch_slot_can_save(s->batch, g->slot)) return;
+    const ds4_tokens *tokens = ds4_batch_tokens(s->batch, g->slot);
+    if (!tokens || tokens->len < kc->opt.min_tokens) return;
+    if (tokens->len - g->continued_last_store_tokens < kc->opt.continued_interval_tokens) return;
+    if (kv_cache_store_batch_slot_prefix(s, g->slot, tokens, tokens->len, "continued")) {
+        batch_kv_cache_note_store(g, tokens->len);
+    }
+}
+
+static bool generation_state_accept_token(generation_state *g, int token) {
+    server *s = g->srv;
+    job *j = g->j;
+    if (!generation_state_require_slot_current(g, "accept-token")) return false;
+    size_t piece_len = 0;
+    char *piece = ds4_token_text(s->engine, token, &piece_len);
+    g->completion++;
+
+    trace_piece(s, g->trace_id, piece, piece_len);
+    buf_append(&g->text, piece, piece_len);
+    thinking_state_feed(&g->thinking, piece, piece_len);
+
+    size_t stop_pos = 0, stop_len = 0;
+    bool hit_stop = stop_list_find_from(&j->req.stops, g->text.ptr,
+                                        g->stop_scan_from,
+                                        &stop_pos, &stop_len);
+    size_t stream_len = hit_stop ?
+        stop_pos : stop_list_stream_safe_len(&j->req.stops, g->text.len);
+    if (stream_len > g->text.len) stream_len = g->text.len;
+    stream_len = utf8_stream_safe_len(g->text.ptr, g->plain_stream_pos,
+                                      stream_len, hit_stop);
+    if (!hit_stop && j->req.stops.max_len > 1) {
+        const size_t hold = j->req.stops.max_len - 1;
+        g->stop_scan_from = g->text.len > hold ? g->text.len - hold : 0;
+    }
+
+    if (j->req.stream && !g->structured_stream && stream_len > g->plain_stream_pos) {
+        char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
+        bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
+        free(delta);
+        if (!ok) {
+            g->finish = "error";
+            snprintf(g->err, sizeof(g->err), "client stream write failed");
+            free(piece);
+            return false;
+        }
+        g->plain_stream_pos = stream_len;
+    }
+    if (j->req.stream && j->req.api == API_ANTHROPIC &&
+        !anthropic_sse_stream_update(j->fd, &j->req, g->id,
+                                     &g->anthropic_live, g->text.ptr, stream_len,
+                                     false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return false;
+    }
+    if (j->req.stream && j->req.api == API_RESPONSES &&
+        !responses_sse_stream_update(j->fd, s, &j->req, g->id,
+                                     &g->responses_live, g->text.ptr, stream_len,
+                                     false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return false;
+    }
+    if (g->openai_live_chat &&
+        !openai_sse_stream_update(j->fd, s, &j->req, g->id,
+                                  &g->openai_live, g->text.ptr, stream_len,
+                                  false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return false;
+    }
+    free(piece);
+
+    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+        const char *tool_scan = g->text.ptr ? g->text.ptr + g->tool_scan_from : "";
+        bool orphan_end = false;
+        bool old_start = g->saw_tool_start;
+        bool old_end = g->saw_tool_end;
+        observe_tool_markers(tool_scan, &g->saw_tool_start, &g->saw_tool_end, &orphan_end);
+        if (orphan_end && !g->saw_orphan_tool_end) {
+            g->saw_orphan_tool_end = true;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: batch slot=%d chat ctx=%s ignored orphan tool-call end marker after %d generated tokens",
+                       g->slot,
+                       g->ctx_span,
+                       g->completion);
+            trace_event(s, g->trace_id,
+                        "ignored orphan tool-call end marker after %d generated tokens",
+                        g->completion);
+        }
+        if (g->saw_tool_start && !old_start) {
+            trace_event(s, g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
+        }
+        if (g->saw_tool_end && !old_end) {
+            trace_event(s, g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
+        }
+        const size_t marker_hold = 80;
+        g->tool_scan_from = g->text.len > marker_hold ? g->text.len - marker_hold : 0;
+        if (s->trace && g->completion >= g->next_tool_progress) {
+            trace_event(s, g->trace_id,
+                        "progress gen=%d dsml_start=%d dsml_end=%d",
+                        g->completion, g->saw_tool_start ? 1 : 0, g->saw_tool_end ? 1 : 0);
+            g->next_tool_progress += 128;
+        }
+    }
+
+    if (g->completion >= g->next_decode_log) {
+        log_decode_progress(j->req.kind, g->ctx_span, g->completion,
+                            j->req.has_tools,
+                            g->thinking.inside,
+                            g->saw_tool_start,
+                            g->saw_tool_end,
+                            g->decode_t0,
+                            &g->last_decode_log_t,
+                            &g->last_decode_log_completion);
+        g->next_decode_log += 50;
+    }
+
+    if (hit_stop) {
+        (void)stop_len;
+        g->finish = "stop";
+        g->text.len = stop_pos;
+        g->text.ptr[g->text.len] = '\0';
+        ds4_batch_invalidate_slot(s->batch, g->slot);
+        return false;
+    }
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && g->saw_tool_end) {
+        g->finish = "tool_calls";
+        return false;
+    }
+    kv_cache_maybe_store_batch_continued(s, g);
+    return true;
+}
+
+static void generation_state_finish(generation_state *g) {
+    server *s = g->srv;
+    job *j = g->j;
+    if (!g->response_started) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: batch slot=%d %s ctx=%s finish=%s error=\"%s\" %.3fs",
+                   g->slot,
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   g->ctx_span,
+                   g->finish ? g->finish : "error",
+                   g->err,
+                   now_sec() - g->t0);
+        if (!strcmp(g->finish ? g->finish : "error", "error")) {
+            ds4_batch_mark_slot_error(s->batch, g->slot);
+        }
+        ds4_batch_release_slot(s->batch, g->slot);
+        buf_free(&g->text);
+        signal_job_done(j);
+        return;
+    }
+    if (g_stop_requested && strcmp(g->finish, "error") != 0) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "shutdown requested");
+    }
+    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+        g->saw_tool_start && !g->saw_tool_end && strcmp(g->finish, "error") != 0)
+    {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "unterminated tool call");
+    }
+    if (g->completion > g->last_decode_log_completion) {
+        log_decode_progress(j->req.kind, g->ctx_span, g->completion,
+                            j->req.has_tools,
+                            g->thinking.inside,
+                            g->saw_tool_start,
+                            g->saw_tool_end,
+                            g->decode_t0,
+                            &g->last_decode_log_t,
+                            &g->last_decode_log_completion);
+    }
+    if (j->req.stream && !g->structured_stream && g->text.len > g->plain_stream_pos) {
+        char *tail = xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
+        if (!sse_chunk(j->fd, &j->req, g->id, tail, NULL)) g->finish = "error";
+        free(tail);
+    }
+
+    tool_calls parsed_calls = {0};
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    const char *final_finish = g->finish;
+    if (j->req.kind == REQ_CHAT) {
+        bool parsed_ok = parse_generated_message(g->text.ptr ? g->text.ptr : "", &parsed_content,
+                                                 &parsed_reasoning, &parsed_calls);
+        if (!parsed_ok) {
+            free(parsed_content);
+            free(parsed_reasoning);
+            parsed_content = xstrdup(g->text.ptr ? g->text.ptr : "");
+            parsed_reasoning = NULL;
+            tool_calls_free(&parsed_calls);
+            if (j->req.has_tools && g->saw_tool_start && strcmp(final_finish, "error") != 0) {
+                final_finish = "error";
+                snprintf(g->err, sizeof(g->err), "invalid tool call");
+            }
+        }
+        if (parsed_calls.len) final_finish = "tool_calls";
+    }
+    log_tool_calls_summary(g->ctx_span, &parsed_calls);
+
+    trace_finish(s, g->trace_id, &j->req, final_finish, g->completion,
+                 g->saw_tool_start, g->saw_tool_end,
+                 parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
+                 parsed_reasoning, &parsed_calls, now_sec() - g->t0);
+
+    if (j->req.stream) {
+        bool response_ok = true;
+        if (j->req.api == API_RESPONSES) {
+            response_ok = responses_sse_finish_live(j->fd, s, &j->req, g->id, &g->responses_live,
+                                                    g->text.ptr ? g->text.ptr : "", g->text.len,
+                                                    parsed_content ? parsed_content : "",
+                                                    &parsed_calls,
+                                                    j->req.prompt.len, g->completion);
+        } else if (j->req.api == API_ANTHROPIC) {
+            response_ok = anthropic_sse_finish_live(j->fd, &j->req, g->id, &g->anthropic_live,
+                                                    g->text.ptr ? g->text.ptr : "", g->text.len,
+                                                    &parsed_calls, final_finish, g->completion);
+        } else if (g->openai_live_chat) {
+            response_ok = openai_sse_finish_live(j->fd, s, &j->req, g->id, &g->openai_live,
+                                                 g->text.ptr ? g->text.ptr : "", g->text.len,
+                                                 &parsed_calls, final_finish,
+                                                 j->req.prompt.len, g->completion);
+        } else if (g->structured_stream) {
+            response_ok = sse_chat_finish(j->fd, &j->req, g->id,
+                                          parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
+                                          parsed_reasoning,
+                                          &parsed_calls, final_finish,
+                                          j->req.prompt.len, g->completion);
+        } else {
+            response_ok = sse_chunk(j->fd, &j->req, g->id, NULL, final_finish) &&
+                          sse_done(j->fd, &j->req, g->id, j->req.prompt.len, g->completion);
+        }
+        if (!response_ok) {
+            final_finish = "error";
+            g->finish = "error";
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: batch slot=%d %s ctx=%s final stream failed",
+                       g->slot,
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       g->ctx_span);
+        }
+    } else if (j->req.api == API_ANTHROPIC) {
+        anthropic_final_response(j->fd, &j->req, g->id,
+                                 parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
+                                 parsed_reasoning,
+                                 &parsed_calls, final_finish,
+                                 j->req.prompt.len, g->completion);
+    } else if (j->req.api == API_RESPONSES) {
+        responses_final_response(j->fd, &j->req, g->id,
+                                 parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
+                                 &parsed_calls,
+                                 j->req.prompt.len, g->completion);
+    } else {
+        final_response(j->fd, &j->req, g->id,
+                       parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
+                       parsed_reasoning,
+                       &parsed_calls, final_finish,
+                       j->req.prompt.len, g->completion);
+    }
+
+    char flags[80];
+    log_flags(flags, sizeof(flags),
+              j->req.has_tools,
+              g->thinking.inside,
+              g->saw_tool_start,
+              g->saw_tool_end);
+    if (!strcmp(final_finish, "error") && g->err[0]) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: batch slot=%d %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                   g->slot,
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   g->ctx_span,
+                   g->completion,
+                   flags[0] ? " " : "",
+                   flags,
+                   final_finish,
+                   g->err,
+                   now_sec() - g->t0);
+    } else {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: batch slot=%d %s ctx=%s gen=%d%s%s finish=%s %.3fs",
+                   g->slot,
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   g->ctx_span,
+                   g->completion,
+                   flags[0] ? " " : "",
+                   flags,
+                   final_finish,
+                   now_sec() - g->t0);
+    }
+    if (!strcmp(final_finish, "error")) ds4_batch_mark_slot_error(s->batch, g->slot);
+    else kv_cache_maybe_store_batch_continued(s, g);
+    ds4_batch_release_slot(s->batch, g->slot);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&parsed_calls);
+    buf_free(&g->text);
+    signal_job_done(j);
+}
+
 static bool enqueue(server *s, job *j) {
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
@@ -8489,8 +9116,357 @@ static job *dequeue(server *s) {
     return j;
 }
 
+static job *try_dequeue(server *s) {
+    pthread_mutex_lock(&s->mu);
+    job *j = s->head;
+    if (j) {
+        s->head = j->next;
+        if (!s->head) s->tail = NULL;
+        j->next = NULL;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return j;
+}
+
+static bool batch_has_active(const batch_request *reqs, int n) {
+    for (int i = 0; i < n; i++) {
+        if (reqs[i].phase != BATCH_REQ_EMPTY) return true;
+    }
+    return false;
+}
+
+static int batch_decode_ready_count(const batch_request *reqs, int n) {
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        if (reqs[i].phase == BATCH_REQ_DECODE) count++;
+    }
+    return count;
+}
+
+static bool batch_has_short_prefill(const batch_request *reqs, int n, int chunk_tokens) {
+    for (int i = 0; i < n; i++) {
+        if (reqs[i].phase != BATCH_REQ_PREFILL) continue;
+        const generation_state *g = &reqs[i].gen;
+        const int remaining = g->j->req.prompt.len - g->prefill_pos;
+        if (remaining > 0 && remaining <= chunk_tokens) return true;
+    }
+    return false;
+}
+
+static int batch_find_idle_slot(server *s, const batch_request *reqs, const request *req, int *cached_out) {
+    int best_slot = -1;
+    int best_cached = -1;
+    for (int slot = 0; slot < s->max_slots; slot++) {
+        if (reqs[slot].phase != BATCH_REQ_EMPTY) continue;
+        if (ds4_batch_slot_occupied(s->batch, slot)) continue;
+        int cached = 0;
+        const ds4_tokens *live = ds4_batch_tokens(s->batch, slot);
+        if (live && live->len > 0) {
+            const int common = ds4_batch_common_prefix(s->batch, slot, &req->prompt);
+            if (common == live->len && req->prompt.len >= common) cached = common;
+        }
+        if (cached > best_cached) {
+            best_cached = cached;
+            best_slot = slot;
+        }
+    }
+    if (cached_out) *cached_out = best_cached > 0 ? best_cached : 0;
+    return best_slot;
+}
+
+static bool batch_admit_job(server *s, batch_request *reqs, job *j) {
+    int cached = 0;
+    const int slot = batch_find_idle_slot(s, reqs, &j->req, &cached);
+    if (slot < 0) return false;
+    const char *cache_source = cached > 0 ? "slot" : "none";
+    int disk_cached = 0;
+    char *disk_path = NULL;
+    if (s->kv.enabled) {
+        const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+        int disk_candidate = 0;
+        if (quant_bits == 2 || quant_bits == 4) {
+            int idx = kv_cache_find_prefix(&s->kv, &j->req.prompt, quant_bits, ds4_batch_ctx(s->batch));
+            if (idx >= 0) disk_candidate = (int)s->kv.entry[idx].tokens;
+        }
+        if (disk_candidate > cached) {
+            const ds4_tokens *old_tokens = ds4_batch_tokens(s->batch, slot);
+            if (old_tokens && old_tokens->len >= s->kv.opt.min_tokens &&
+                ds4_batch_slot_can_save(s->batch, slot)) {
+                kv_cache_store_batch_slot_prefix(s, slot, old_tokens, old_tokens->len, "evict");
+            }
+            disk_cached = kv_cache_try_load_batch_slot(s, slot, &j->req, &disk_path);
+            if (disk_cached > 0) {
+                cached = disk_cached;
+                cache_source = "disk";
+            } else {
+                cached = 0;
+                cache_source = "none";
+            }
+        }
+    }
+    reqs[slot].phase = BATCH_REQ_PREFILL;
+    generation_state_begin(s, &reqs[slot].gen, j, slot, cached,
+                           cache_source, disk_cached, disk_path);
+    free(disk_path);
+    if (cached >= j->req.prompt.len) {
+        if (generation_state_start_decode(&reqs[slot].gen)) {
+            reqs[slot].phase = BATCH_REQ_DECODE;
+        } else {
+            reqs[slot].phase = BATCH_REQ_DONE;
+        }
+    }
+    return true;
+}
+
+static bool batch_admit_waiting(server *s, batch_request *reqs) {
+    bool admitted = false;
+    for (;;) {
+        bool has_free = false;
+        for (int i = 0; i < s->max_slots; i++) {
+            if (reqs[i].phase == BATCH_REQ_EMPTY) {
+                has_free = true;
+                break;
+            }
+        }
+        if (!has_free) break;
+        job *j = try_dequeue(s);
+        if (!j) break;
+        if (!batch_admit_job(s, reqs, j)) {
+            http_error(j->fd, 503, "server has no available batch slots");
+            signal_job_done(j);
+            break;
+        }
+        admitted = true;
+    }
+    return admitted;
+}
+
+static bool batch_prefill_one(server *s, batch_request *reqs) {
+    for (int i = 0; i < s->max_slots; i++) {
+        batch_request *br = &reqs[i];
+        if (br->phase != BATCH_REQ_PREFILL) continue;
+        generation_state *g = &br->gen;
+        job *j = g->j;
+        if (!generation_state_require_slot_current(g, "prefill")) {
+            br->phase = BATCH_REQ_DONE;
+            return true;
+        }
+        if (g->prefill_pos >= j->req.prompt.len) {
+            br->phase = generation_state_start_decode(g) ? BATCH_REQ_DECODE : BATCH_REQ_DONE;
+            return true;
+        }
+
+        int next = j->req.prompt.len;
+        if (batch_decode_ready_count(reqs, s->max_slots) > 0) {
+            next = g->prefill_pos + batch_prefill_chunk_tokens();
+            if (next < g->cached) next = g->cached;
+            if (next > j->req.prompt.len) next = j->req.prompt.len;
+        }
+        if (next <= 0) next = j->req.prompt.len;
+
+        ds4_tokens prefix = {0};
+        tokens_copy_prefix(&prefix, &j->req.prompt, next);
+        server_prefill_progress progress = {
+            .srv = s,
+            .kind = j->req.kind,
+            .prompt_tokens = j->req.prompt.len,
+            .cached_tokens = g->cached,
+            .batch_slot = g->slot,
+            .has_tools = j->req.has_tools,
+            .t0 = g->t0,
+        };
+        snprintf(progress.ctx, sizeof(progress.ctx), "%s", g->ctx_span);
+        ds4_batch_set_progress(s->batch, g->slot, server_progress_cb, &progress);
+        if (ds4_batch_sync(s->batch, g->slot, &prefix, g->err, sizeof(g->err)) != 0) {
+            ds4_batch_set_progress(s->batch, g->slot, NULL, NULL);
+            ds4_batch_mark_slot_error(s->batch, g->slot);
+            trace_event(s, g->trace_id, "batch prefill failed: %s", g->err);
+            http_error(j->fd, 500, g->err);
+            g->finish = "error";
+            ds4_tokens_free(&prefix);
+            br->phase = BATCH_REQ_DONE;
+            return true;
+        }
+        ds4_tokens_free(&prefix);
+        g->prefill_pos = next;
+        if (g->cold_store_len == next && next >= s->kv.opt.min_tokens) {
+            if (kv_cache_store_batch_slot_prefix(s, g->slot, &j->req.prompt, next, "cold")) {
+                batch_kv_cache_note_store(g, next);
+            }
+            g->cold_store_len = 0;
+        }
+        kv_cache_maybe_store_batch_continued(s, g);
+        if (g->prefill_pos >= j->req.prompt.len) {
+            br->phase = generation_state_start_decode(g) ? BATCH_REQ_DECODE : BATCH_REQ_DONE;
+        }
+        return true;
+    }
+    return false;
+}
+
+static void batch_finish_done(server *s, batch_request *reqs) {
+    for (int i = 0; i < s->max_slots; i++) {
+        if (reqs[i].phase != BATCH_REQ_DONE) continue;
+        generation_state_finish(&reqs[i].gen);
+        memset(&reqs[i], 0, sizeof(reqs[i]));
+    }
+}
+
+static bool batch_decode_step(server *s, batch_request *reqs) {
+    ds4_batch_step steps[64];
+    generation_state *gens[64];
+    int tokens[64];
+    int top_tokens[64];
+    int n = 0;
+    bool top_only = true;
+
+    for (int i = 0; i < s->max_slots; i++) {
+        batch_request *br = &reqs[i];
+        if (br->phase != BATCH_REQ_DECODE) continue;
+        generation_state *g = &br->gen;
+        job *j = g->j;
+        if (!generation_state_require_slot_current(g, "decode")) {
+            br->phase = BATCH_REQ_DONE;
+            continue;
+        }
+        if (g_stop_requested) {
+            g->finish = "error";
+            snprintf(g->err, sizeof(g->err), "shutdown requested");
+            br->phase = BATCH_REQ_DONE;
+            continue;
+        }
+        if (g->completion >= g->max_tokens ||
+            ds4_batch_pos(s->batch, g->slot) >= ds4_batch_ctx(s->batch)) {
+            g->finish = "length";
+            br->phase = BATCH_REQ_DONE;
+            continue;
+        }
+
+        int token = -1;
+        if (g->greedy_top_path && g->next_token_valid) {
+            token = g->next_token;
+        } else {
+            const bool in_tool_call = j->req.kind == REQ_CHAT && j->req.has_tools &&
+                                      g->saw_tool_start && !g->saw_tool_end;
+            float temperature = j->req.temperature;
+            int top_k = j->req.top_k;
+            float top_p = j->req.top_p;
+            float min_p = j->req.min_p;
+            if (ds4_think_mode_enabled(j->req.think_mode)) {
+                temperature = 1.0f;
+                top_k = 0;
+                top_p = 1.0f;
+                min_p = 0.0f;
+            }
+            if (in_tool_call) temperature = 0.0f;
+            token = ds4_batch_sample(s->batch, g->slot, temperature, top_k, top_p, min_p, &g->rng);
+            if (token < 0) {
+                g->finish = "error";
+                snprintf(g->err, sizeof(g->err), "batch sampling failed");
+                br->phase = BATCH_REQ_DONE;
+                continue;
+            }
+        }
+        if (token == ds4_token_eos(s->engine)) {
+            g->finish = "stop";
+            br->phase = BATCH_REQ_DONE;
+            continue;
+        }
+        if (!g->greedy_top_path) top_only = false;
+        steps[n] = (ds4_batch_step){ .slot = g->slot, .token = token };
+        gens[n] = g;
+        tokens[n] = token;
+        n++;
+    }
+
+    if (n == 0) return false;
+    if (s->batch_wait_us > 0 && n < s->max_slots) usleep((useconds_t)s->batch_wait_us);
+    char err[160];
+    err[0] = '\0';
+    int active = 0;
+    for (int i = 0; i < s->max_slots; i++) {
+        if (reqs[i].phase != BATCH_REQ_EMPTY) active++;
+    }
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: batch backend=%s active=%d batch=%d top=%d",
+               ds4_batch_backend_name(s->batch),
+               active,
+               n,
+               top_only ? 1 : 0);
+    int rc = top_only ?
+        ds4_batch_eval_top(s->batch, steps, n, top_tokens, err, sizeof(err)) :
+        ds4_batch_eval(s->batch, steps, n, err, sizeof(err));
+    if (rc != 0) {
+        for (int i = 0; i < n; i++) {
+            generation_state *g = gens[i];
+            g->finish = "error";
+            snprintf(g->err, sizeof(g->err), "%s", err);
+            reqs[g->slot].phase = BATCH_REQ_DONE;
+        }
+        return true;
+    }
+    for (int i = 0; i < n; i++) {
+        generation_state *g = gens[i];
+        if (top_only) {
+            g->next_token = top_tokens[i];
+            g->next_token_valid = true;
+        } else {
+            g->next_token_valid = false;
+        }
+        if (!generation_state_accept_token(g, tokens[i])) {
+            reqs[g->slot].phase = BATCH_REQ_DONE;
+        }
+    }
+    return true;
+}
+
+static void *batch_worker_main(void *arg) {
+    server *s = arg;
+    batch_request *reqs = xcalloc((size_t)s->max_slots, sizeof(reqs[0]));
+    for (;;) {
+        batch_finish_done(s, reqs);
+        batch_admit_waiting(s, reqs);
+
+        if (!batch_has_active(reqs, s->max_slots)) {
+            job *j = dequeue(s);
+            if (!j) break;
+            (void)batch_admit_job(s, reqs, j);
+            batch_admit_waiting(s, reqs);
+        }
+
+        const int prefill_chunk = batch_prefill_chunk_tokens();
+        if (batch_decode_ready_count(reqs, s->max_slots) < s->max_slots &&
+            batch_has_short_prefill(reqs, s->max_slots, prefill_chunk)) {
+            if (batch_prefill_one(s, reqs)) continue;
+        }
+
+        if (batch_decode_step(s, reqs)) continue;
+        batch_finish_done(s, reqs);
+        if (batch_prefill_one(s, reqs)) continue;
+
+        if (!batch_has_active(reqs, s->max_slots)) {
+            pthread_mutex_lock(&s->mu);
+            const bool stopping = s->stopping && !s->head;
+            pthread_mutex_unlock(&s->mu);
+            if (stopping) break;
+        } else {
+            usleep(1000);
+        }
+    }
+    for (int i = 0; i < s->max_slots; i++) {
+        if (reqs[i].phase != BATCH_REQ_EMPTY) {
+            reqs[i].gen.finish = "error";
+            snprintf(reqs[i].gen.err, sizeof(reqs[i].gen.err), "shutdown requested");
+            generation_state_finish(&reqs[i].gen);
+        }
+    }
+    free(reqs);
+    return NULL;
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
+    if (s->batch) return batch_worker_main(arg);
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
@@ -8627,7 +9603,7 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
 }
 
 static void append_model_json(buf *b, const server *s) {
-    append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
+    append_model_json_values(b, server_ctx(s), s->default_tokens);
 }
 
 static bool send_model(server *s, int fd) {
@@ -8684,7 +9660,7 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
-    const int ctx_size = ds4_session_ctx(s->session);
+    const int ctx_size = server_ctx(s);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -8787,6 +9763,9 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    int max_slots;
+    int batch_wait_us;
+    const char *batch_backend;
     const char *trace_path;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
@@ -8858,6 +9837,7 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    ds4_batch_free(s->batch);
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
@@ -8886,6 +9866,12 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --max-slots N\n"
+        "      Active inference slots. 1 preserves serialized session mode. >1 enables the multi-slot scheduler. Default: 1\n"
+        "  --batch-wait-us N\n"
+        "      Decode coalescing delay in microseconds for --max-slots > 1. Default: 500\n"
+        "  --batch-backend NAME\n"
+        "      Batch runtime for --max-slots > 1: shared-decode (default) or session-slots.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -8955,6 +9941,9 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .max_slots = 1,
+        .batch_wait_us = 500,
+        .batch_backend = "shared-decode",
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
@@ -8978,6 +9967,26 @@ static server_config parse_options(int argc, char **argv) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--max-slots")) {
+            c.max_slots = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.max_slots < 1 || c.max_slots > 64) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --max-slots must be between 1 and 64");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--batch-wait-us")) {
+            c.batch_wait_us = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.batch_wait_us > 100000) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --batch-wait-us must be between 0 and 100000");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--batch-backend")) {
+            c.batch_backend = need_arg(&i, argc, argv, arg);
+            if (strcmp(c.batch_backend, "session-slots") &&
+                strcmp(c.batch_backend, "shared-decode")) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --batch-backend must be session-slots or shared-decode");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
@@ -9024,6 +10033,10 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+    if (c.max_slots > 1 && c.engine.mtp_path) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --mtp is not supported with --max-slots > 1 in batch mode");
+        exit(2);
+    }
     return c;
 }
 
@@ -9043,18 +10056,36 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
-
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create Metal session");
-        ds4_engine_close(engine);
-        return 1;
+    if (cfg.max_slots > 1) {
+        ds4_context_memory m = ds4_context_memory_estimate(cfg.engine.backend, cfg.ctx_size);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: multi-slot session buffers estimated %.2f MiB total for %d slots",
+                   ((double)m.total_bytes * (double)cfg.max_slots) / (1024.0 * 1024.0),
+                   cfg.max_slots);
     }
 
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
-    s.session = session;
+    s.max_slots = cfg.max_slots;
+    s.batch_wait_us = cfg.batch_wait_us;
+    if (cfg.max_slots > 1) {
+        if (ds4_batch_create_with_backend(&s.batch, engine, cfg.ctx_size,
+                                          cfg.max_slots, cfg.batch_backend) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create Metal batch runtime");
+            ds4_engine_close(engine);
+            return 1;
+        }
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: batch scheduler enabled backend=%s max_slots=%d batch_wait_us=%d",
+                   ds4_batch_backend_name(s.batch),
+                   cfg.max_slots,
+                   cfg.batch_wait_us);
+    } else if (ds4_session_create(&s.session, engine, cfg.ctx_size) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create Metal session");
+        ds4_engine_close(engine);
+        return 1;
+    }
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -9147,12 +10178,23 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
+    const ds4_tokens *tokens = s.session ? ds4_session_tokens(s.session) : NULL;
+    if (s.session && s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
         kv_cache_store_current(&s, "shutdown");
+    } else if (s.batch && s.kv.enabled) {
+        for (int slot = 0; slot < s.max_slots; slot++) {
+            tokens = ds4_batch_tokens(s.batch, slot);
+            if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
+            if (!ds4_batch_slot_can_save(s.batch, slot)) continue;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: persisting batch slot KV cache before shutdown slot=%d tokens=%d",
+                       slot,
+                       tokens->len);
+            kv_cache_store_batch_slot_prefix(&s, slot, tokens, tokens->len, "shutdown");
+        }
     }
     server_close_resources(&s);
     return 0;
@@ -11310,6 +12352,27 @@ static void test_kv_cache_eviction_penalizes_live_continued_prefixes(void) {
     rmdir(dir);
 }
 
+static void test_batch_options_parse(void) {
+    char *argv[] = {
+        "ds4-server",
+        "--max-slots", "4",
+        "--batch-wait-us", "250",
+        "--batch-backend", "shared-decode",
+        "--kv-disk-dir", "/tmp/ds4-kv-test",
+    };
+    server_config c = parse_options((int)(sizeof(argv) / sizeof(argv[0])), argv);
+    TEST_ASSERT(c.max_slots == 4);
+    TEST_ASSERT(c.batch_wait_us == 250);
+    TEST_ASSERT(c.batch_backend && !strcmp(c.batch_backend, "shared-decode"));
+    TEST_ASSERT(c.kv_disk_dir && !strcmp(c.kv_disk_dir, "/tmp/ds4-kv-test"));
+
+    char *default_argv[] = {"ds4-server"};
+    c = parse_options((int)(sizeof(default_argv) / sizeof(default_argv[0])), default_argv);
+    TEST_ASSERT(c.max_slots == 1);
+    TEST_ASSERT(c.batch_wait_us == 500);
+    TEST_ASSERT(c.batch_backend && !strcmp(c.batch_backend, "shared-decode"));
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_match_deepseek_api();
     test_reasoning_effort_mapping();
@@ -11360,6 +12423,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
+    test_batch_options_parse();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();

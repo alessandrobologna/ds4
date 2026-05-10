@@ -7340,32 +7340,18 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     id_list_free(&wanted);
 }
 
-static bool kv_entry_is_live_continued_prefix(const kv_entry *e, const ds4_tokens *live) {
-    if (!e || e->reason != KV_REASON_CONTINUED) return false;
-    if (!live || (int)e->tokens >= live->len) return false;
-    char sha[41];
-    sha1_tokens_hex(live, (int)e->tokens, sha);
-    return !strcmp(sha, e->sha);
-}
-
 static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live) {
     if (!e || e->file_size == 0) return 0.0;
+    (void)live;
     /*
      * Hits count successful disk reuses, but a fresh snapshot is still useful:
      * it may be the only copy of the session that is about to be evicted from
-     * RAM.  Use hits+1 for eviction value so a just-written checkpoint does not
-     * get deleted immediately just because its persisted hit counter is still 0.
+     * RAM.  Continued checkpoints are deliberately aligned restart frontiers,
+     * so do not demote them just because they are a prefix of the live session.
+     * Use hits+1 for eviction value so a just-written checkpoint does not get
+     * deleted immediately just because its persisted hit counter is still 0.
      */
-    double score = ((double)e->hits + 1.0) * (double)e->tokens / (double)e->file_size;
-    if (kv_entry_is_live_continued_prefix(e, live)) {
-        /* A continued checkpoint that is already a strict prefix of the live
-         * RAM session is only a crash fallback.  Under pressure, cold prefixes
-         * and non-dominated branch points are more valuable. */
-        double depth = (double)e->tokens / (double)live->len;
-        score *= e->hits ? 0.25 : 0.02;
-        score *= depth;
-    }
-    return score;
+    return ((double)e->hits + 1.0) * (double)e->tokens / (double)e->file_size;
 }
 
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
@@ -7463,6 +7449,31 @@ static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
         if (stable >= kc->opt.min_tokens) return stable;
     }
     return tokens;
+}
+
+static int kv_cache_continued_step(const kv_disk_cache *kc) {
+    if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return 0;
+    int step = kc->opt.continued_interval_tokens;
+    const int align = kc->opt.boundary_align_tokens;
+    if (align > 0) {
+        step = ((step + align - 1) / align) * align;
+        if (step <= 0) step = align;
+    }
+    return step;
+}
+
+static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
+    const int step = kv_cache_continued_step(kc);
+    if (step <= 0) return 0;
+    if (live_tokens < kc->opt.min_tokens) return 0;
+
+    /* Continued checkpoints cannot roll the live graph backward.  Save only
+     * at absolute aligned frontiers, not relative to the last cold/evict file.
+     * Otherwise an early cold checkpoint can shift the whole schedule and leave
+     * long generations with no recent durable restart point. */
+    if (live_tokens % step != 0) return 0;
+    if (live_tokens <= kc->continued_last_store_tokens) return 0;
+    return live_tokens;
 }
 
 /* A same-token file can be reused by a larger context, but not by a smaller
@@ -7742,12 +7753,12 @@ static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
 
 static void kv_cache_maybe_store_continued(server *s) {
     kv_disk_cache *kc = &s->kv;
-    if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return;
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
-    if (!tokens || tokens->len < kc->opt.min_tokens) return;
-    if (tokens->len - kc->continued_last_store_tokens < kc->opt.continued_interval_tokens) return;
-    if (kv_cache_store_live_prefix(s, tokens, tokens->len, "continued")) {
-        kv_cache_note_store(kc, tokens->len);
+    if (!tokens) return;
+    const int target = kv_cache_continued_store_target(kc, tokens->len);
+    if (target == 0) return;
+    if (kv_cache_store_live_prefix(s, tokens, target, "continued")) {
+        kv_cache_note_store(kc, target);
     }
 }
 
@@ -8647,6 +8658,9 @@ static void generate_job(server *s, job *j) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
+        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
+            kv_cache_maybe_store_continued(s);
+        }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
@@ -8814,9 +8828,6 @@ static void generate_job(server *s, job *j) {
                                     &last_decode_log_t,
                                     &last_decode_log_completion);
                 next_decode_log += 50;
-                if (!(j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_start)) {
-                    kv_cache_maybe_store_continued(s);
-                }
             }
 
             if (hit_stop) {
@@ -8862,11 +8873,6 @@ static void generate_job(server *s, job *j) {
                             decode_t0,
                             &last_decode_log_t,
                             &last_decode_log_completion);
-        if (strcmp(finish, "error") != 0 &&
-            !(j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_start))
-        {
-            kv_cache_maybe_store_continued(s);
-        }
     }
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
@@ -9029,7 +9035,6 @@ static void generate_job(server *s, job *j) {
                        now_sec() - t0);
         }
     }
-    if (strcmp(final_finish, "error") != 0) kv_cache_maybe_store_continued(s);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -10876,7 +10881,7 @@ static void usage(FILE *fp) {
         "  --kv-cache-cold-max-tokens N\n"
         "      Cold first prompts in [min,N] are saved automatically. 0 disables cold saves. Default: 30000\n"
         "  --kv-cache-continued-interval-tokens N\n"
-        "      Save the live conversation after it grows N tokens past the last saved point. 0 disables. Default: 10000\n"
+        "      Save at absolute aligned frontiers spaced about N tokens apart. 0 disables. Default: 10000\n"
         "  --kv-cache-boundary-trim-tokens N\n"
         "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
         "  --kv-cache-boundary-align-tokens N\n"
@@ -10890,7 +10895,7 @@ static void usage(FILE *fp) {
         "\n"
         "  Cache triggers:\n"
         "      cold       save a stable prefix of a long first prompt before generation starts\n"
-        "      continued  save the active conversation after it grows by the configured interval\n"
+        "      continued  save absolute aligned restart frontiers during long prefill or generation\n"
         "      evict      save the live conversation before another request replaces it\n"
         "      shutdown   save the live conversation when the server exits cleanly\n"
         "\n"
@@ -13164,6 +13169,30 @@ static void test_kv_cache_store_len_uses_configured_boundary(void) {
     TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3500);
 }
 
+static void test_kv_cache_continued_uses_aligned_frontiers(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+
+    kc.continued_last_store_tokens = 4096;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+
+    kc.continued_last_store_tokens = 24576;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
+
+    kc.continued_last_store_tokens = 10240;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+
+    kc.opt.boundary_align_tokens = 0;
+    kc.continued_last_store_tokens = 20480;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+}
+
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
@@ -13356,7 +13385,7 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_penalizes_live_continued_prefixes(void) {
+static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -13384,8 +13413,8 @@ static void test_kv_cache_eviction_penalizes_live_continued_prefixes(void) {
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
     kv_cache_evict(&kc, &live);
 
-    TEST_ASSERT(access(continued_path, F_OK) != 0);
-    TEST_ASSERT(access(cold_path, F_OK) == 0);
+    TEST_ASSERT(access(cold_path, F_OK) != 0);
+    TEST_ASSERT(access(continued_path, F_OK) == 0);
 
     kv_cache_close(&kc);
     unlink(cold_path);
@@ -13733,8 +13762,9 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
+    test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_eviction_values_fresh_snapshots();
-    test_kv_cache_eviction_penalizes_live_continued_prefixes();
+    test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

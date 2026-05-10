@@ -191,6 +191,11 @@ int ds4_batch_max_slots(ds4_batch *b);
 int ds4_batch_ctx(ds4_batch *b);
 int ds4_batch_prefill_capacity(ds4_batch *b);
 const char *ds4_batch_backend_name(ds4_batch *b);
+/* Slot lifecycle: inference calls that advance or sample a live request require
+ * a claimed slot.  Released slots may still retain a valid checkpoint for idle
+ * prefix reuse, disk-cache eviction, and shutdown persistence; common_prefix,
+ * tokens, save/load, and payload queries are therefore intentionally valid for
+ * unoccupied slots when their payload state is save-safe. */
 void ds4_batch_claim_slot(ds4_batch *b, int slot);
 void ds4_batch_release_slot(ds4_batch *b, int slot);
 uint64_t ds4_batch_slot_generation(ds4_batch *b, int slot);

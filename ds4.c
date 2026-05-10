@@ -60,6 +60,7 @@
 #define DS4_ROPE_YARN_BETA_SLOW (1.0f)
 #define DS4_COMPRESS_ROPE_FREQ_BASE (160000.0f)
 #define DS4_ROPE_ORIG_CTX       UINT64_C(65536)
+#define DS4_BATCH_PREFILL_ROW_CAP_MAX 8192u
 
 static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
@@ -13265,14 +13266,19 @@ static uint32_t metal_graph_batch_prefill_cap_for_slots(int ctx_size, int max_sl
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
-        if (endp != env && v > 0) return (uint32_t)v;
+        if (endp != env && v > 0) {
+            uint32_t cap = v > (long)DS4_BATCH_PREFILL_ROW_CAP_MAX ?
+                DS4_BATCH_PREFILL_ROW_CAP_MAX : (uint32_t)v;
+            if (cap < 1u) cap = 1u;
+            return cap;
+        }
     }
 
     uint64_t cap = (uint64_t)base * (uint64_t)max_slots;
-    const uint64_t default_cap = 8192u;
+    const uint64_t default_cap = DS4_BATCH_PREFILL_ROW_CAP_MAX;
     if (cap > default_cap) cap = default_cap;
-    if (cap < base) cap = base;
     if (cap > UINT32_MAX) cap = UINT32_MAX;
+    if (cap < 1u) cap = 1u;
     return (uint32_t)cap;
 }
 
@@ -15324,6 +15330,10 @@ int ds4_batch_sync(ds4_batch *b, int slot, const ds4_tokens *prompt, char *err, 
         return 1;
     }
     ds4_batch_slot_state *st = ds4_batch_state(b, slot);
+    if (!st || !st->occupied || st->eval_in_flight) {
+        ds4_batch_set_err(err, errlen, "batch slot is not claimed");
+        return 1;
+    }
     if (st && st->error) {
         ds4_session_invalidate(s);
     }
@@ -15379,13 +15389,13 @@ int ds4_batch_common_prefix(ds4_batch *b, int slot, const ds4_tokens *prompt) {
 
 int ds4_batch_sample(ds4_batch *b, int slot, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     ds4_session *s = ds4_batch_slot(b, slot);
-    return s && ds4_batch_slot_logits_valid(b, slot) ?
+    return s && ds4_batch_slot_occupied(b, slot) && ds4_batch_slot_logits_valid(b, slot) ?
         ds4_session_sample(s, temperature, top_k, top_p, min_p, rng) : -1;
 }
 
 int ds4_batch_top_logprobs(ds4_batch *b, int slot, ds4_token_score *out, int k) {
     ds4_session *s = ds4_batch_slot(b, slot);
-    return s && ds4_batch_slot_logits_valid(b, slot) ?
+    return s && ds4_batch_slot_occupied(b, slot) && ds4_batch_slot_logits_valid(b, slot) ?
         ds4_session_top_logprobs(s, out, k) : 0;
 }
 
@@ -16078,7 +16088,7 @@ static int ds4_batch_prepare_decode_steps(
         }
         ds4_session *s = b->slot[slot];
         ds4_batch_slot_state *st = ds4_batch_state(b, slot);
-        if (!s || !st || st->error || st->eval_in_flight ||
+        if (!s || !st || !st->occupied || st->error || st->eval_in_flight ||
             !s->checkpoint_valid || s->checkpoint.len >= s->ctx_size) {
             ds4_batch_set_err(err, errlen, "batch slot is not decode-ready");
             return 1;
@@ -16356,12 +16366,16 @@ static bool ds4_batch_encode_decode_rows_attention(
     ds4_metal_graph *work = &b->shared_graph;
     const ds4_model *model = &e->model;
     const ds4_layer_weights *layer = &e->weights.layer[il];
+    if (n_rows <= 0) return false;
     const uint32_t n_tokens = (uint32_t)n_rows;
     if (n_tokens == 0 || n_tokens > work->prefill_cap) return false;
-    uint32_t row_n_comp[n_rows];
-    uint32_t row_n_index_comp[n_rows];
-    memset(row_n_comp, 0, sizeof(row_n_comp));
-    memset(row_n_index_comp, 0, sizeof(row_n_index_comp));
+    uint32_t *row_n_comp = xcalloc((size_t)n_rows, sizeof(row_n_comp[0]));
+    uint32_t *row_n_index_comp = xcalloc((size_t)n_rows, sizeof(row_n_index_comp[0]));
+    if (!row_n_comp || !row_n_index_comp) {
+        free(row_n_index_comp);
+        free(row_n_comp);
+        return false;
+    }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -16956,6 +16970,8 @@ static bool ds4_batch_encode_decode_rows_attention(
     ds4_metal_tensor_free(attn_cur_view);
     ds4_metal_tensor_free(hc_split_view);
     ds4_metal_tensor_free(hc_mix_view);
+    free(row_n_index_comp);
+    free(row_n_comp);
     return ok;
 }
 

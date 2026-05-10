@@ -894,6 +894,7 @@ static void test_batch_shared_payload_roundtrip(void) {
     TEST_ASSERT(ds4_batch_create_with_backend(&batch, engine, 4096, 2, "shared-decode") == 0);
     if (!source || !restored || !batch) goto done;
 
+    TEST_ASSERT(ds4_batch_sync(batch, 0, &prompt, err, sizeof(err)) != 0);
     ds4_batch_claim_slot(batch, 1);
     TEST_ASSERT(ds4_session_sync(source, &prompt, err, sizeof(err)) == 0);
 
@@ -906,6 +907,11 @@ static void test_batch_shared_payload_roundtrip(void) {
     rewind(fp1);
     TEST_ASSERT(ds4_batch_load_slot_payload(batch, 1, fp1, session_payload_bytes,
                                             err, sizeof(err)) == 0);
+    ds4_batch_release_slot(batch, 1);
+    TEST_ASSERT(ds4_batch_common_prefix(batch, 1, &prompt) == prompt.len);
+    TEST_ASSERT(ds4_batch_slot_can_save(batch, 1));
+    TEST_ASSERT(ds4_batch_sample(batch, 1, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){0}) < 0);
+    ds4_batch_claim_slot(batch, 1);
     test_compare_session_batch_top("serialized-to-shared payload", source, batch, 1);
 
     fp2 = tmpfile();

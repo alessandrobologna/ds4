@@ -151,8 +151,10 @@ Start with `--max-slots N` to admit up to `N` independent live inference slots:
 ```
 
 The default `--max-slots > 1` backend is `shared-decode`: it uses a batch-owned
-Metal graph with slot-indexed KV/frontier storage, layer-major decode work
-across active slots, and batched dense/output-head work.
+Metal graph with slot-indexed KV/frontier storage and row-batched dense,
+feed-forward, and output-head work across active slots. Attention state is
+slot-isolated; some attention subpaths still use row-loop or slot-view execution
+while the row-metadata attention diagnostics continue to mature.
 `--batch-backend session-slots` remains available as the conservative reference
 fallback with independent session/KV slots behind the same scheduler. Both modes
 keep the same logical per-slot payload format as serialized mode so disk KV
@@ -180,6 +182,7 @@ remains opt-in while this path is still being validated.
 
 Diagnostic tuning knobs for this path are intentionally environment-only:
 `DS4_BATCH_PREFILL_ROW_CAP` caps total packed rows per segmented prefill call,
+clamped to a hard maximum of 8192 rows,
 `DS4_BATCH_PREFILL_CHUNK_TOKENS` caps the serialized prefill chunk size used by
 the scheduler,
 `DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS` caps scheduler rows per tick,

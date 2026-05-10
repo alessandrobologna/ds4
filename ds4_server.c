@@ -9709,9 +9709,13 @@ static bool batch_prefill_many(server *s, batch_request *reqs) {
         }
     }
 
+    const char *backend = ds4_batch_backend_name(s->batch);
+    const char *attention =
+        getenv("DS4_BATCH_SEGMENTED_DIRECT_ATTENTION") != NULL ? "segmented-direct" : "row-loop";
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: batch backend=%s active=%d batch=%d prefill=segment rows=%d slots=%d logits=%d",
-               ds4_batch_backend_name(s->batch),
+               "ds4-server: batch backend=%s mode=row-batched attention=%s active=%d batch=%d prefill=segment rows=%d slots=%d logits=%d",
+               backend,
+               attention,
                active,
                n,
                rows,
@@ -9866,9 +9870,21 @@ static bool batch_decode_step(server *s, batch_request *reqs) {
     for (int i = 0; i < s->max_slots; i++) {
         if (reqs[i].phase != BATCH_REQ_EMPTY) active++;
     }
+    const char *backend = ds4_batch_backend_name(s->batch);
+    const bool shared_decode = strcmp(backend, "shared-decode") == 0;
+    const bool legacy_layer_loop =
+        shared_decode && getenv("DS4_SHARED_DECODE_LEGACY_LAYER_LOOP") != NULL;
+    const char *mode = shared_decode ?
+        (legacy_layer_loop ? "legacy-layer-loop" : "row-batched") :
+        "session-slots";
+    const char *attention = shared_decode ?
+        (getenv("DS4_BATCH_SEGMENTED_DIRECT_ATTENTION") != NULL ? "segmented-direct" : "row-loop") :
+        "session";
     server_log(DS4_LOG_GENERATION,
-               "ds4-server: batch backend=%s active=%d batch=%d top=%d",
-               ds4_batch_backend_name(s->batch),
+               "ds4-server: batch backend=%s mode=%s attention=%s active=%d batch=%d top=%d",
+               backend,
+               mode,
+               attention,
                active,
                n,
                top_only ? 1 : 0);

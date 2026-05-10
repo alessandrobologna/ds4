@@ -10525,6 +10525,17 @@ static bool metal_graph_matmul_f16_maybe_rows(
                                            n_tokens) != 0;
     }
 
+    if (getenv("DS4_MTP_VERIFY_HOST_ROW_FALLBACK") == NULL) {
+        return ds4_metal_matmul_f16_rows_tensor(out,
+                                                model->map,
+                                                model->size,
+                                                weight_offset,
+                                                in_dim,
+                                                out_dim,
+                                                x,
+                                                n_tokens) != 0;
+    }
+
     bool ok = true;
     for (uint64_t t = 0; ok && t < n_tokens; t++) {
         ds4_metal_tensor *out_row = ds4_metal_tensor_view(out,
@@ -10570,6 +10581,17 @@ static bool metal_graph_matmul_q8_0_maybe_rows(
                                             n_tokens) != 0;
     }
 
+    if (getenv("DS4_MTP_VERIFY_HOST_ROW_FALLBACK") == NULL) {
+        return ds4_metal_matmul_q8_0_rows_tensor(out,
+                                                 model->map,
+                                                 model->size,
+                                                 weight_offset,
+                                                 in_dim,
+                                                 out_dim,
+                                                 x,
+                                                 n_tokens) != 0;
+    }
+
     bool ok = true;
     for (uint64_t t = 0; ok && t < n_tokens; t++) {
         ds4_metal_tensor *out_row = ds4_metal_tensor_view(out,
@@ -10611,6 +10633,23 @@ static bool metal_graph_attention_output_q8_maybe_rows(
     if (!g || !g->spec_verify_mode || n_tokens <= 1 ||
         getenv("DS4_MTP_VERIFY_ATTN_OUT_ROW_FALLBACK") == NULL)
     {
+        return ds4_metal_attention_output_q8_batch_tensor(out,
+                                                          low,
+                                                          group_tmp,
+                                                          low_tmp,
+                                                          model->map,
+                                                          model->size,
+                                                          out_a_offset,
+                                                          out_b_offset,
+                                                          group_dim,
+                                                          rank,
+                                                          n_groups,
+                                                          out_dim,
+                                                          heads,
+                                                          n_tokens) != 0;
+    }
+
+    if (getenv("DS4_MTP_VERIFY_HOST_ROW_FALLBACK") == NULL) {
         return ds4_metal_attention_output_q8_batch_tensor(out,
                                                           low,
                                                           group_tmp,
@@ -19475,6 +19514,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             !speed_trust_suffix &&
             draft_n >= 2 &&
             (getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL ||
+             (strict_mtp && draft_n == 2 && getenv("DS4_MTP_NO_CAPTURE_PREFIX1") == NULL) ||
              (!strict_mtp && draft_n == 2 && getenv("DS4_MTP_NO_CAPTURE_PREFIX1") == NULL));
         const bool snapshot_required =
             getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL ||

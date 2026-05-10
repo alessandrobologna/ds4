@@ -1767,6 +1767,16 @@ static ds4_metal_f16_matvec_args ds4_metal_make_f16_mv_args(uint64_t in_dim, uin
     };
 }
 
+static void ds4_metal_mv_args_set_rows(
+        ds4_metal_q8_0_matvec_args *args,
+        uint64_t                    in_dim,
+        uint64_t                    n_tok) {
+    args->ne11 = (int32_t)n_tok;
+    args->ne1 = (int32_t)n_tok;
+    args->nb12 = in_dim * n_tok * sizeof(float);
+    args->nb13 = in_dim * n_tok * sizeof(float);
+}
+
 static ds4_metal_q8_0_matvec_args ds4_metal_make_f32_mv_args(
         uint64_t in_dim,
         uint64_t out_dim,
@@ -5017,6 +5027,84 @@ int ds4_metal_matmul_q8_0_tensor(
     return 1;
 }
 
+int ds4_metal_matmul_q8_0_rows_tensor(
+        ds4_metal_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint64_t                n_tok) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if ((in_dim & 31u) != 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_tok == 0 || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(out);
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_metal_tensor_bytes(x) < x_bytes ||
+            ds4_metal_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal Q8_0 exact rows matvec received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t blocks = in_dim / 32;
+        const uint64_t row_bytes = blocks * 34;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal Q8_0 exact rows matvec range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf =
+            ds4_metal_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        ds4_metal_q8_0_matvec_args mv_args = ds4_metal_make_q8_0_mv_args(in_dim, out_dim);
+        ds4_metal_mv_args_set_rows(&mv_args, in_dim, n_tok);
+
+        ds4_metal_mv_dispatch mv_dispatch = ds4_metal_make_q8_0_mv_dispatch();
+        if (out_dim > 65536u) mv_dispatch.nsg = 8;
+        mv_args.nr0 = mv_dispatch.nr0;
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_metal_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                                  (NSUInteger)mv_dispatch.nr0,
+                                              (NSUInteger)n_tok,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "Q8_0 exact rows matvec")) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         ds4_metal_tensor       *gate,
         ds4_metal_tensor       *up,
@@ -5228,6 +5316,86 @@ int ds4_metal_matmul_f16_tensor(
         ds4_metal_end_compute_encoder(cb, enc);
 
         if (!ds4_metal_finish_command_buffer(cb, owned, "F16 tensor matmul")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_metal_matmul_f16_rows_tensor(
+        ds4_metal_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint64_t                n_tok) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_tok == 0 || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(out);
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_metal_tensor_bytes(x) < x_bytes ||
+            ds4_metal_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal F16 exact rows matvec received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t row_bytes = in_dim * sizeof(uint16_t);
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal F16 exact rows matvec range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf =
+            ds4_metal_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        ds4_metal_f16_matvec_args mv_args = ds4_metal_make_f16_mv_args(in_dim, out_dim);
+        ds4_metal_mv_args_set_rows(&mv_args, in_dim, n_tok);
+
+        ds4_metal_mv_dispatch mv_dispatch =
+            ds4_metal_make_plain_mv_dispatch(in_dim, 0);
+        if (!g_quality_mode && (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
+            mv_dispatch.nr0 = 4;
+            mv_dispatch.smem = 32u * 4u * sizeof(float);
+        }
+        mv_args.nr0 = mv_dispatch.nr0;
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_metal_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(out) atIndex:3];
+        if (mv_dispatch.smem) {
+            [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                                  (NSUInteger)mv_dispatch.nr0,
+                                              (NSUInteger)n_tok,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "F16 exact rows matvec")) return 0;
     }
 
     return 1;
@@ -8153,9 +8321,18 @@ int ds4_metal_attention_output_q8_batch_tensor(
         DS4_METAL_PROFILE_ATTN_OUT_STAGE("low_proj");
 
         if (ok) {
-            ok = ds4_metal_matmul_q8_0_tensor(out, model_map, model_size,
-                                              out_b_offset,
-                                              low_dim, out_dim, low, n_tokens) != 0;
+            const bool exact_rows =
+                getenv("DS4_MTP_VERIFY_ATTN_OUT_ROW_FALLBACK") != NULL &&
+                getenv("DS4_MTP_VERIFY_HOST_ROW_FALLBACK") == NULL;
+            if (exact_rows) {
+                ok = ds4_metal_matmul_q8_0_rows_tensor(out, model_map, model_size,
+                                                       out_b_offset,
+                                                       low_dim, out_dim, low, n_tokens) != 0;
+            } else {
+                ok = ds4_metal_matmul_q8_0_tensor(out, model_map, model_size,
+                                                  out_b_offset,
+                                                  low_dim, out_dim, low, n_tokens) != 0;
+            }
         }
         DS4_METAL_PROFILE_ATTN_OUT_STAGE("out_proj");
 

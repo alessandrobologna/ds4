@@ -140,7 +140,10 @@ tests but currently slower than the default exact N=2 path.
 For MTP diagnostics, `DS4_MTP_ORACLE=1` checks the exact N=2 path,
 `DS4_MTP_SPEED_AUDIT=1` audits approximate speed commits against sequential
 greedy logits, and `DS4_MTP_VERIFY_SCALE_DETAIL=1` adds mismatch details to
-`--mtp-verify-scale` for N=3/N=4 verifier work.
+`--mtp-verify-scale` for N=3/N=4 verifier work. `DS4_MTP_TREE_ORACLE=1`
+adds a non-mutating tree-coverage diagnostic: on baseline-equivalent states it
+checks whether the target greedy path appears in MTP top-1/top-2/top-4/top-8
+alternatives up to depth 6 before any tree verifier is implemented.
 
 ## Server
 

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL="/Users/alessandro/git/antirez/ds4/ds4flash.gguf"
-MTP="/Users/alessandro/git/antirez/ds4/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+MODEL="$ROOT/ds4flash.gguf"
+MTP="$ROOT/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
 RUNS=5
 TOKENS=64
 DRAFT=6

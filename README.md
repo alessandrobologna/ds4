@@ -179,7 +179,11 @@ remains opt-in while this path is still being validated.
 
 Diagnostic tuning knobs for this path are intentionally environment-only:
 `DS4_BATCH_PREFILL_ROW_CAP` caps total packed rows per segmented prefill call,
+`DS4_BATCH_PREFILL_CHUNK_TOKENS` caps the serialized prefill chunk size used by
+the scheduler,
 `DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS` caps scheduler rows per tick,
+`DS4_BATCH_PREFILL_WAIT_US` controls how long the scheduler can wait to collect
+multiple prefill-ready slots,
 `DS4_BATCH_PREFILL_FANOUT_MIN_TOKENS` controls the minimum common-prefix length
 that is worth payload fanout,
 `DS4_BATCH_PREFILL_ALIGN_TOKENS` can force divergent segments to split on

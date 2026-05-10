@@ -4956,7 +4956,7 @@ int ds4_metal_matmul_q8_0_tensor(
             return 1;
         }
 
-        if (n_tok <= 8 && (in_dim % 128u) == 0) {
+        if (n_tok <= 8 && (in_dim % 128u) == 0 && getenv("DS4_METAL_DISABLE_MV_EXT") == NULL) {
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_metal_mv_ext_nxpsg(in_dim, n_tok);
             const int16_t r1ptg = ds4_metal_mv_ext_r1ptg(n_tok);

@@ -344,7 +344,7 @@ def max_logged_batch(lines: list[str]) -> int:
             continue
         match = re.search(r" batch=(\d+)", line)
         if match:
-                best = max(best, int(match.group(1)))
+            best = max(best, int(match.group(1)))
     return best
 
 
@@ -582,19 +582,23 @@ def benchmark_once(
                             flush=True,
                         )
             except concurrent.futures.TimeoutError as exc:
+                for future in futures:
+                    future.cancel()
                 logs = "\n".join(server.lines[-80:])
                 raise CheckError(
                     f"benchmark timed out workload={workload} label={label} "
                     f"clients={clients} completed={len(results)}/{clients}\n{logs}"
                 ) from exc
             except Exception as exc:
+                for future in futures:
+                    future.cancel()
                 logs = "\n".join(server.lines[-80:])
                 raise CheckError(
                     f"benchmark request failed workload={workload} "
                     f"label={label} clients={clients}: {exc}\n{logs}"
                 ) from exc
         finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=True, cancel_futures=True)
         wall = time.monotonic() - started
         prompt_tokens = sum(int(r["prompt_tokens"]) for r in results)
         completion_tokens = sum(int(r["completion_tokens"]) for r in results)

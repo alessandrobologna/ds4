@@ -64,6 +64,43 @@ struct ds4_metal_args_dsv4_indexed_attention {
     float    scale;
 };
 
+struct ds4_metal_args_dsv4_segmented_attention {
+    uint32_t n_tokens;
+    uint32_t n_slots;
+    uint32_t n_head;
+    uint32_t raw_cap;
+    uint32_t comp_cap;
+    uint32_t top_k;
+    uint32_t ratio;
+    uint64_t q_token_stride;
+    uint64_t q_head_stride;
+    uint64_t raw_slot_stride;
+    uint64_t raw_row_stride;
+    uint64_t comp_slot_stride;
+    uint64_t comp_row_stride;
+    uint64_t topk_token_stride;
+    uint64_t dst_token_stride;
+    uint64_t dst_head_stride;
+    float    scale;
+};
+
+#ifndef DS4_METAL_SEGMENTED_ATTENTION_ROW_DEFINED
+#define DS4_METAL_SEGMENTED_ATTENTION_ROW_DEFINED
+struct ds4_metal_segmented_attention_row {
+    uint32_t slot;
+    uint32_t pos;
+    uint32_t n_raw;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t top_k;
+    uint32_t key_offset;
+    uint32_t n_keys_padded;
+    uint32_t raw_first_pos;
+    uint32_t raw_window;
+    uint32_t ratio;
+};
+#endif
+
 struct ds4_metal_args_dsv4_indexer_scores_fused {
     uint32_t n_comp;
     uint32_t n_tokens;
@@ -661,6 +698,156 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
                                                  o0, o1, o2, o3);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
+
+    const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
+    device float4 *dst4 = (device float4 *)(dst +
+        (uint64_t)token * args.dst_token_stride +
+        (uint64_t)head  * args.dst_head_stride);
+    dst4[lane +  0] = o0 * inv_s;
+    dst4[lane + 32] = o1 * inv_s;
+    dst4[lane + 64] = o2 * inv_s;
+    dst4[lane + 96] = o3 * inv_s;
+}
+
+// Row-metadata attention for shared slot-indexed prefill/decode. Each token row
+// carries the slot and prefix lengths it may read, so one dispatch can cover
+// unrelated slots without exposing cross-slot KV.
+kernel void kernel_dsv4_segmented_mixed_attention_heads8_rb4(
+        constant ds4_metal_args_dsv4_segmented_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device const ds4_metal_segmented_attention_row *rows,
+        device       char *dst,
+        threadgroup float4 *kv_shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint token = tgpig.x;
+    const uint head = tgpig.y * 8u + (uint)sg;
+    if (token >= args.n_tokens || head >= args.n_head) {
+        return;
+    }
+
+    const ds4_metal_segmented_attention_row row = rows[token];
+    if (row.slot >= args.n_slots || args.raw_cap == 0u || row.n_raw > args.raw_cap) {
+        return;
+    }
+
+    device const float4 *q4 = (device const float4 *)(q +
+        (uint64_t)token * args.q_token_stride +
+        (uint64_t)head  * args.q_head_stride);
+    const half4 q0 = (half4)q4[lane +  0];
+    const half4 q1 = (half4)q4[lane + 32];
+    const half4 q2 = (half4)q4[lane + 64];
+    const half4 q3 = (half4)q4[lane + 96];
+
+    float M = -FLT_MAX/2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    const uint64_t raw_base = (uint64_t)row.slot * args.raw_slot_stride;
+    for (uint pos0 = 0; pos0 < row.n_raw; pos0 += 4u) {
+        const uint n_rows = min(4u, row.n_raw - pos0);
+        for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+            const uint r = off >> 7;
+            const uint c = off & 127u;
+            const uint raw_row = (row.raw_start + pos0 + r) % args.raw_cap;
+            device const float4 *src = (device const float4 *)(raw_kv +
+                raw_base + (uint64_t)raw_row * args.raw_row_stride);
+            kv_shared[off] = src[c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < n_rows; r++) {
+            dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
+                                                 r,
+                                                 q0, q1, q2, q3,
+                                                 args.scale,
+                                                 lane,
+                                                 M, S,
+                                                 o0, o1, o2, o3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (args.ratio != 0u && row.n_comp != 0u && args.comp_cap != 0u) {
+        const uint64_t comp_base = (uint64_t)row.slot * args.comp_slot_stride;
+        uint visible = (row.pos + 1u) / args.ratio;
+        visible = min(visible, row.n_comp);
+        visible = min(visible, args.comp_cap);
+        if (row.top_k != 0u && args.top_k != 0u) {
+            const uint use_top_k = min(row.top_k, args.top_k);
+            device const int32_t *row_topk = (device const int32_t *)(topk +
+                (uint64_t)token * args.topk_token_stride);
+            bool stop = false;
+            for (uint i = 0; i < use_top_k && !stop; i += 4u) {
+                uint comp_rows[4];
+                uint n_rows = 0;
+                for (uint j = 0; j < 4u && i + j < use_top_k; j++) {
+                    const int32_t idx = row_topk[i + j];
+                    if (idx < 0) {
+                        continue;
+                    }
+                    if ((uint)idx >= visible) {
+                        stop = true;
+                        break;
+                    }
+                    comp_rows[n_rows++] = (uint)idx;
+                }
+                if (n_rows == 0u) {
+                    continue;
+                }
+                for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+                    const uint r = off >> 7;
+                    const uint c = off & 127u;
+                    device const float4 *src = (device const float4 *)(comp_kv +
+                        comp_base + (uint64_t)comp_rows[r] * args.comp_row_stride);
+                    kv_shared[off] = src[c];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint r = 0; r < n_rows; r++) {
+                    dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
+                                                         r,
+                                                         q0, q1, q2, q3,
+                                                         args.scale,
+                                                         lane,
+                                                         M, S,
+                                                         o0, o1, o2, o3);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        } else {
+            for (uint comp0 = 0; comp0 < visible; comp0 += 4u) {
+                const uint n_rows = min(4u, visible - comp0);
+                for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+                    const uint r = off >> 7;
+                    const uint c = off & 127u;
+                    device const float4 *src = (device const float4 *)(comp_kv +
+                        comp_base + (uint64_t)(comp0 + r) * args.comp_row_stride);
+                    kv_shared[off] = src[c];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint r = 0; r < n_rows; r++) {
+                    dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
+                                                         r,
+                                                         q0, q1, q2, q3,
+                                                         args.scale,
+                                                         lane,
+                                                         M, S,
+                                                         o0, o1, o2, o3);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
     }
 
     dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);

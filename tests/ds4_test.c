@@ -707,22 +707,33 @@ static void test_batch_shared_batched_prefill_equivalence(void) {
     int pos_a = 0;
     int pos_b = 0;
     while (pos_a < prompt_a.len || pos_b < prompt_b.len) {
-        ds4_batch_step steps[2];
-        int refresh[2] = {0};
+        ds4_batch_prefill_segment segments[2];
         int n = 0;
         if (pos_a < prompt_a.len) {
-            steps[n] = (ds4_batch_step){ .slot = 0, .token = prompt_a.v[pos_a] };
-            refresh[n] = pos_a + 1 == prompt_a.len;
+            int len = prompt_a.len - pos_a;
+            if (len > 5) len = 5;
+            segments[n] = (ds4_batch_prefill_segment){
+                .slot = 0,
+                .tokens = &prompt_a.v[pos_a],
+                .n_tokens = len,
+                .refresh_logits = pos_a + len == prompt_a.len,
+            };
+            pos_a += len;
             n++;
         }
         if (pos_b < prompt_b.len) {
-            steps[n] = (ds4_batch_step){ .slot = 1, .token = prompt_b.v[pos_b] };
-            refresh[n] = pos_b + 1 == prompt_b.len;
+            int len = prompt_b.len - pos_b;
+            if (len > 3) len = 3;
+            segments[n] = (ds4_batch_prefill_segment){
+                .slot = 1,
+                .tokens = &prompt_b.v[pos_b],
+                .n_tokens = len,
+                .refresh_logits = pos_b + len == prompt_b.len,
+            };
+            pos_b += len;
             n++;
         }
-        TEST_ASSERT(ds4_batch_prefill(batch, steps, refresh, n, err, sizeof(err)) == 0);
-        if (pos_a < prompt_a.len) pos_a++;
-        if (pos_b < prompt_b.len) pos_b++;
+        TEST_ASSERT(ds4_batch_prefill_segments(batch, segments, n, err, sizeof(err)) == 0);
     }
 
     test_compare_session_batch_top_with_tolerance("batched prefill slot0",
@@ -761,6 +772,8 @@ static void test_batch_shared_long_boundary_isolation(void) {
 
     ds4_batch_claim_slot(batch, 2);
     ds4_batch_claim_slot(batch, 0);
+    ds4_batch_invalidate_slot(batch, 2);
+    ds4_batch_invalidate_slot(batch, 0);
     TEST_ASSERT(ds4_session_sync(session_a, &prompt_a, err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_session_sync(session_b, &prompt_b, err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_batch_sync(batch, 2, &prompt_a, err, sizeof(err)) == 0);

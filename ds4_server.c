@@ -9208,6 +9208,37 @@ static bool batch_prefill_step_wants_logits(server *s, generation_state *g, int 
     return false;
 }
 
+static int batch_prefill_align_tokens(void) {
+    const char *env = getenv("DS4_BATCH_PREFILL_ALIGN_TOKENS");
+    if (env && env[0]) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v >= 0 && v <= INT_MAX) return (int)v;
+    }
+    return 0;
+}
+
+static int batch_prefill_segment_end(server *s, generation_state *g, int max_tokens) {
+    const int start = g->prefill_pos;
+    int end = start + max_tokens;
+    if (end > g->j->req.prompt.len) end = g->j->req.prompt.len;
+    const int align = batch_prefill_align_tokens();
+    if (align > 1 && end < g->j->req.prompt.len) {
+        const int rem = start % align;
+        if (rem != 0) {
+            const int boundary = start + (align - rem);
+            if (boundary > start && boundary < end) end = boundary;
+        } else {
+            const int aligned_end = end - (end % align);
+            if (aligned_end > start && aligned_end < end) end = aligned_end;
+        }
+    }
+    for (int next = start + 1; next <= end; next++) {
+        if (batch_prefill_step_wants_logits(s, g, next)) return next;
+    }
+    return end;
+}
+
 static int batch_prefill_wait_us(server *s) {
     const char *env = getenv("DS4_BATCH_PREFILL_WAIT_US");
     if (env && env[0]) {
@@ -9225,7 +9256,7 @@ static int batch_prefill_step_limit_tokens(void) {
         long v = strtol(env, &end, 10);
         if (end != env && *end == '\0' && v >= 0 && v <= INT_MAX) return (int)v;
     }
-    return 64;
+    return INT_MAX;
 }
 
 static int batch_prefill_fanout_min_tokens(void) {
@@ -9299,7 +9330,7 @@ static bool batch_prefill_shared_prefix_many(server *s, batch_request *reqs) {
             target = current + chunk_tokens;
         }
         if (target <= current) continue;
-        if (target - current < min_tokens && target < common) continue;
+        if (target - current < min_tokens) continue;
         const long score = (long)(target - current) * (long)(n - 1);
         const long best_score = (long)(best_target - best_current) * (long)(best_n - 1);
         if (score > best_score) {
@@ -9506,114 +9537,126 @@ static bool batch_prefill_many(server *s, batch_request *reqs) {
     if (strcmp(ds4_batch_backend_name(s->batch), "shared-decode") != 0) return false;
     if (batch_decode_ready_count(reqs, s->max_slots) > 0) return false;
 
-    ds4_batch_step steps[64];
-    int refresh_logits[64];
+    ds4_batch_prefill_segment segments[64];
     generation_state *gens[64];
+    int seg_lens[64];
     bool changed = false;
-    const int step_limit = batch_prefill_step_limit_tokens();
-    if (step_limit <= 0) return false;
-
-    int rounds = 0;
-    int total_rows = 0;
-    int max_batch = 0;
-    int total_logits = 0;
+    int row_budget = batch_prefill_step_limit_tokens();
+    if (row_budget <= 0) return false;
+    const int prefill_cap = ds4_batch_prefill_capacity(s->batch);
+    if (prefill_cap > 0 && row_budget > prefill_cap) row_budget = prefill_cap;
+    const int slot_chunk = batch_prefill_chunk_tokens();
     const int active = batch_active_count(reqs, s->max_slots);
+    int candidates[64];
+    int n_candidates = 0;
 
-    while (rounds < step_limit && batch_decode_ready_count(reqs, s->max_slots) == 0) {
-        int n = 0;
-        int n_logits = 0;
-
-        for (int i = 0; i < s->max_slots; i++) {
-            batch_request *br = &reqs[i];
-            if (br->phase != BATCH_REQ_PREFILL) continue;
-            generation_state *g = &br->gen;
-            job *j = g->j;
-            if (!generation_state_require_slot_current(g, "batched-prefill")) {
-                br->phase = BATCH_REQ_DONE;
-                changed = true;
-                continue;
-            }
-            if (g_stop_requested) {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "shutdown requested");
-                br->phase = BATCH_REQ_DONE;
-                changed = true;
-                continue;
-            }
-            if (g->prefill_pos >= j->req.prompt.len) {
-                br->phase = generation_state_start_decode(g) ? BATCH_REQ_DECODE : BATCH_REQ_DONE;
-                changed = true;
-                continue;
-            }
-            if (g->prefill_pos == 0) ds4_batch_invalidate_slot(s->batch, g->slot);
-            if (!batch_live_prefix_matches(s, g, g->prefill_pos)) continue;
-
-            const int next_pos = g->prefill_pos + 1;
-            steps[n] = (ds4_batch_step){
-                .slot = g->slot,
-                .token = j->req.prompt.v[g->prefill_pos],
-            };
-            refresh_logits[n] = batch_prefill_step_wants_logits(s, g, next_pos) ? 1 : 0;
-            if (refresh_logits[n]) n_logits++;
-            gens[n] = g;
-            n++;
+    for (int i = 0; i < s->max_slots; i++) {
+        batch_request *br = &reqs[i];
+        if (br->phase != BATCH_REQ_PREFILL) continue;
+        generation_state *g = &br->gen;
+        job *j = g->j;
+        if (!generation_state_require_slot_current(g, "batched-prefill")) {
+            br->phase = BATCH_REQ_DONE;
+            changed = true;
+            continue;
         }
-
-        if (n < 2) break;
-
-        char err[160];
-        err[0] = '\0';
-        if (ds4_batch_prefill(s->batch, steps, refresh_logits, n, err, sizeof(err)) != 0) {
-            for (int i = 0; i < n; i++) {
-                generation_state *g = gens[i];
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "%s", err);
-                ds4_batch_mark_slot_error(s->batch, g->slot);
-                trace_event(s, g->trace_id, "batch prefill failed: %s", g->err);
-                http_error(g->j->fd, 500, g->err);
-                reqs[g->slot].phase = BATCH_REQ_DONE;
-            }
-            return true;
+        if (g_stop_requested) {
+            g->finish = "error";
+            snprintf(g->err, sizeof(g->err), "shutdown requested");
+            br->phase = BATCH_REQ_DONE;
+            changed = true;
+            continue;
         }
+        if (g->prefill_pos >= j->req.prompt.len) {
+            br->phase = generation_state_start_decode(g) ? BATCH_REQ_DECODE : BATCH_REQ_DONE;
+            changed = true;
+            continue;
+        }
+        if (g->prefill_pos == 0) ds4_batch_invalidate_slot(s->batch, g->slot);
+        if (!batch_live_prefix_matches(s, g, g->prefill_pos)) continue;
+        candidates[n_candidates++] = i;
+    }
 
+    if (n_candidates < 2 || row_budget < 2) return changed;
+
+    int n = 0;
+    int rows = 0;
+    int n_logits = 0;
+    int remaining_rows = row_budget;
+    for (int ci = 0; ci < n_candidates && remaining_rows > 0; ci++) {
+        const int remaining_slots = n_candidates - ci;
+        int share = remaining_rows / remaining_slots;
+        if (share <= 0) share = 1;
+        if (slot_chunk > 0 && share > slot_chunk) share = slot_chunk;
+        generation_state *g = &reqs[candidates[ci]].gen;
+        job *j = g->j;
+        const int remaining_prompt = j->req.prompt.len - g->prefill_pos;
+        if (remaining_prompt <= 0) continue;
+        if (share > remaining_prompt) share = remaining_prompt;
+        const int next_pos = batch_prefill_segment_end(s, g, share);
+        const int len = next_pos - g->prefill_pos;
+        if (len <= 0) continue;
+        const bool wants_logits = batch_prefill_step_wants_logits(s, g, next_pos);
+        segments[n] = (ds4_batch_prefill_segment){
+            .slot = g->slot,
+            .tokens = &j->req.prompt.v[g->prefill_pos],
+            .n_tokens = len,
+            .refresh_logits = wants_logits ? 1 : 0,
+        };
+        gens[n] = g;
+        seg_lens[n] = len;
+        if (wants_logits) n_logits++;
+        rows += len;
+        remaining_rows -= len;
+        n++;
+    }
+
+    if (n < 2) return changed;
+
+    char err[160];
+    err[0] = '\0';
+    if (ds4_batch_prefill_segments(s->batch, segments, n, err, sizeof(err)) != 0) {
         for (int i = 0; i < n; i++) {
             generation_state *g = gens[i];
-            job *j = g->j;
-            g->prefill_pos++;
-            if (g->cold_store_len == g->prefill_pos &&
-                g->prefill_pos >= s->kv.opt.min_tokens &&
-                ds4_batch_slot_can_save(s->batch, g->slot)) {
-                if (kv_cache_store_batch_slot_prefix(s, g->slot, &j->req.prompt,
-                                                     g->prefill_pos, "cold")) {
-                    batch_kv_cache_note_store(g, g->prefill_pos);
-                }
-                g->cold_store_len = 0;
-            }
-            kv_cache_maybe_store_batch_continued(s, g);
-            if (g->prefill_pos >= j->req.prompt.len) {
-                reqs[g->slot].phase = generation_state_start_decode(g) ?
-                    BATCH_REQ_DECODE : BATCH_REQ_DONE;
-            }
+            g->finish = "error";
+            snprintf(g->err, sizeof(g->err), "%s", err);
+            ds4_batch_mark_slot_error(s->batch, g->slot);
+            trace_event(s, g->trace_id, "batch segmented prefill failed: %s", g->err);
+            http_error(g->j->fd, 500, g->err);
+            reqs[g->slot].phase = BATCH_REQ_DONE;
         }
-
-        changed = true;
-        rounds++;
-        total_rows += n;
-        total_logits += n_logits;
-        if (n > max_batch) max_batch = n;
+        return true;
     }
 
-    if (rounds > 0) {
-        server_log(DS4_LOG_PREFILL,
-                   "ds4-server: batch backend=%s active=%d batch=%d prefill=chunk steps=%d rows=%d logits=%d",
-                   ds4_batch_backend_name(s->batch),
-                   active,
-                   max_batch,
-                   rounds,
-                   total_rows,
-                   total_logits);
+    for (int i = 0; i < n; i++) {
+        generation_state *g = gens[i];
+        job *j = g->j;
+        g->prefill_pos += seg_lens[i];
+        if (g->cold_store_len == g->prefill_pos &&
+            g->prefill_pos >= s->kv.opt.min_tokens &&
+            ds4_batch_slot_can_save(s->batch, g->slot)) {
+            if (kv_cache_store_batch_slot_prefix(s, g->slot, &j->req.prompt,
+                                                 g->prefill_pos, "cold")) {
+                batch_kv_cache_note_store(g, g->prefill_pos);
+            }
+            g->cold_store_len = 0;
+        }
+        kv_cache_maybe_store_batch_continued(s, g);
+        if (g->prefill_pos >= j->req.prompt.len) {
+            reqs[g->slot].phase = generation_state_start_decode(g) ?
+                BATCH_REQ_DECODE : BATCH_REQ_DONE;
+        }
     }
-    return changed;
+
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: batch backend=%s active=%d batch=%d prefill=segment rows=%d slots=%d logits=%d",
+               ds4_batch_backend_name(s->batch),
+               active,
+               n,
+               rows,
+               n,
+               n_logits);
+    return true;
 }
 
 static bool batch_prefill_one(server *s, batch_request *reqs) {
@@ -10261,7 +10304,7 @@ static void usage(FILE *fp) {
         "  --batch-backend NAME\n"
         "      Batch runtime for --max-slots > 1: shared-decode (default) or session-slots.\n"
         "  --experimental-batched-prefill\n"
-        "      In shared-decode batch mode, advance one prompt token per active slot in a shared row batch.\n"
+        "      In shared-decode batch mode, pack active prompt segments into shared prefill row batches.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"

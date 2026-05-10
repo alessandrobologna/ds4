@@ -44,9 +44,19 @@ class CheckError(RuntimeError):
 
 
 def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((HOST, 0))
-        return int(sock.getsockname()[1])
+    avoid = {8000, 8010}
+    extra = os.environ.get("DS4_SERVER_BATCH_AVOID_PORTS", "")
+    for item in extra.split(","):
+        item = item.strip()
+        if item.isdigit():
+            avoid.add(int(item))
+    for _ in range(128):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((HOST, 0))
+            port = int(sock.getsockname()[1])
+            if port not in avoid:
+                return port
+    raise CheckError(f"could not find a free port outside {sorted(avoid)}")
 
 
 def resolve_model(path: str | None) -> str:
@@ -59,9 +69,10 @@ def resolve_model(path: str | None) -> str:
 
 
 class Server:
-    def __init__(self, argv: list[str], port: int):
+    def __init__(self, argv: list[str], port: int, env: dict[str, str] | None = None):
         self.argv = argv
         self.port = port
+        self.env = env
         self.proc: subprocess.Popen[str] | None = None
         self.lines: list[str] = []
         self._reader: threading.Thread | None = None
@@ -73,6 +84,7 @@ class Server:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=self.env,
         )
         self._reader = threading.Thread(target=self._read_log, daemon=True)
         self._reader.start()
@@ -143,6 +155,17 @@ def chat_body(prompt: str, max_tokens: int, stream: bool) -> dict:
     return body
 
 
+def completion_body(prompt: str, max_tokens: int) -> dict:
+    return {
+        "model": "deepseek-chat",
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "top_p": 1,
+        "stream": False,
+    }
+
+
 def post_json(port: int, path: str, body: dict, timeout: float = 180.0) -> bytes:
     conn = http.client.HTTPConnection(HOST, port, timeout=timeout)
     payload = json.dumps(body).encode("utf-8")
@@ -168,6 +191,28 @@ def run_chat(port: int, prompt: str, max_tokens: int, timeout: float) -> dict:
         port,
         "/v1/chat/completions",
         chat_body(prompt, max_tokens, False),
+        timeout=timeout,
+    )
+    elapsed = time.monotonic() - start
+    obj = json.loads(data.decode("utf-8"))
+    usage = obj.get("usage") or {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    if completion_tokens <= 0:
+        raise CheckError(f"missing completion token usage: {obj}")
+    return {
+        "elapsed": elapsed,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    }
+
+
+def run_completion(port: int, prompt: str, max_tokens: int, timeout: float) -> dict:
+    start = time.monotonic()
+    data = post_json(
+        port,
+        "/v1/completions",
+        completion_body(prompt, max_tokens),
         timeout=timeout,
     )
     elapsed = time.monotonic() - start
@@ -318,6 +363,107 @@ def count_logs(lines: list[str], needle: str) -> int:
     return sum(1 for line in lines if needle in line)
 
 
+def run_batched_prefill_smoke(args: argparse.Namespace) -> None:
+    args.model = resolve_model(args.model)
+    env = os.environ.copy()
+    env.setdefault("DS4_BATCH_PREFILL_FANOUT_MIN_TOKENS", "16")
+    env.setdefault("DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS", "256")
+    env.setdefault("DS4_BATCH_PREFILL_WAIT_US", "100000")
+
+    with tempfile.TemporaryDirectory(prefix="ds4-batch-prefill-smoke-") as tmp:
+        port = find_free_port()
+        kv_dir = str(Path(tmp) / "kv")
+        old_experimental = args.experimental_batched_prefill
+        args.experimental_batched_prefill = True
+        try:
+            argv = server_argv(
+                args,
+                port,
+                max_slots=2,
+                backend="shared-decode",
+                tokens=max(args.smoke_tokens, 4),
+                kv_dir=kv_dir,
+            )
+        finally:
+            args.experimental_batched_prefill = old_experimental
+
+        with Server(argv, port, env=env) as server:
+            shared = make_prefill_prompt(12)
+            fanout_prompts = [
+                shared + f"\nUnique fanout suffix for client {i}: keep this request distinct."
+                for i in range(2)
+            ]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                fanout_results = [
+                    f.result()
+                    for f in [
+                        pool.submit(run_completion, port, fanout_prompts[i], 1, args.request_timeout)
+                        for i in range(2)
+                    ]
+                ]
+            fanout_logs = count_logs(server.lines, "prefill=fanout")
+            if fanout_logs <= 0:
+                raise CheckError("shared-prefix prefill did not use fanout")
+            if any(r["completion_tokens"] <= 0 for r in fanout_results):
+                raise CheckError(f"fanout requests did not complete: {fanout_results}")
+
+            prefixes = [
+                "Cache prefix alpha.\n" + make_prefill_prompt(8),
+                "Cache prefix beta.\n" + make_prefill_prompt(8),
+            ]
+            for prefix in prefixes:
+                run_completion(port, prefix, 1, args.request_timeout)
+            if not server.wait_for_log(r"kv cache stored", timeout=20):
+                raise CheckError("prefix warmups did not store disk KV")
+            stores_before = count_logs(server.lines, "kv cache stored")
+            if stores_before < 2:
+                raise CheckError(f"expected at least two disk KV stores, saw {stores_before}")
+
+            hits_before = count_logs(server.lines, "kv cache hit")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                cached_results = [
+                    f.result()
+                    for f in [
+                        pool.submit(run_completion, port, prefixes[i], 1, args.request_timeout)
+                        for i in range(2)
+                    ]
+                ]
+            kv_hits = count_logs(server.lines, "kv cache hit") - hits_before
+            if kv_hits < 2:
+                logs = "\n".join(server.lines[-80:])
+                raise CheckError(
+                    f"expected two disk KV hits for cached prompts, saw {kv_hits}\n{logs}"
+                )
+            if any(r["completion_tokens"] <= 0 for r in cached_results):
+                raise CheckError(f"cached requests did not complete: {cached_results}")
+
+            segment_before = count_logs(server.lines, "prefill=segment")
+            divergent_prompts = [
+                prefixes[0] + "\nDivergent cached suffix alpha.\n" + make_prefill_prompt(8),
+                prefixes[1] + "\nDivergent cached suffix beta.\n" + make_prefill_prompt(8),
+            ]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                segment_results = [
+                    f.result()
+                    for f in [
+                        pool.submit(run_completion, port, divergent_prompts[i], 1, args.request_timeout)
+                        for i in range(2)
+                    ]
+                ]
+            segment_logs = count_logs(server.lines, "prefill=segment") - segment_before
+            if segment_logs <= 0:
+                logs = "\n".join(server.lines[-80:])
+                raise CheckError(f"divergent prompts did not use segmented prefill\n{logs}")
+            if any(r["completion_tokens"] <= 0 for r in segment_results):
+                raise CheckError(f"segmented prefill requests did not complete: {segment_results}")
+
+            print(
+                "server-batched-prefill-smoke: OK "
+                f"fanout={fanout_logs} segment={segment_logs} kv_hits={kv_hits} "
+                f"kv_stores={stores_before}"
+            )
+
+
 def run_smoke(args: argparse.Namespace) -> None:
     args.model = resolve_model(args.model)
     with tempfile.TemporaryDirectory(prefix="ds4-batch-smoke-") as tmp:
@@ -371,18 +517,20 @@ def benchmark_workload(args: argparse.Namespace, workload: str) -> tuple[str, in
         return BENCH_PROMPT, args.max_tokens
     if workload == "prefill":
         return make_prefill_prompt(args.prefill_repeats), args.prefill_max_tokens
+    if workload == "mixed":
+        return make_prefill_prompt(args.prefill_repeats), args.max_tokens
     raise CheckError(f"unknown benchmark workload: {workload}")
 
 
 def benchmark_prompts(args: argparse.Namespace, workload: str, clients: int) -> tuple[list[str], int]:
     prompt, max_tokens = benchmark_workload(args, workload)
     prompts = [prompt for _ in range(clients)]
-    if workload == "prefill" and args.prefill_unique_prefix:
+    if workload in {"prefill", "mixed"} and args.prefill_unique_prefix:
         prompts = [
             f"Unique request prefix {i:02d}: this request starts differently before the long body.\n{prompt}"
             for i in range(clients)
         ]
-    if workload == "prefill" and args.prefill_unique_suffix:
+    if workload in {"prefill", "mixed"} and args.prefill_unique_suffix:
         prompts = [
             prompt +
             f"\nUnique request suffix {i:02d}: answer for client {i} only after the shared context."
@@ -473,6 +621,7 @@ def benchmark_once(
             "max_prefill_batch": max_logged_prefill_batch(server.lines),
             "prefill_fanout": count_logs(server.lines, "prefill=fanout"),
             "prefill_chunk": count_logs(server.lines, "prefill=chunk"),
+            "prefill_segment": count_logs(server.lines, "prefill=segment"),
         }
 
 
@@ -523,10 +672,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
                         and workload == "prefill"
                         and label == "shared-decode"
                         and clients > 1
-                        and row["prefill_chunk"] <= 0
+                        and row["prefill_chunk"] + row["prefill_segment"] <= 0
                     ):
                         raise CheckError(
-                            "expected shared-decode row prefill chunk logs for "
+                            "expected shared-decode row prefill chunk/segment logs for "
                             f"clients={clients} trial={trial}, saw none"
                         )
                     rows.append(row)
@@ -540,7 +689,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
                         f"max_batch={row['max_batch']} "
                         f"max_prefill_batch={row['max_prefill_batch']} "
                         f"prefill_fanout={row['prefill_fanout']} "
-                        f"prefill_chunk={row['prefill_chunk']}",
+                        f"prefill_chunk={row['prefill_chunk']} "
+                        f"prefill_segment={row['prefill_segment']}",
                         flush=True,
                     )
 
@@ -574,7 +724,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["smoke", "benchmark"])
+    parser.add_argument("mode", choices=["smoke", "prefill-smoke", "benchmark"])
     parser.add_argument("--server", default="./ds4-server")
     parser.add_argument("--model", default=None)
     parser.add_argument("--ctx", type=int, default=4096)
@@ -582,7 +732,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument("--backend", default="shared-decode")
     parser.add_argument("--smoke-tokens", type=int, default=30)
-    parser.add_argument("--workload", choices=["decode", "prefill", "both"], default="decode")
+    parser.add_argument("--workload", choices=["decode", "prefill", "mixed", "both"], default="decode")
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--prefill-repeats", type=int, default=160)
     parser.add_argument("--prefill-max-tokens", type=int, default=1)
@@ -615,7 +765,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--expect-prefill-chunk",
         action="store_true",
-        help="Fail shared-decode prefill benchmark trials with clients > 1 unless row prefill chunking is observed.",
+        help="Fail shared-decode prefill benchmark trials with clients > 1 unless row prefill chunking/segmentation is observed.",
     )
     args = parser.parse_args(argv)
     if args.mode == "smoke" and args.backend not in {"shared-decode", "session-slots"}:
@@ -640,6 +790,8 @@ def main(argv: list[str]) -> int:
     try:
         if args.mode == "smoke":
             run_smoke(args)
+        elif args.mode == "prefill-smoke":
+            run_batched_prefill_smoke(args)
         else:
             run_benchmark(args)
     except CheckError as exc:

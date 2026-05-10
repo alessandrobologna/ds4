@@ -2610,6 +2610,26 @@ typedef struct {
 } ds4_metal_dsv4_indexed_attention_args;
 
 typedef struct {
+    uint32_t n_tokens;
+    uint32_t n_slots;
+    uint32_t n_head;
+    uint32_t raw_cap;
+    uint32_t comp_cap;
+    uint32_t top_k;
+    uint32_t ratio;
+    uint64_t q_token_stride;
+    uint64_t q_head_stride;
+    uint64_t raw_slot_stride;
+    uint64_t raw_row_stride;
+    uint64_t comp_slot_stride;
+    uint64_t comp_row_stride;
+    uint64_t topk_token_stride;
+    uint64_t dst_token_stride;
+    uint64_t dst_head_stride;
+    float    scale;
+} ds4_metal_dsv4_segmented_attention_args;
+
+typedef struct {
     uint32_t n_comp;
     uint32_t n_tokens;
     uint32_t n_head;
@@ -10873,6 +10893,773 @@ int ds4_metal_attention_indexed_mixed_batch_heads_tensor(
         ds4_metal_end_compute_encoder(cb, enc);
 
         if (!ds4_metal_finish_command_buffer(cb, owned, "graph indexed mixed attention heads")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_metal_attention_segmented_mixed_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const ds4_metal_tensor *comp_kv,
+        const ds4_metal_tensor *topk,
+        const ds4_metal_tensor *rows,
+        uint32_t                n_tokens,
+        uint32_t                n_slots,
+        uint32_t                raw_cap,
+        uint32_t                comp_cap,
+        uint32_t                top_k,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv || !rows ||
+        n_tokens == 0 || n_slots == 0 || raw_cap == 0 ||
+        n_head == 0 || head_dim != 512 ||
+        (ratio != 0 && !comp_kv) ||
+        (top_k != 0 && !topk)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal segmented attention sinks range is outside the mapped model\n");
+            return 0;
+        }
+
+        const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
+        const uint64_t raw_bytes = (uint64_t)n_slots * raw_cap * row_bytes;
+        const uint64_t comp_bytes = (uint64_t)n_slots * comp_cap * row_bytes;
+        const uint64_t topk_bytes = (uint64_t)(top_k ? top_k : 1u) * n_tokens * sizeof(int32_t);
+        const uint64_t rows_bytes = (uint64_t)n_tokens * sizeof(ds4_metal_segmented_attention_row);
+        id<MTLBuffer> qbuf = ds4_metal_tensor_buffer(q);
+        id<MTLBuffer> rawbuf = ds4_metal_tensor_buffer(raw_kv);
+        id<MTLBuffer> compbuf = comp_kv ? ds4_metal_tensor_buffer(comp_kv) : rawbuf;
+        id<MTLBuffer> topkbuf = topk ? ds4_metal_tensor_buffer(topk) : rawbuf;
+        id<MTLBuffer> rowsbuf = ds4_metal_tensor_buffer(rows);
+        id<MTLBuffer> headsbuf = ds4_metal_tensor_buffer(heads);
+        if (!qbuf || !rawbuf || !compbuf || !topkbuf || !rowsbuf || !headsbuf ||
+            ds4_metal_tensor_bytes(q) < q_bytes ||
+            ds4_metal_tensor_bytes(raw_kv) < raw_bytes ||
+            (ratio != 0 && ds4_metal_tensor_bytes(comp_kv) < comp_bytes) ||
+            (top_k != 0 && ds4_metal_tensor_bytes(topk) < topk_bytes) ||
+            ds4_metal_tensor_bytes(rows) < rows_bytes ||
+            ds4_metal_tensor_bytes(heads) < q_bytes) {
+            fprintf(stderr, "ds4: Metal segmented mixed attention received undersized buffers\n");
+            return 0;
+        }
+
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_metal_wrap_model_range(model_map, model_size,
+                                                             sinks_offset,
+                                                             (uint64_t)n_head * sizeof(float),
+                                                             &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_metal_get_pipeline("kernel_dsv4_segmented_mixed_attention_heads8_rb4");
+        id<MTLComputePipelineState> sort_pipeline = nil;
+        if (top_k != 0) {
+            sort_pipeline = ds4_metal_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
+                                                   "kernel_dsv4_sort_i32_rows_asc");
+            if (!sort_pipeline) return 0;
+            if ((NSUInteger)top_k > sort_pipeline.maxTotalThreadsPerThreadgroup) {
+                fprintf(stderr, "ds4: Metal segmented attention top-k exceeds sort threadgroup limit\n");
+                return 0;
+            }
+            if (!ds4_metal_ensure_scratch_buffer(&g_indexed_topk_buffer,
+                                                 &g_indexed_topk_bytes,
+                                                 (NSUInteger)topk_bytes,
+                                                 "ds4_segmented_topk_sorted")) {
+                return 0;
+            }
+        }
+        if (!pipeline) return 0;
+
+        ds4_metal_dsv4_segmented_attention_args attn_args = {
+            .n_tokens = n_tokens,
+            .n_slots = n_slots,
+            .n_head = n_head,
+            .raw_cap = raw_cap,
+            .comp_cap = comp_cap,
+            .top_k = top_k,
+            .ratio = ratio,
+            .q_token_stride = (uint64_t)n_head * row_bytes,
+            .q_head_stride = row_bytes,
+            .raw_slot_stride = (uint64_t)raw_cap * row_bytes,
+            .raw_row_stride = row_bytes,
+            .comp_slot_stride = (uint64_t)comp_cap * row_bytes,
+            .comp_row_stride = row_bytes,
+            .topk_token_stride = (uint64_t)(top_k ? top_k : 1u) * sizeof(int32_t),
+            .dst_token_stride = (uint64_t)n_head * row_bytes,
+            .dst_head_stride = row_bytes,
+            .scale = 1.0f / sqrtf((float)head_dim),
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = nil;
+        if (top_k != 0) {
+            ds4_metal_dsv4_topk_mask_args sort_args = {
+                .ne00 = (int64_t)top_k,
+                .ne01 = (int64_t)n_tokens,
+                .nb00 = sizeof(int32_t),
+                .nb01 = (uint64_t)top_k * sizeof(int32_t),
+                .ne0 = (int64_t)top_k,
+                .ne1 = (int64_t)n_tokens,
+                .nb0 = sizeof(int32_t),
+                .nb1 = (uint64_t)top_k * sizeof(int32_t),
+            };
+            enc = ds4_metal_compute_encoder(cb);
+            [enc setComputePipelineState:sort_pipeline];
+            [enc setBytes:&sort_args length:sizeof(sort_args) atIndex:0];
+            [enc setBuffer:topkbuf offset:ds4_metal_tensor_offset(topk) atIndex:1];
+            [enc setBuffer:g_indexed_topk_buffer offset:0 atIndex:2];
+            [enc setThreadgroupMemoryLength:(NSUInteger)top_k * sizeof(int32_t) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(top_k, 1, 1)];
+            ds4_metal_end_compute_encoder(cb, enc);
+        }
+
+        enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&attn_args length:sizeof(attn_args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_metal_tensor_offset(q) atIndex:1];
+        [enc setBuffer:rawbuf offset:ds4_metal_tensor_offset(raw_kv) atIndex:2];
+        [enc setBuffer:compbuf offset:comp_kv ? ds4_metal_tensor_offset(comp_kv) : ds4_metal_tensor_offset(raw_kv) atIndex:3];
+        [enc setBuffer:top_k ? g_indexed_topk_buffer : topkbuf
+              offset:top_k ? 0 : ds4_metal_tensor_offset(raw_kv)
+             atIndex:4];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
+        [enc setBuffer:rowsbuf offset:ds4_metal_tensor_offset(rows) atIndex:6];
+        [enc setBuffer:headsbuf offset:ds4_metal_tensor_offset(heads) atIndex:7];
+        [enc setThreadgroupMemoryLength:4u * 128u * 4u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, ((NSUInteger)n_head + 7u) / 8u, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "graph segmented mixed attention heads")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_metal_attention_prefill_masked_raw_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const uint16_t         *mask,
+        uint32_t                n_tokens,
+        uint32_t                n_keys,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv || !mask ||
+        n_tokens == 0 || n_keys == 0 || n_head == 0 || head_dim != 512) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal masked raw attention sinks range is outside the mapped model\n");
+            return 0;
+        }
+
+        id<MTLBuffer> qbuf = ds4_metal_tensor_buffer(q);
+        id<MTLBuffer> rawbuf = ds4_metal_tensor_buffer(raw_kv);
+        id<MTLBuffer> headsbuf = ds4_metal_tensor_buffer(heads);
+        const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
+        const uint64_t raw_bytes = (uint64_t)n_keys * row_bytes;
+        if (!qbuf || !rawbuf || !headsbuf ||
+            ds4_metal_tensor_bytes(q) < q_bytes ||
+            ds4_metal_tensor_bytes(raw_kv) < raw_bytes ||
+            ds4_metal_tensor_bytes(heads) < q_bytes) {
+            fprintf(stderr, "ds4: Metal masked raw FlashAttention received undersized buffers\n");
+            return 0;
+        }
+
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_metal_wrap_model_range(model_map, model_size,
+                                                             sinks_offset,
+                                                             (uint64_t)n_head * sizeof(float),
+                                                             &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        const uint32_t nqptg = 8;
+        const uint32_t ncpsg = 64;
+        const uint32_t nsg = head_dim >= 512 ? 8u : 4u;
+        const bool has_kvpad = (n_keys % ncpsg) != 0;
+        const bool bc_mask = (n_tokens % nqptg) != 0;
+        const NSUInteger row_bytes_f16 = (NSUInteger)head_dim * sizeof(uint16_t);
+        const NSUInteger mask_bytes = (NSUInteger)n_keys * (NSUInteger)n_tokens * sizeof(uint16_t);
+        const NSUInteger kv_bytes = (NSUInteger)n_keys * row_bytes_f16;
+        const NSUInteger pad_bytes = has_kvpad
+            ? (NSUInteger)ncpsg * (2u * row_bytes_f16 + (NSUInteger)n_tokens * sizeof(uint16_t))
+            : 1u;
+        const NSUInteger nblk0 = ((NSUInteger)n_keys + ncpsg - 1u) / ncpsg;
+        const NSUInteger nblk1 = ((NSUInteger)n_tokens + nqptg - 1u) / nqptg;
+        const NSUInteger blk_bytes = ds4_metal_align_up_ns(nblk0 * nblk1, 32u);
+
+        id<MTLBuffer> mask_buffer =
+            ds4_metal_new_transient_buffer(mask_bytes, "ds4_flash_attn_mask");
+        if (!mask_buffer ||
+            !ds4_metal_ensure_scratch_buffer(&g_flash_attn_kv_buffer,
+                                             &g_flash_attn_kv_bytes,
+                                             kv_bytes,
+                                             "ds4_flash_attn_kv_f16") ||
+            !ds4_metal_ensure_scratch_buffer(&g_flash_attn_pad_buffer,
+                                             &g_flash_attn_pad_bytes,
+                                             pad_bytes,
+                                             "ds4_flash_attn_pad") ||
+            !ds4_metal_ensure_scratch_buffer(&g_flash_attn_blk_buffer,
+                                             &g_flash_attn_blk_bytes,
+                                             blk_bytes,
+                                             "ds4_flash_attn_blk")) {
+            return 0;
+        }
+        memcpy([mask_buffer contents], mask, mask_bytes);
+
+        id<MTLComputePipelineState> pad_pipeline = nil;
+        if (has_kvpad) {
+            pad_pipeline = ds4_metal_get_flash_attn_pad_pipeline(true, (int32_t)ncpsg);
+            if (!pad_pipeline) return 0;
+        }
+        id<MTLComputePipelineState> blk_pipeline =
+            ds4_metal_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
+        id<MTLComputePipelineState> attn_pipeline =
+            ds4_metal_get_flash_attn_pipeline("kernel_flash_attn_ext_f16_dk512_dv512",
+                                              true, true, false, false, has_kvpad, bc_mask,
+                                              (int32_t)head_dim,
+                                              (int32_t)head_dim,
+                                              (int32_t)nsg);
+        if (!blk_pipeline || !attn_pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (!ds4_metal_encode_cpy_f32_f16_1d(cb,
+                                             rawbuf,
+                                             ds4_metal_tensor_offset(raw_kv),
+                                             g_flash_attn_kv_buffer,
+                                             0,
+                                             n_keys * head_dim)) {
+            return 0;
+        }
+
+        if (has_kvpad) {
+            ds4_metal_flash_attn_pad_args pad_args = {
+                .ne11 = (int32_t)n_keys,
+                .ne_12_2 = 1,
+                .ne_12_3 = 1,
+                .nb11 = row_bytes_f16,
+                .nb12 = (uint64_t)n_keys * row_bytes_f16,
+                .nb13 = (uint64_t)n_keys * row_bytes_f16,
+                .nb21 = row_bytes_f16,
+                .nb22 = (uint64_t)n_keys * row_bytes_f16,
+                .nb23 = (uint64_t)n_keys * row_bytes_f16,
+                .ne31 = (int32_t)n_tokens,
+                .ne32 = 1,
+                .ne33 = 1,
+                .nb31 = (uint64_t)n_keys * sizeof(uint16_t),
+                .nb32 = mask_bytes,
+                .nb33 = mask_bytes,
+            };
+
+            id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+            [enc setComputePipelineState:pad_pipeline];
+            [enc setBytes:&pad_args length:sizeof(pad_args) atIndex:0];
+            [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:1];
+            [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
+            [enc setBuffer:mask_buffer offset:0 atIndex:3];
+            [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            ds4_metal_end_compute_encoder(cb, enc);
+        }
+
+        ds4_metal_flash_attn_blk_args blk_args = {
+            .ne01 = (int32_t)n_tokens,
+            .ne30 = (int32_t)n_keys,
+            .ne31 = (int32_t)n_tokens,
+            .ne32 = 1,
+            .ne33 = 1,
+            .nb31 = (uint64_t)n_keys * sizeof(uint16_t),
+            .nb32 = mask_bytes,
+            .nb33 = mask_bytes,
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:blk_pipeline];
+        [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
+        [enc setBuffer:mask_buffer offset:0 atIndex:1];
+        [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        ds4_metal_flash_attn_vec_args args = {
+            .ne01 = (int32_t)n_tokens,
+            .ne02 = (int32_t)n_head,
+            .ne03 = 1,
+            .nb01 = (uint64_t)n_head * row_bytes,
+            .nb02 = row_bytes,
+            .nb03 = (uint64_t)n_tokens * n_head * row_bytes,
+            .ne11 = (int32_t)n_keys,
+            .ne_12_2 = 1,
+            .ne_12_3 = 1,
+            .ns10 = (int32_t)head_dim,
+            .nb11 = row_bytes_f16,
+            .nb12 = (uint64_t)n_keys * row_bytes_f16,
+            .nb13 = (uint64_t)n_keys * row_bytes_f16,
+            .ns20 = (int32_t)head_dim,
+            .nb21 = row_bytes_f16,
+            .nb22 = (uint64_t)n_keys * row_bytes_f16,
+            .nb23 = (uint64_t)n_keys * row_bytes_f16,
+            .ne31 = (int32_t)n_tokens,
+            .ne32 = 1,
+            .ne33 = 1,
+            .nb31 = (uint64_t)n_keys * sizeof(uint16_t),
+            .nb32 = mask_bytes,
+            .nb33 = mask_bytes,
+            .ne1 = (int32_t)n_head,
+            .ne2 = (int32_t)n_tokens,
+            .ne3 = 1,
+            .scale = 1.0f / sqrtf((float)head_dim),
+            .max_bias = 0.0f,
+            .m0 = 0.0f,
+            .m1 = 0.0f,
+            .n_head_log2 = 0,
+            .logit_softcap = 0.0f,
+        };
+
+        const NSUInteger padded_v = ds4_metal_align_up_ns(head_dim, 64u);
+        const NSUInteger shared_elems = (NSUInteger)nqptg *
+            ((NSUInteger)head_dim + 2u * padded_v + 2u * (2u * (NSUInteger)ncpsg));
+        const NSUInteger shared_bytes = ds4_metal_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
+
+        enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:attn_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_metal_tensor_offset(q) atIndex:1];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:3];
+        [enc setBuffer:mask_buffer offset:0 atIndex:4];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
+        [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
+        [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:7];
+        [enc setBuffer:headsbuf offset:ds4_metal_tensor_offset(heads) atIndex:8];
+        [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "graph masked raw prefill attention heads")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_metal_attention_prefill_masked_multi_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *packed_kv,
+        const uint16_t         *mask,
+        uint32_t                n_batches,
+        uint32_t                n_tokens,
+        uint32_t                n_keys,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !packed_kv || !mask ||
+        n_batches == 0 || n_tokens == 0 || n_keys == 0 ||
+        n_head == 0 || head_dim != 512) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal multi masked attention sinks range is outside the mapped model\n");
+            return 0;
+        }
+
+        id<MTLBuffer> qbuf = ds4_metal_tensor_buffer(q);
+        id<MTLBuffer> kvbuf = ds4_metal_tensor_buffer(packed_kv);
+        id<MTLBuffer> headsbuf = ds4_metal_tensor_buffer(heads);
+        const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t q_bytes = (uint64_t)n_batches * n_tokens * n_head * row_bytes;
+        const uint64_t kv_bytes_f32 = (uint64_t)n_batches * n_keys * row_bytes;
+        if (!qbuf || !kvbuf || !headsbuf ||
+            ds4_metal_tensor_bytes(q) < q_bytes ||
+            ds4_metal_tensor_bytes(packed_kv) < kv_bytes_f32 ||
+            ds4_metal_tensor_bytes(heads) < q_bytes) {
+            fprintf(stderr, "ds4: Metal multi masked FlashAttention received undersized buffers\n");
+            return 0;
+        }
+
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_metal_wrap_model_range(model_map, model_size,
+                                                             sinks_offset,
+                                                             (uint64_t)n_head * sizeof(float),
+                                                             &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        const uint32_t nqptg = 8;
+        const uint32_t ncpsg = 64;
+        const uint32_t nsg = head_dim >= 512 ? 8u : 4u;
+        const bool has_kvpad = (n_keys % ncpsg) != 0;
+        const bool bc_mask = (n_tokens % nqptg) != 0;
+        const NSUInteger row_bytes_f16 = (NSUInteger)head_dim * sizeof(uint16_t);
+        const NSUInteger one_mask_bytes = (NSUInteger)n_keys * (NSUInteger)n_tokens * sizeof(uint16_t);
+        const NSUInteger mask_bytes = one_mask_bytes * (NSUInteger)n_batches;
+        const NSUInteger kv_bytes = (NSUInteger)n_batches * (NSUInteger)n_keys * row_bytes_f16;
+        const NSUInteger one_pad_bytes = (NSUInteger)ncpsg *
+            (2u * row_bytes_f16 + (NSUInteger)n_tokens * sizeof(uint16_t));
+        const NSUInteger pad_bytes = has_kvpad ? one_pad_bytes * (NSUInteger)n_batches : 1u;
+        const NSUInteger nblk0 = ((NSUInteger)n_keys + ncpsg - 1u) / ncpsg;
+        const NSUInteger nblk1 = ((NSUInteger)n_tokens + nqptg - 1u) / nqptg;
+        const NSUInteger blk_bytes = ds4_metal_align_up_ns(nblk0 * nblk1 * (NSUInteger)n_batches, 32u);
+
+        id<MTLBuffer> mask_buffer =
+            ds4_metal_new_transient_buffer(mask_bytes, "ds4_flash_attn_multi_mask");
+        if (!mask_buffer ||
+            !ds4_metal_ensure_scratch_buffer(&g_flash_attn_kv_buffer,
+                                             &g_flash_attn_kv_bytes,
+                                             kv_bytes,
+                                             "ds4_flash_attn_multi_kv_f16") ||
+            !ds4_metal_ensure_scratch_buffer(&g_flash_attn_pad_buffer,
+                                             &g_flash_attn_pad_bytes,
+                                             pad_bytes,
+                                             "ds4_flash_attn_multi_pad") ||
+            !ds4_metal_ensure_scratch_buffer(&g_flash_attn_blk_buffer,
+                                             &g_flash_attn_blk_bytes,
+                                             blk_bytes,
+                                             "ds4_flash_attn_multi_blk")) {
+            return 0;
+        }
+        memcpy([mask_buffer contents], mask, mask_bytes);
+
+        id<MTLComputePipelineState> pad_pipeline = nil;
+        if (has_kvpad) {
+            pad_pipeline = ds4_metal_get_flash_attn_pad_pipeline(true, (int32_t)ncpsg);
+            if (!pad_pipeline) return 0;
+        }
+        id<MTLComputePipelineState> blk_pipeline =
+            ds4_metal_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
+        id<MTLComputePipelineState> attn_pipeline =
+            ds4_metal_get_flash_attn_pipeline("kernel_flash_attn_ext_f16_dk512_dv512",
+                                              true, true, false, false, has_kvpad, bc_mask,
+                                              (int32_t)head_dim,
+                                              (int32_t)head_dim,
+                                              (int32_t)nsg);
+        if (!blk_pipeline || !attn_pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (!ds4_metal_encode_cpy_f32_f16_1d(cb,
+                                             kvbuf,
+                                             ds4_metal_tensor_offset(packed_kv),
+                                             g_flash_attn_kv_buffer,
+                                             0,
+                                             n_batches * n_keys * head_dim)) {
+            return 0;
+        }
+
+        if (has_kvpad) {
+            ds4_metal_flash_attn_pad_args pad_args = {
+                .ne11 = (int32_t)n_keys,
+                .ne_12_2 = 1,
+                .ne_12_3 = (int32_t)n_batches,
+                .nb11 = row_bytes_f16,
+                .nb12 = (uint64_t)n_keys * row_bytes_f16,
+                .nb13 = (uint64_t)n_keys * row_bytes_f16,
+                .nb21 = row_bytes_f16,
+                .nb22 = (uint64_t)n_keys * row_bytes_f16,
+                .nb23 = (uint64_t)n_keys * row_bytes_f16,
+                .ne31 = (int32_t)n_tokens,
+                .ne32 = 1,
+                .ne33 = (int32_t)n_batches,
+                .nb31 = (uint64_t)n_keys * sizeof(uint16_t),
+                .nb32 = one_mask_bytes,
+                .nb33 = one_mask_bytes,
+            };
+
+            id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+            [enc setComputePipelineState:pad_pipeline];
+            [enc setBytes:&pad_args length:sizeof(pad_args) atIndex:0];
+            [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:1];
+            [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
+            [enc setBuffer:mask_buffer offset:0 atIndex:3];
+            [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, n_batches)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            ds4_metal_end_compute_encoder(cb, enc);
+        }
+
+        ds4_metal_flash_attn_blk_args blk_args = {
+            .ne01 = (int32_t)n_tokens,
+            .ne30 = (int32_t)n_keys,
+            .ne31 = (int32_t)n_tokens,
+            .ne32 = 1,
+            .ne33 = (int32_t)n_batches,
+            .nb31 = (uint64_t)n_keys * sizeof(uint16_t),
+            .nb32 = one_mask_bytes,
+            .nb33 = one_mask_bytes,
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:blk_pipeline];
+        [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
+        [enc setBuffer:mask_buffer offset:0 atIndex:1];
+        [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, n_batches)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        ds4_metal_flash_attn_vec_args args = {
+            .ne01 = (int32_t)n_tokens,
+            .ne02 = (int32_t)n_head,
+            .ne03 = (int32_t)n_batches,
+            .nb01 = (uint64_t)n_head * row_bytes,
+            .nb02 = row_bytes,
+            .nb03 = (uint64_t)n_tokens * n_head * row_bytes,
+            .ne11 = (int32_t)n_keys,
+            .ne_12_2 = 1,
+            .ne_12_3 = (int32_t)n_batches,
+            .ns10 = (int32_t)head_dim,
+            .nb11 = row_bytes_f16,
+            .nb12 = (uint64_t)n_keys * row_bytes_f16,
+            .nb13 = (uint64_t)n_keys * row_bytes_f16,
+            .ns20 = (int32_t)head_dim,
+            .nb21 = row_bytes_f16,
+            .nb22 = (uint64_t)n_keys * row_bytes_f16,
+            .nb23 = (uint64_t)n_keys * row_bytes_f16,
+            .ne31 = (int32_t)n_tokens,
+            .ne32 = 1,
+            .ne33 = (int32_t)n_batches,
+            .nb31 = (uint64_t)n_keys * sizeof(uint16_t),
+            .nb32 = one_mask_bytes,
+            .nb33 = one_mask_bytes,
+            .ne1 = (int32_t)n_head,
+            .ne2 = (int32_t)n_tokens,
+            .ne3 = (int32_t)n_batches,
+            .scale = 1.0f / sqrtf((float)head_dim),
+            .max_bias = 0.0f,
+            .m0 = 0.0f,
+            .m1 = 0.0f,
+            .n_head_log2 = 0,
+            .logit_softcap = 0.0f,
+        };
+
+        const NSUInteger padded_v = ds4_metal_align_up_ns(head_dim, 64u);
+        const NSUInteger shared_elems = (NSUInteger)nqptg *
+            ((NSUInteger)head_dim + 2u * padded_v + 2u * (2u * (NSUInteger)ncpsg));
+        const NSUInteger shared_bytes = ds4_metal_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
+
+        enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:attn_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_metal_tensor_offset(q) atIndex:1];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:3];
+        [enc setBuffer:mask_buffer offset:0 atIndex:4];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
+        [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
+        [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:7];
+        [enc setBuffer:headsbuf offset:ds4_metal_tensor_offset(heads) atIndex:8];
+        [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, n_batches)
+             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "graph multi masked prefill attention heads")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_metal_attention_prefill_segmented_flash_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *packed_kv,
+        const ds4_metal_tensor *rows,
+        uint32_t                n_tokens,
+        uint32_t                n_packed_keys,
+        uint32_t                max_keys,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !packed_kv || !rows ||
+        n_tokens == 0 || n_packed_keys == 0 || max_keys == 0 ||
+        n_head == 0 || head_dim != 512) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal segmented FlashAttention sinks range is outside the mapped model\n");
+            return 0;
+        }
+
+        id<MTLBuffer> qbuf = ds4_metal_tensor_buffer(q);
+        id<MTLBuffer> kvbuf = ds4_metal_tensor_buffer(packed_kv);
+        id<MTLBuffer> rowsbuf = ds4_metal_tensor_buffer(rows);
+        id<MTLBuffer> headsbuf = ds4_metal_tensor_buffer(heads);
+        const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t row_bytes_f16 = (uint64_t)head_dim * sizeof(uint16_t);
+        const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
+        const uint64_t kv_bytes_f32 = (uint64_t)n_packed_keys * row_bytes;
+        const uint64_t rows_bytes = (uint64_t)n_tokens * sizeof(ds4_metal_segmented_attention_row);
+        if (!qbuf || !kvbuf || !rowsbuf || !headsbuf ||
+            ds4_metal_tensor_bytes(q) < q_bytes ||
+            ds4_metal_tensor_bytes(packed_kv) < kv_bytes_f32 ||
+            ds4_metal_tensor_bytes(rows) < rows_bytes ||
+            ds4_metal_tensor_bytes(heads) < q_bytes) {
+            fprintf(stderr, "ds4: Metal segmented FlashAttention received undersized buffers\n");
+            return 0;
+        }
+
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_metal_wrap_model_range(model_map, model_size,
+                                                             sinks_offset,
+                                                             (uint64_t)n_head * sizeof(float),
+                                                             &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        const uint32_t ncpsg = 32;
+        const uint32_t nwg = 32;
+        const uint32_t nsg = ds4_metal_flash_attn_vec_nsg(max_keys, nwg, ncpsg);
+        const NSUInteger kv_bytes = (NSUInteger)n_packed_keys * (NSUInteger)row_bytes_f16;
+        const NSUInteger nrows = (NSUInteger)n_tokens * (NSUInteger)n_head;
+        const NSUInteger tmp_bytes =
+            nrows * (NSUInteger)head_dim * (NSUInteger)nwg * sizeof(float) +
+            nrows * (2u * (NSUInteger)nwg) * sizeof(float);
+        if (!ds4_metal_ensure_scratch_buffer(&g_flash_attn_kv_buffer,
+                                             &g_flash_attn_kv_bytes,
+                                             kv_bytes,
+                                             "ds4_segmented_flash_kv_f16") ||
+            !ds4_metal_ensure_scratch_buffer(&g_flash_attn_pad_buffer,
+                                             &g_flash_attn_pad_bytes,
+                                             1u,
+                                             "ds4_segmented_flash_pad") ||
+            !ds4_metal_ensure_scratch_buffer(&g_flash_attn_tmp_buffer,
+                                             &g_flash_attn_tmp_bytes,
+                                             tmp_bytes,
+                                             "ds4_segmented_flash_tmp")) {
+            return 0;
+        }
+
+        id<MTLComputePipelineState> vec_pipeline =
+            ds4_metal_get_flash_attn_vec_pipeline("kernel_dsv4_segmented_flash_attn_ext_vec_f16_dk512_dv512",
+                                                  false, true, false, false, false,
+                                                  (int32_t)head_dim,
+                                                  (int32_t)head_dim,
+                                                  (int32_t)nsg,
+                                                  (int32_t)nwg);
+        id<MTLComputePipelineState> reduce_pipeline =
+            ds4_metal_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg);
+        if (!vec_pipeline || !reduce_pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (!ds4_metal_encode_cpy_f32_f16_1d(cb,
+                                             kvbuf,
+                                             ds4_metal_tensor_offset(packed_kv),
+                                             g_flash_attn_kv_buffer,
+                                             0,
+                                             n_packed_keys * head_dim)) {
+            return 0;
+        }
+
+        ds4_metal_flash_attn_vec_args vec_args = {
+            .ne01 = (int32_t)n_tokens,
+            .ne02 = (int32_t)n_head,
+            .ne03 = 1,
+            .nb01 = (uint64_t)n_head * row_bytes,
+            .nb02 = row_bytes,
+            .nb03 = (uint64_t)n_tokens * n_head * row_bytes,
+            .ne11 = (int32_t)max_keys,
+            .ne_12_2 = 1,
+            .ne_12_3 = 1,
+            .ns10 = (int32_t)head_dim,
+            .nb11 = row_bytes_f16,
+            .nb12 = (uint64_t)n_packed_keys * row_bytes_f16,
+            .nb13 = (uint64_t)n_packed_keys * row_bytes_f16,
+            .ns20 = (int32_t)head_dim,
+            .nb21 = row_bytes_f16,
+            .nb22 = (uint64_t)n_packed_keys * row_bytes_f16,
+            .nb23 = (uint64_t)n_packed_keys * row_bytes_f16,
+            .ne31 = (int32_t)n_tokens,
+            .ne32 = 1,
+            .ne33 = 1,
+            .nb31 = 0,
+            .nb32 = 0,
+            .nb33 = 0,
+            .ne1 = (int32_t)n_head,
+            .ne2 = (int32_t)n_tokens,
+            .ne3 = 1,
+            .scale = 1.0f / sqrtf((float)head_dim),
+            .max_bias = 0.0f,
+            .m0 = 0.0f,
+            .m1 = 0.0f,
+            .n_head_log2 = 0,
+            .logit_softcap = 0.0f,
+        };
+
+        const NSUInteger shared_elems = (ds4_metal_align_up_ns(head_dim, 128u) +
+                                         4u * ncpsg +
+                                         2u * ds4_metal_align_up_ns(head_dim, 128u)) * nsg;
+        const NSUInteger shared_bytes = ds4_metal_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:vec_pipeline];
+        [enc setBytes:&vec_args length:sizeof(vec_args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_metal_tensor_offset(q) atIndex:1];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:3];
+        [enc setBuffer:rowsbuf offset:ds4_metal_tensor_offset(rows) atIndex:4];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
+        [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
+        [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
+        [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, nwg)
+             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        ds4_metal_flash_attn_reduce_args reduce_args = {
+            .nrows = (int32_t)nrows,
+        };
+        enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:reduce_pipeline];
+        [enc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
+        [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
+        [enc setBuffer:headsbuf offset:ds4_metal_tensor_offset(heads) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "graph segmented FlashAttention heads")) return 0;
     }
 
     return 1;

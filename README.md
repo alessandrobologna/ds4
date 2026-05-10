@@ -168,14 +168,37 @@ Deterministic non-thinking requests use a top-token decode path that avoids host
 readback of the full vocabulary row after every generated token; slots that have
 only this top-token state are not written to disk until full logits are refreshed.
 
-`--experimental-batched-prefill` adds early shared-decode prefill experiments.
+`--experimental-batched-prefill` adds segmented shared-decode prefill experiments.
 Concurrent prompts with a shared token prefix are prefetched once per common
 prefix chunk and fanned out through the same slot payload format used by disk KV.
-Non-identical prompts can also advance bounded chunks by issuing one shared row
-batch per prompt token across active slots when no decode-ready slot is waiting.
-Full logits are refreshed at final prompt tokens and cache-save boundaries so
-disk KV compatibility is preserved, but the mode remains opt-in while this path
-is still being validated.
+Non-identical prompts can also advance bounded multi-token segments by packing
+rows from each active slot into one layer-major shared graph pass when no
+decode-ready slot is waiting. Full logits are refreshed at final prompt tokens
+and cache-save boundaries so disk KV compatibility is preserved, but the mode
+remains opt-in while this path is still being validated.
+
+Diagnostic tuning knobs for this path are intentionally environment-only:
+`DS4_BATCH_PREFILL_ROW_CAP` caps total packed rows per segmented prefill call,
+`DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS` caps scheduler rows per tick,
+`DS4_BATCH_PREFILL_FANOUT_MIN_TOKENS` controls the minimum common-prefix length
+that is worth payload fanout,
+`DS4_BATCH_PREFILL_ALIGN_TOKENS` can force divergent segments to split on
+compression-style boundaries for profiling,
+`DS4_BATCH_PREFILL_SPAN_MIN_ROWS` controls when exact span prefill attention is
+used when segmented attention is disabled,
+`DS4_BATCH_DISABLE_SEGMENTED_PREFILL_ATTENTION=1` falls back to per-slot span
+attention for all layers,
+`DS4_BATCH_DISABLE_PRECOMPUTED_SPAN_ATTENTION=1` restores the older per-span
+projection path for non-ratio-4 layers,
+`DS4_BATCH_EQUAL_SPAN_FLASH_ATTENTION=1` lets equal-shape spans dispatch through
+one 3D FlashAttention diagnostic call,
+`DS4_BATCH_SEGMENTED_FLASH_ATTENTION=1` enables the row-metadata segmented
+FlashAttention diagnostic, `DS4_BATCH_SEGMENTED_DENSE_MASK_ATTENTION=1` switches
+that diagnostic back to the dense block-mask scaffold, and
+`DS4_BATCH_SEGMENTED_DIRECT_ATTENTION=1` forces the row-metadata attention
+kernel on shared decode. These diagnostics are not default paths because Studio
+benchmarks showed they have not yet beaten serialized prefill despite passing
+correctness gates.
 
 Supported endpoints:
 
@@ -590,11 +613,13 @@ Model-backed batch checks use `DS4_TEST_MODEL`:
 ```sh
 DS4_TEST_MODEL=/path/to/ds4flash.gguf ./ds4_test --batch-correctness
 DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batch-smoke
+DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batched-prefill-smoke
 DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batch-benchmark
 DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 1,2,4,8
 DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 1,4,8 --labels serialized,shared-decode --experimental-batched-prefill
 DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 4,8 --labels serialized,shared-decode --experimental-batched-prefill --prefill-unique-suffix --expect-prefill-fanout
 DS4_TEST_MODEL=/path/to/ds4flash.gguf DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS=32 python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 2 --labels shared-decode --experimental-batched-prefill --prefill-unique-prefix --expect-prefill-batch --expect-prefill-chunk
+DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload mixed --clients 2,4,8 --labels shared-decode --experimental-batched-prefill --prefill-unique-prefix
 ```
 
 `server-batch-smoke` starts `ds4-server --max-slots 2 --kv-disk-dir ...` for

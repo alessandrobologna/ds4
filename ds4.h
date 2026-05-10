@@ -84,6 +84,13 @@ typedef struct {
     int token;
 } ds4_batch_step;
 
+typedef struct {
+    int slot;
+    const int *tokens;
+    int n_tokens;
+    int refresh_logits;
+} ds4_batch_prefill_segment;
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
@@ -182,6 +189,7 @@ int ds4_batch_create_with_backend(ds4_batch **out, ds4_engine *e, int ctx_size,
 void ds4_batch_free(ds4_batch *b);
 int ds4_batch_max_slots(ds4_batch *b);
 int ds4_batch_ctx(ds4_batch *b);
+int ds4_batch_prefill_capacity(ds4_batch *b);
 const char *ds4_batch_backend_name(ds4_batch *b);
 void ds4_batch_claim_slot(ds4_batch *b, int slot);
 void ds4_batch_release_slot(ds4_batch *b, int slot);
@@ -206,6 +214,11 @@ int ds4_batch_eval_top(ds4_batch *b, const ds4_batch_step *steps, int n_steps,
 int ds4_batch_prefill(ds4_batch *b, const ds4_batch_step *steps,
                       const int *refresh_logits, int n_steps,
                       char *err, size_t errlen);
+/* Advance one contiguous prompt segment per slot.  The implementation may pack
+ * all segment rows into one shared layer-major prefill pass.  refresh_logits
+ * refreshes the final row for that slot and makes the slot payload save-safe. */
+int ds4_batch_prefill_segments(ds4_batch *b, const ds4_batch_prefill_segment *segments,
+                               int n_segments, char *err, size_t errlen);
 void ds4_batch_invalidate_slot(ds4_batch *b, int slot);
 void ds4_batch_rewind_slot(ds4_batch *b, int slot, int pos);
 int ds4_batch_pos(ds4_batch *b, int slot);

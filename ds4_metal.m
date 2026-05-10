@@ -290,6 +290,18 @@ static int ds4_metal_ensure_scratch_buffer(
     return 1;
 }
 
+static int ds4_metal_mul_ns(NSUInteger a, NSUInteger b, NSUInteger *out) {
+    if (b != 0 && a > NSUIntegerMax / b) return 0;
+    *out = a * b;
+    return 1;
+}
+
+static int ds4_metal_add_ns(NSUInteger a, NSUInteger b, NSUInteger *out) {
+    if (a > NSUIntegerMax - b) return 0;
+    *out = a + b;
+    return 1;
+}
+
 static uint64_t round_up_u64(uint64_t v, uint64_t align) {
     return (v + align - 1) & ~(align - 1);
 }
@@ -11550,11 +11562,28 @@ int ds4_metal_attention_prefill_segmented_flash_heads_tensor(
         const uint32_t ncpsg = 32;
         const uint32_t nwg = 32;
         const uint32_t nsg = ds4_metal_flash_attn_vec_nsg(max_keys, nwg, ncpsg);
-        const NSUInteger kv_bytes = (NSUInteger)n_packed_keys * (NSUInteger)row_bytes_f16;
-        const NSUInteger nrows = (NSUInteger)n_tokens * (NSUInteger)n_head;
-        const NSUInteger tmp_bytes =
-            nrows * (NSUInteger)head_dim * (NSUInteger)nwg * sizeof(float) +
-            nrows * (2u * (NSUInteger)nwg) * sizeof(float);
+        if (row_bytes_f16 > (uint64_t)NSUIntegerMax) {
+            fprintf(stderr, "ds4: Metal segmented FlashAttention scratch size overflow\n");
+            return 0;
+        }
+        NSUInteger kv_bytes = 0;
+        NSUInteger nrows = 0;
+        NSUInteger tmp_vec_bytes = 0;
+        NSUInteger tmp_reduce_bytes = 0;
+        NSUInteger tmp_bytes = 0;
+        NSUInteger reduce_width = 0;
+        if (!ds4_metal_mul_ns((NSUInteger)n_packed_keys, (NSUInteger)row_bytes_f16, &kv_bytes) ||
+            !ds4_metal_mul_ns((NSUInteger)n_tokens, (NSUInteger)n_head, &nrows) ||
+            !ds4_metal_mul_ns(nrows, (NSUInteger)head_dim, &tmp_vec_bytes) ||
+            !ds4_metal_mul_ns(tmp_vec_bytes, (NSUInteger)nwg, &tmp_vec_bytes) ||
+            !ds4_metal_mul_ns(tmp_vec_bytes, sizeof(float), &tmp_vec_bytes) ||
+            !ds4_metal_mul_ns(2u, (NSUInteger)nwg, &reduce_width) ||
+            !ds4_metal_mul_ns(nrows, reduce_width, &tmp_reduce_bytes) ||
+            !ds4_metal_mul_ns(tmp_reduce_bytes, sizeof(float), &tmp_reduce_bytes) ||
+            !ds4_metal_add_ns(tmp_vec_bytes, tmp_reduce_bytes, &tmp_bytes)) {
+            fprintf(stderr, "ds4: Metal segmented FlashAttention scratch size overflow\n");
+            return 0;
+        }
         if (!ds4_metal_ensure_scratch_buffer(&g_flash_attn_kv_buffer,
                                              &g_flash_attn_kv_bytes,
                                              kv_bytes,

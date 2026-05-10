@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import http.client
 import json
 import os
@@ -43,6 +44,10 @@ class CheckError(RuntimeError):
     pass
 
 
+class PortInUseError(CheckError):
+    pass
+
+
 def find_free_port() -> int:
     avoid = {8000, 8010}
     extra = os.environ.get("DS4_SERVER_BATCH_AVOID_PORTS", "")
@@ -66,6 +71,14 @@ def resolve_model(path: str | None) -> str:
             f"model not found: {model} (pass --model or set DS4_TEST_MODEL)"
         )
     return model
+
+
+def server_failed_with_address_in_use(lines: list[str]) -> bool:
+    return any(
+        "failed to listen" in line and
+        ("Address already in use" in line or "EADDRINUSE" in line)
+        for line in lines
+    )
 
 
 class Server:
@@ -104,15 +117,16 @@ class Server:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.proc and self.proc.poll() is not None:
+                if server_failed_with_address_in_use(self.lines):
+                    raise PortInUseError(
+                        "server port was claimed before bind:\n" +
+                        "\n".join(self.lines[-40:])
+                    )
                 raise CheckError(
                     "server exited before listening:\n" + "\n".join(self.lines[-40:])
                 )
             if any("listening on http://" in line for line in self.lines):
                 return
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(0.1)
-                if sock.connect_ex((HOST, self.port)) == 0:
-                    return
             time.sleep(0.05)
         raise CheckError("server did not become ready:\n" + "\n".join(self.lines[-40:]))
 
@@ -139,6 +153,33 @@ class Server:
                 self.proc.wait(timeout=10)
         if self._reader:
             self._reader.join(timeout=2)
+
+
+@contextlib.contextmanager
+def server_with_retries(
+    make_argv,
+    env: dict[str, str] | None = None,
+    attempts: int = 8,
+):
+    last_error: PortInUseError | None = None
+    for attempt in range(1, attempts + 1):
+        port = find_free_port()
+        server = Server(make_argv(port), port, env=env)
+        try:
+            server.__enter__()
+        except PortInUseError as exc:
+            last_error = exc
+            server.stop()
+            if attempt == attempts:
+                break
+            time.sleep(0.05 * attempt)
+            continue
+        try:
+            yield server, port
+        finally:
+            server.__exit__(None, None, None)
+        return
+    raise last_error or CheckError("could not start server without a port collision")
 
 
 def chat_body(prompt: str, max_tokens: int, stream: bool) -> dict:
@@ -371,23 +412,24 @@ def run_batched_prefill_smoke(args: argparse.Namespace) -> None:
     env.setdefault("DS4_BATCH_PREFILL_WAIT_US", "100000")
 
     with tempfile.TemporaryDirectory(prefix="ds4-batch-prefill-smoke-") as tmp:
-        port = find_free_port()
         kv_dir = str(Path(tmp) / "kv")
-        old_experimental = args.experimental_batched_prefill
-        args.experimental_batched_prefill = True
-        try:
-            argv = server_argv(
-                args,
-                port,
-                max_slots=2,
-                backend="shared-decode",
-                tokens=max(args.smoke_tokens, 4),
-                kv_dir=kv_dir,
-            )
-        finally:
-            args.experimental_batched_prefill = old_experimental
 
-        with Server(argv, port, env=env) as server:
+        def make_argv(port: int) -> list[str]:
+            old_experimental = args.experimental_batched_prefill
+            args.experimental_batched_prefill = True
+            try:
+                return server_argv(
+                    args,
+                    port,
+                    max_slots=2,
+                    backend="shared-decode",
+                    tokens=max(args.smoke_tokens, 4),
+                    kv_dir=kv_dir,
+                )
+            finally:
+                args.experimental_batched_prefill = old_experimental
+
+        with server_with_retries(make_argv, env=env) as (server, port):
             shared = make_prefill_prompt(12)
             fanout_prompts = [
                 shared + f"\nUnique fanout suffix for client {i}: keep this request distinct."
@@ -467,17 +509,19 @@ def run_batched_prefill_smoke(args: argparse.Namespace) -> None:
 def run_smoke(args: argparse.Namespace) -> None:
     args.model = resolve_model(args.model)
     with tempfile.TemporaryDirectory(prefix="ds4-batch-smoke-") as tmp:
-        port = find_free_port()
         kv_dir = str(Path(tmp) / "kv")
-        argv = server_argv(
-            args,
-            port,
-            max_slots=2,
-            backend=args.backend,
-            tokens=args.smoke_tokens,
-            kv_dir=kv_dir,
-        )
-        with Server(argv, port) as server:
+
+        def make_argv(port: int) -> list[str]:
+            return server_argv(
+                args,
+                port,
+                max_slots=2,
+                backend=args.backend,
+                tokens=args.smoke_tokens,
+                kv_dir=kv_dir,
+            )
+
+        with server_with_retries(make_argv) as (server, port):
             run_chat(port, SMOKE_PROMPT, 4, args.request_timeout)
             if not server.wait_for_log(r"kv cache stored", timeout=20):
                 raise CheckError("warmup request did not store disk KV")
@@ -542,7 +586,6 @@ def benchmark_prompts(args: argparse.Namespace, workload: str, clients: int) -> 
 def benchmark_once(
     args: argparse.Namespace, workload: str, label: str, clients: int, trial: int
 ) -> dict:
-    port = find_free_port()
     if label == "serialized":
         max_slots = 1
         backend = None
@@ -550,14 +593,17 @@ def benchmark_once(
         max_slots = max(clients, args.batch_slots_min)
         backend = label
     prompts, max_tokens = benchmark_prompts(args, workload, clients)
-    argv = server_argv(
-        args,
-        port,
-        max_slots=max_slots,
-        backend=backend,
-        tokens=max_tokens,
-    )
-    with Server(argv, port) as server:
+
+    def make_argv(port: int) -> list[str]:
+        return server_argv(
+            args,
+            port,
+            max_slots=max_slots,
+            backend=backend,
+            tokens=max_tokens,
+        )
+
+    with server_with_retries(make_argv) as (server, port):
         started = time.monotonic()
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=clients)
         futures = {

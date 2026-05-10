@@ -8084,7 +8084,7 @@ static int ds4_metal_encode_fill_f32_rows(
     return 1;
 }
 
-int ds4_metal_attention_output_q8_batch_tensor(
+static int ds4_metal_attention_output_q8_batch_tensor_impl(
         ds4_metal_tensor       *out,
         ds4_metal_tensor       *low,
         ds4_metal_tensor       *group_tmp,
@@ -8098,7 +8098,8 @@ int ds4_metal_attention_output_q8_batch_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_metal_tensor *heads,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        bool                    exact_out_rows) {
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0 ||
@@ -8322,7 +8323,7 @@ int ds4_metal_attention_output_q8_batch_tensor(
 
         if (ok) {
             const bool exact_rows =
-                getenv("DS4_MTP_VERIFY_ATTN_OUT_ROW_FALLBACK") != NULL &&
+                (exact_out_rows || getenv("DS4_MTP_VERIFY_ATTN_OUT_ROW_FALLBACK") != NULL) &&
                 getenv("DS4_MTP_VERIFY_HOST_ROW_FALLBACK") == NULL;
             if (exact_rows) {
                 ok = ds4_metal_matmul_q8_0_rows_tensor(out, model_map, model_size,
@@ -8342,6 +8343,70 @@ int ds4_metal_attention_output_q8_batch_tensor(
 #undef DS4_METAL_PROFILE_ATTN_OUT_STAGE
         return ok ? 1 : 0;
     }
+}
+
+int ds4_metal_attention_output_q8_batch_tensor(
+        ds4_metal_tensor       *out,
+        ds4_metal_tensor       *low,
+        ds4_metal_tensor       *group_tmp,
+        ds4_metal_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *heads,
+        uint32_t                n_tokens) {
+    return ds4_metal_attention_output_q8_batch_tensor_impl(out,
+                                                           low,
+                                                           group_tmp,
+                                                           low_tmp,
+                                                           model_map,
+                                                           model_size,
+                                                           out_a_offset,
+                                                           out_b_offset,
+                                                           group_dim,
+                                                           rank,
+                                                           n_groups,
+                                                           out_dim,
+                                                           heads,
+                                                           n_tokens,
+                                                           false);
+}
+
+int ds4_metal_attention_output_q8_exact_rows_batch_tensor(
+        ds4_metal_tensor       *out,
+        ds4_metal_tensor       *low,
+        ds4_metal_tensor       *group_tmp,
+        ds4_metal_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *heads,
+        uint32_t                n_tokens) {
+    return ds4_metal_attention_output_q8_batch_tensor_impl(out,
+                                                           low,
+                                                           group_tmp,
+                                                           low_tmp,
+                                                           model_map,
+                                                           model_size,
+                                                           out_a_offset,
+                                                           out_b_offset,
+                                                           group_dim,
+                                                           rank,
+                                                           n_groups,
+                                                           out_dim,
+                                                           heads,
+                                                           n_tokens,
+                                                           true);
 }
 
 int ds4_metal_attention_output_low_q8_tensor(

@@ -557,6 +557,22 @@ int ds4_metal_attention_output_q8_batch_tensor(
         const ds4_metal_tensor *heads,
         uint32_t                n_tokens);
 
+int ds4_metal_attention_output_q8_exact_rows_batch_tensor(
+        ds4_metal_tensor       *out,
+        ds4_metal_tensor       *low,
+        ds4_metal_tensor       *group_tmp,
+        ds4_metal_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *heads,
+        uint32_t                n_tokens);
+
 int ds4_metal_attention_output_low_q8_tensor(
         ds4_metal_tensor       *low,
         const void             *model_map,

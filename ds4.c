@@ -7840,6 +7840,7 @@ typedef struct {
     uint32_t spec_prefix1_n_index_comp[DS4_N_LAYER];
     bool spec_capture_prefix1;
     bool spec_verify_mode;
+    bool spec_exact_rows;
     uint32_t raw_cap;
     uint32_t comp_cap;
 
@@ -10503,6 +10504,12 @@ static ds4_metal_tensor *metal_graph_tensor_row_view(
                                  row_values * sizeof(float));
 }
 
+static bool metal_graph_use_exact_verify_rows(const ds4_metal_graph *g) {
+    return g &&
+           g->spec_verify_mode &&
+           (g->spec_exact_rows || getenv("DS4_MTP_VERIFY_ROW_FALLBACK") != NULL);
+}
+
 static bool metal_graph_matmul_f16_maybe_rows(
         const ds4_metal_graph  *g,
         ds4_metal_tensor       *out,
@@ -10512,8 +10519,8 @@ static bool metal_graph_matmul_f16_maybe_rows(
         uint64_t                out_dim,
         const ds4_metal_tensor *x,
         uint64_t                n_tokens) {
-    if (!g || !g->spec_verify_mode || n_tokens <= 1 ||
-        getenv("DS4_MTP_VERIFY_F16_ROW_FALLBACK") == NULL)
+    if (!metal_graph_use_exact_verify_rows(g) || n_tokens <= 1 ||
+        getenv("DS4_MTP_VERIFY_FAST_BATCH") != NULL)
     {
         return ds4_metal_matmul_f16_tensor(out,
                                            model->map,
@@ -10568,8 +10575,8 @@ static bool metal_graph_matmul_q8_0_maybe_rows(
         uint64_t                out_dim,
         const ds4_metal_tensor *x,
         uint64_t                n_tokens) {
-    if (!g || !g->spec_verify_mode || n_tokens <= 1 ||
-        getenv("DS4_MTP_VERIFY_Q8_ROW_FALLBACK") == NULL)
+    if (!metal_graph_use_exact_verify_rows(g) || n_tokens <= 1 ||
+        getenv("DS4_MTP_VERIFY_FAST_BATCH") != NULL)
     {
         return ds4_metal_matmul_q8_0_tensor(out,
                                             model->map,
@@ -10630,8 +10637,8 @@ static bool metal_graph_attention_output_q8_maybe_rows(
         uint64_t                out_dim,
         const ds4_metal_tensor *heads,
         uint32_t                n_tokens) {
-    if (!g || !g->spec_verify_mode || n_tokens <= 1 ||
-        getenv("DS4_MTP_VERIFY_ATTN_OUT_ROW_FALLBACK") == NULL)
+    if (!metal_graph_use_exact_verify_rows(g) || n_tokens <= 1 ||
+        getenv("DS4_MTP_VERIFY_FAST_BATCH") != NULL)
     {
         return ds4_metal_attention_output_q8_batch_tensor(out,
                                                           low,
@@ -10650,20 +10657,20 @@ static bool metal_graph_attention_output_q8_maybe_rows(
     }
 
     if (getenv("DS4_MTP_VERIFY_HOST_ROW_FALLBACK") == NULL) {
-        return ds4_metal_attention_output_q8_batch_tensor(out,
-                                                          low,
-                                                          group_tmp,
-                                                          low_tmp,
-                                                          model->map,
-                                                          model->size,
-                                                          out_a_offset,
-                                                          out_b_offset,
-                                                          group_dim,
-                                                          rank,
-                                                          n_groups,
-                                                          out_dim,
-                                                          heads,
-                                                          n_tokens) != 0;
+        return ds4_metal_attention_output_q8_exact_rows_batch_tensor(out,
+                                                                     low,
+                                                                     group_tmp,
+                                                                     low_tmp,
+                                                                     model->map,
+                                                                     model->size,
+                                                                     out_a_offset,
+                                                                     out_b_offset,
+                                                                     group_dim,
+                                                                     rank,
+                                                                     n_groups,
+                                                                     out_dim,
+                                                                     heads,
+                                                                     n_tokens) != 0;
     }
 
     const uint64_t heads_dim = (uint64_t)n_groups * group_dim;
@@ -10725,8 +10732,8 @@ static bool metal_graph_router_select_maybe_rows(
         const ds4_metal_tensor *logits,
         const ds4_metal_tensor *tokens,
         uint32_t                n_tokens) {
-    if (!g || !g->spec_verify_mode || n_tokens <= 1 ||
-        getenv("DS4_MTP_VERIFY_ROUTER_ROW_FALLBACK") == NULL)
+    if (!metal_graph_use_exact_verify_rows(g) || n_tokens <= 1 ||
+        getenv("DS4_MTP_VERIFY_FAST_BATCH") != NULL)
     {
         return ds4_metal_router_select_batch_tensor(selected,
                                                     weights,
@@ -11081,8 +11088,7 @@ static bool metal_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
-    const bool spec_row_fallback =
-        g->spec_verify_mode && getenv("DS4_MTP_VERIFY_ROW_FALLBACK") != NULL;
+    const bool spec_row_fallback = metal_graph_use_exact_verify_rows(g);
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
     const bool q_stage_profile = getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL;
@@ -13420,6 +13426,7 @@ static bool metal_graph_verify_suffix_tops(
         uint32_t               start,
         uint32_t               n_tokens,
         bool                   capture_prefix1,
+        bool                   exact_rows,
         int                   *row_tops,
         float                 *row_logits,
         ds4_verify_suffix_profile *profile) {
@@ -13444,8 +13451,10 @@ static bool metal_graph_verify_suffix_tops(
 
     const bool saved_capture = g->spec_capture_prefix1;
     const bool saved_verify_mode = g->spec_verify_mode;
+    const bool saved_exact_rows = g->spec_exact_rows;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens >= 2;
     g->spec_verify_mode = true;
+    g->spec_exact_rows = exact_rows;
 
     const double t_layers0 = profile ? now_sec() : 0.0;
     ok = ds4_metal_begin_commands() != 0;
@@ -13463,6 +13472,7 @@ static bool metal_graph_verify_suffix_tops(
     if (profile) profile->layer_sec = t_layers_done - t_layers0;
     g->spec_capture_prefix1 = saved_capture;
     g->spec_verify_mode = saved_verify_mode;
+    g->spec_exact_rows = saved_exact_rows;
     if (!ok) return false;
 
     const double t_head0 = profile ? now_sec() : 0.0;
@@ -16676,6 +16686,7 @@ static void ds4_mtp_oracle_check_decode2(ds4_session *s,
                                              start,
                                              2,
                                              true,
+                                             getenv("DS4_MTP_VERIFY_ROW_FALLBACK") != NULL,
                                              fast_tops,
                                              fast_logits,
                                              NULL);
@@ -16899,6 +16910,7 @@ static void ds4_mtp_batch_probe_check(ds4_session *s,
                                                           start,
                                                           1,
                                                           false,
+                                                          getenv("DS4_MTP_VERIFY_ROW_FALLBACK") != NULL,
                                                           NULL,
                                                           n1_logits,
                                                           NULL);
@@ -16944,6 +16956,7 @@ static void ds4_mtp_batch_probe_check(ds4_session *s,
                                                             start,
                                                             2,
                                                             prefix_probe,
+                                                            getenv("DS4_MTP_VERIFY_ROW_FALLBACK") != NULL,
                                                             row_tops,
                                                             fast_logits,
                                                             NULL);
@@ -17221,6 +17234,7 @@ static void ds4_mtp_live_batch_oracle_check(ds4_session *s,
                                                   start,
                                                   (uint32_t)draft_n,
                                                   draft_n == 2,
+                                                  getenv("DS4_MTP_VERIFY_ROW_FALLBACK") != NULL,
                                                   fast_tops,
                                                   fast_logits,
                                                   NULL);
@@ -18366,6 +18380,8 @@ int ds4_session_mtp_verify_scale(ds4_session *s, int max_n, int repeats, char *e
     }
     if (repeats <= 0) repeats = 3;
     if (repeats > 1000) repeats = 1000;
+    const bool profile_exact_rows =
+        getenv("DS4_MTP_VERIFY_FAST_BATCH") == NULL;
 
     const int saved_len = s->checkpoint.len;
     int rc = 0;
@@ -18425,10 +18441,12 @@ int ds4_session_mtp_verify_scale(ds4_session *s, int max_n, int repeats, char *e
     }
 
     fprintf(stderr,
-            "ds4: mtp verify-scale pos=%d max_n=%d repeats=%d target_avg=%.3fms drafts=",
+            "ds4: mtp verify-scale pos=%d max_n=%d repeats=%d exact_rows=%d "
+            "target_avg=%.3fms drafts=",
             saved_len,
             max_n,
             repeats,
+            profile_exact_rows ? 1 : 0,
             seq_cum[max_n] > 0.0 ? (seq_cum[max_n] * 1000.0) / (double)max_n : 0.0);
     for (int i = 0; i < max_n; i++) {
         fprintf(stderr, "%s%d", i ? "," : "", drafts[i]);
@@ -18501,6 +18519,7 @@ int ds4_session_mtp_verify_scale(ds4_session *s, int max_n, int repeats, char *e
                                                 (uint32_t)saved_len,
                                                 (uint32_t)n,
                                                 n == 2,
+                                                profile_exact_rows,
                                                 row_tops,
                                                 NULL,
                                                 &prof);
@@ -19386,14 +19405,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
 
     /*
-     * The speed-mode N=2 verifier is the tiny batch path: it verifies two target
-     * positions in one layer-major pass and commits prefix-1 directly on a
-     * partial accept.  It can pick a different greedy token when batched
-     * reductions perturb nearly-tied logits, so the normal --mtp path uses the
-     * exact decode verifier unless --mtp-speed opts into this approximate path.
+     * Keep the old sequential-shape N=2 verifier available as a diagnostic.
+     * The normal strict N=2 path now uses the exact row-preserving batch
+     * verifier below, with prefix-1 capture for cheap one-token commits.
      */
     const bool use_decode2_exact =
-        draft_n == 2 && strict_mtp && getenv("DS4_MTP_BATCH_VERIFY") == NULL;
+        draft_n == 2 &&
+        strict_mtp &&
+        getenv("DS4_MTP_DECODE2_EXACT") != NULL &&
+        getenv("DS4_MTP_BATCH_VERIFY") == NULL;
     if (use_decode2_exact) {
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
@@ -19540,6 +19560,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 (uint32_t)start,
                                                 (uint32_t)draft_n,
                                                 capture_prefix1,
+                                                strict_mtp,
                                                 speed_trust_suffix ? NULL : row_tops,
                                                 NULL,
                                                 NULL);
@@ -19799,6 +19820,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     (uint32_t)start,
                                                     (uint32_t)commit_drafts,
                                                     false,
+                                                    strict_mtp,
                                                     row_tops,
                                                     NULL,
                                                     NULL);

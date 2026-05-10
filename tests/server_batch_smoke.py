@@ -641,7 +641,7 @@ def median(values: list[float]) -> float:
 def run_benchmark(args: argparse.Namespace) -> None:
     args.model = resolve_model(args.model)
     rows: list[dict] = []
-    clients_list = [int(v) for v in args.clients.split(",") if v.strip()]
+    clients_list = args.clients
     workloads = ["decode", "prefill"] if args.workload == "both" else [args.workload]
     labels = [v.strip() for v in args.labels.split(",") if v.strip()]
     for workload in workloads:
@@ -782,6 +782,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--prefill-max-tokens must be >= 1")
     if args.batch_slots_min < 2:
         parser.error("--batch-slots-min must be >= 2")
+    clients: list[int] = []
+    for item in args.clients.split(","):
+        item = item.strip()
+        if not item:
+            parser.error("--clients must be a comma-separated list of integers >= 1")
+        try:
+            value = int(item)
+        except ValueError:
+            parser.error("--clients must be a comma-separated list of integers >= 1")
+        if value < 1:
+            parser.error("--clients must be a comma-separated list of integers >= 1")
+        clients.append(value)
+    if not clients:
+        parser.error("--clients must contain at least one value")
+    args.clients = clients
     valid_labels = {"serialized", "session-slots", "shared-decode"}
     labels = [v.strip() for v in args.labels.split(",") if v.strip()]
     if not labels or any(v not in valid_labels for v in labels):

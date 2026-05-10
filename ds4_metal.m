@@ -11034,8 +11034,10 @@ int ds4_metal_attention_segmented_mixed_heads_tensor(
         [enc setBuffer:qbuf offset:ds4_metal_tensor_offset(q) atIndex:1];
         [enc setBuffer:rawbuf offset:ds4_metal_tensor_offset(raw_kv) atIndex:2];
         [enc setBuffer:compbuf offset:comp_kv ? ds4_metal_tensor_offset(comp_kv) : ds4_metal_tensor_offset(raw_kv) atIndex:3];
+        const NSUInteger topk_inner = top_k ? 0 :
+            (topk ? ds4_metal_tensor_offset(topk) : ds4_metal_tensor_offset(raw_kv));
         [enc setBuffer:top_k ? g_indexed_topk_buffer : topkbuf
-              offset:top_k ? 0 : ds4_metal_tensor_offset(raw_kv)
+              offset:topk_inner
              atIndex:4];
         [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
         [enc setBuffer:rowsbuf offset:ds4_metal_tensor_offset(rows) atIndex:6];

@@ -582,8 +582,7 @@ static void test_compare_session_batch_top_with_tolerance(const char *label, ds4
     const int n = ns < nb ? ns : nb;
     TEST_ASSERT(n >= 8);
     for (int i = 0; i < n && i < 8; i++) {
-        if (i >= id_checked && i >= score_checked) continue;
-        if (session_scores[i].id != batch_scores[i].id) {
+        if (i < id_checked && session_scores[i].id != batch_scores[i].id) {
             fprintf(stderr,
                     "ds4-test: %s top[%d] id mismatch sid=%d bid=%d slogit=%g blogit=%g slp=%g blp=%g\n",
                     label, i,

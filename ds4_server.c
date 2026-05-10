@@ -8630,6 +8630,51 @@ typedef struct {
     generation_state gen;
 } batch_request;
 
+static void canonicalize_tool_batch_checkpoint(server *s, generation_state *g,
+                                               const char *content,
+                                               const char *reasoning,
+                                               const tool_calls *calls) {
+    if (!s || !g || !calls || calls->len == 0 || !g->j->req.prompt_text) return;
+
+    char *suffix_text = build_tool_checkpoint_suffix(&g->j->req, content, reasoning, calls);
+
+    buf rendered = {0};
+    buf_puts(&rendered, g->j->req.prompt_text);
+    buf_puts(&rendered, suffix_text);
+
+    ds4_tokens canonical = {0};
+    ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
+    const int live_len = ds4_batch_pos(s->batch, g->slot);
+    const int common = ds4_batch_common_prefix(s->batch, g->slot, &canonical);
+    if (common == live_len && canonical.len == live_len) goto done;
+    if (common < g->j->req.prompt.len) {
+        trace_event(s, g->trace_id,
+                    "batch tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
+                    common, g->j->req.prompt.len, live_len, canonical.len);
+        goto done;
+    }
+
+    char err[160] = {0};
+    if (ds4_batch_sync(s->batch, g->slot, &canonical, err, sizeof(err)) == 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: batch tool checkpoint canonicalized slot=%d ctx=%s common=%d live=%d canonical=%d",
+                   g->slot, g->ctx_span, common, live_len, canonical.len);
+        trace_event(s, g->trace_id,
+                    "batch tool checkpoint canonicalized: common=%d live=%d canonical=%d",
+                    common, live_len, canonical.len);
+    } else {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: batch tool checkpoint canonicalization failed slot=%d ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
+                   g->slot, g->ctx_span, common, live_len, canonical.len, err);
+        trace_event(s, g->trace_id, "batch tool checkpoint canonicalization failed: %s", err);
+    }
+
+done:
+    ds4_tokens_free(&canonical);
+    buf_free(&rendered);
+    free(suffix_text);
+}
+
 static int batch_prefill_chunk_tokens(void) {
     const char *env = getenv("DS4_BATCH_PREFILL_CHUNK_TOKENS");
     if (env && env[0]) {
@@ -8991,7 +9036,15 @@ static void generation_state_finish(generation_state *g) {
                 snprintf(g->err, sizeof(g->err), "invalid tool call");
             }
         }
-        if (parsed_calls.len) final_finish = "tool_calls";
+        if (parsed_calls.len) {
+            if (g->openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &g->openai_live);
+            if (j->req.stream && j->req.api == API_RESPONSES) {
+                apply_responses_stream_tool_ids(&parsed_calls, &g->responses_live);
+            }
+            assign_tool_call_ids(s, &parsed_calls, j->req.api);
+            tool_memory_remember(s, &parsed_calls);
+            final_finish = "tool_calls";
+        }
     }
     log_tool_calls_summary(g->ctx_span, &parsed_calls);
 
@@ -8999,6 +9052,12 @@ static void generation_state_finish(generation_state *g) {
                  g->saw_tool_start, g->saw_tool_end,
                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - g->t0);
+
+    if (j->req.kind == REQ_CHAT && parsed_calls.len) {
+        canonicalize_tool_batch_checkpoint(s, g,
+                                           parsed_content ? parsed_content : "",
+                                           parsed_reasoning, &parsed_calls);
+    }
 
     if (j->req.stream) {
         bool response_ok = true;

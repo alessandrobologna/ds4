@@ -5975,6 +5975,14 @@ struct server {
     int max_slots;
     int batch_wait_us;
     bool experimental_batched_prefill;
+    bool batch_decode_log_seen;
+    double batch_decode_log_t;
+    int batch_decode_log_active;
+    int batch_decode_log_batch;
+    int batch_decode_log_top;
+    char batch_decode_log_backend[32];
+    char batch_decode_log_mode[32];
+    char batch_decode_log_attention[32];
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -7829,6 +7837,33 @@ static void log_decode_progress(req_kind kind, const char *ctx, int completion,
                elapsed);
     *last_t = now;
     *last_completion = completion;
+}
+
+static bool should_log_batch_decode(server *s, const char *backend,
+                                    const char *mode, const char *attention,
+                                    int active, int batch, bool top_only) {
+    if (getenv("DS4_BATCH_LOG_EVERY_TICK") != NULL) return true;
+    const double now = now_sec();
+    const int top = top_only ? 1 : 0;
+    const bool changed =
+        !s->batch_decode_log_seen ||
+        s->batch_decode_log_active != active ||
+        s->batch_decode_log_batch != batch ||
+        s->batch_decode_log_top != top ||
+        strcmp(s->batch_decode_log_backend, backend) != 0 ||
+        strcmp(s->batch_decode_log_mode, mode) != 0 ||
+        strcmp(s->batch_decode_log_attention, attention) != 0;
+    if (!changed && now - s->batch_decode_log_t < 5.0) return false;
+
+    s->batch_decode_log_seen = true;
+    s->batch_decode_log_t = now;
+    s->batch_decode_log_active = active;
+    s->batch_decode_log_batch = batch;
+    s->batch_decode_log_top = top;
+    snprintf(s->batch_decode_log_backend, sizeof(s->batch_decode_log_backend), "%s", backend);
+    snprintf(s->batch_decode_log_mode, sizeof(s->batch_decode_log_mode), "%s", mode);
+    snprintf(s->batch_decode_log_attention, sizeof(s->batch_decode_log_attention), "%s", attention);
+    return true;
 }
 
 typedef struct {
@@ -9880,14 +9915,16 @@ static bool batch_decode_step(server *s, batch_request *reqs) {
     const char *attention = shared_decode ?
         (getenv("DS4_BATCH_SEGMENTED_DIRECT_ATTENTION") != NULL ? "segmented-direct" : "row-loop") :
         "session";
-    server_log(DS4_LOG_GENERATION,
-               "ds4-server: batch backend=%s mode=%s attention=%s active=%d batch=%d top=%d",
-               backend,
-               mode,
-               attention,
-               active,
-               n,
-               top_only ? 1 : 0);
+    if (should_log_batch_decode(s, backend, mode, attention, active, n, top_only)) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: batch backend=%s mode=%s attention=%s active=%d batch=%d top=%d",
+                   backend,
+                   mode,
+                   attention,
+                   active,
+                   n,
+                   top_only ? 1 : 0);
+    }
     int rc = top_only ?
         ds4_batch_eval_top(s->batch, steps, n, top_tokens, err, sizeof(err)) :
         ds4_batch_eval(s->batch, steps, n, err, sizeof(err));

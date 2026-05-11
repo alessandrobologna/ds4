@@ -190,6 +190,86 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Exact verifier batch2 Q8_0 matvec.  It keeps the same per-token reduction
+// sequence as kernel_mul_mv_q8_0_f32, but computes token rows 0 and 1 in one
+// threadgroup so the weight row is streamed once.
+[[host_name("kernel_mul_mv_q8_0_f32_pair2_rows")]]
+kernel void kernel_mul_mv_q8_0_f32_pair2_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NR0 = N_R0_Q8_0;
+
+    if (args.ne11 != 2 || args.ne1 != 2) {
+        return;
+    }
+
+    const int nb = args.ne00 / QK8_0;
+    const int r0 = tgpig.x * NR0;
+    const int im = tgpig.z;
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+
+    device const float *y0 = (device const float *)(src1 + i12 * args.nb12 + i13 * args.nb13);
+    device const float *y1 = (device const float *)(src1 + args.nb11 + i12 * args.nb12 + i13 * args.nb13);
+
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)(r0 + row) * args.nb01 +
+                                 (i12 / args.r2) * args.nb02 +
+                                 (i13 / args.r3) * args.nb03;
+        ax[row] = (device const block_q8_0 *)((device const char *)src0 + offset0);
+    }
+
+    float sum0[NR0] = { 0.f };
+    float sum1[NR0] = { 0.f };
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    float yl0[NQ];
+    float yl1[NQ];
+    device const float *yb0 = y0 + ib0 * QK8_0 + il * NQ;
+    device const float *yb1 = y1 + ib0 * QK8_0 + il * NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl0[i] = yb0[i];
+            yl1[i] = yb1[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            float s0 = 0.f;
+            float s1 = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                const float q = qs[i];
+                s0 += q * yl0[i];
+                s1 += q * yl1[i];
+            }
+            const float d = ax[row][ib].d;
+            sum0[row] += s0 * d;
+            sum1[row] += s1 * d;
+        }
+
+        yb0 += NSG * NQ * QK8_0;
+        yb1 += NSG * NQ * QK8_0;
+    }
+
+    device float *dst0 = (device float *)dst + (uint64_t)im * args.ne0 * args.ne1;
+    device float *dst1 = dst0 + args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst0, sum0, r0, args.ne01, tiisg, sgitg, shmem);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    helper_mv_reduce_and_write<NR0>(dst1, sum1, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 // Decode shared-expert gate/up projections followed by SwiGLU:
 //
 //     mid = silu(gate) * up
@@ -546,6 +626,119 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 // Host-visible vectorized dense matvec variants for F32 and F16 weights.
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
+
+// Exact verifier batch2 F16 matvec.  This is the n_tokens=2 sibling of
+// kernel_mul_mv_f16_f32_4: each token row keeps the same vectorized reduction
+// order, while the weight row is streamed once for both activations.
+template<short NR0>
+void kernel_mul_mv_f16_f32_4_pair2_rows_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF / 4;
+
+    if (args.ne11 != 2 || args.ne1 != 2 || args.nr0 != NR0) {
+        return;
+    }
+
+    const int nb = args.ne00 / NB;
+    const int r0 = tgpig.x * NR0;
+    const int im = tgpig.z;
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+    const uint64_t base1 = i12 * args.nb12 + i13 * args.nb13;
+
+    device const float  *y0  = (device const float  *)(src1 + base1);
+    device const float4 *y04 = (device const float4 *)(src1 + base1);
+    device const float  *y1  = (device const float  *)(src1 + args.nb11 + base1);
+    device const float4 *y14 = (device const float4 *)(src1 + args.nb11 + base1);
+
+    device const half  *ax[NR0];
+    device const half4 *ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)(r0 + row) * args.nb01 +
+                                 (i12 / args.r2) * args.nb02 +
+                                 (i13 / args.r3) * args.nb03;
+        ax[row] = (device const half *)((device const char *)src0 + offset0);
+        ax4[row] = (device const half4 *)((device const char *)src0 + offset0);
+    }
+
+    float sum0[NR0] = { 0.f };
+    float sum1[NR0] = { 0.f };
+    const short ix = tiisg / (NW / NF);
+    const short il = tiisg % (NW / NF);
+    const int ib0 = sgitg * NF + ix;
+    float4 yl04[NF4];
+    float4 yl14[NF4];
+    device const float4 *yb04 = y04 + (ib0 * NB + il * NF) / 4;
+    device const float4 *yb14 = y14 + (ib0 * NB + il * NF) / 4;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        FOR_UNROLL (short i = 0; i < NF4; ++i) {
+            yl04[i] = yb04[i];
+            yl14[i] = yb14[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const half4 *xb4 = ax4[row] + (ib * NB + il * NF) / 4;
+            float s0 = 0.f;
+            float s1 = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                const float4 xv = float4(xb4[i]);
+                s0 += dot(xv, yl04[i]);
+                s1 += dot(xv, yl14[i]);
+            }
+            sum0[row] += s0;
+            sum1[row] += s1;
+        }
+
+        yb04 += NSG * NF * NW / 4;
+        yb14 += NSG * NF * NW / 4;
+    }
+
+    for (int i = nb * NB + sgitg * NW + tiisg; i < args.ne00; i += NW * NSG) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            const float x = ax[row][i];
+            sum0[row] += x * y0[i];
+            sum1[row] += x * y1[i];
+        }
+    }
+
+    device float *dst0 = (device float *)dst + (uint64_t)im * args.ne0 * args.ne1;
+    device float *dst1 = dst0 + args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst0, sum0, r0, args.ne01, tiisg, sgitg, shmem);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    helper_mv_reduce_and_write<NR0>(dst1, sum1, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+[[host_name("kernel_mul_mv_f16_f32_4_pair2_rows")]]
+kernel void kernel_mul_mv_f16_f32_4_pair2_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    switch (args.nr0) {
+        case 2:
+            kernel_mul_mv_f16_f32_4_pair2_rows_impl<2>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            break;
+        case 4:
+            kernel_mul_mv_f16_f32_4_pair2_rows_impl<4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+            break;
+    }
+}
 
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling

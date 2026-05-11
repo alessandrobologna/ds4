@@ -173,9 +173,7 @@ kernel void kernel_dsv4_router_weights_one(
 
 // Decode router selection for one token after the existing
 // sqrt(softplus(logit)) probability kernel has run. Bias affects only top-k
-// selection. Route-weight normalization deliberately stays in the old one-token
-// kernel: even tiny denominator-order changes here are amplified by 43 MoE
-// layers, so this kernel only replaces the selection work.
+// selection.
 kernel void kernel_dsv4_router_finalize_one(
         constant ds4_metal_args_dsv4_router_select_one & args,
         device const float *probs,
@@ -230,6 +228,152 @@ kernel void kernel_dsv4_router_finalize_one(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Same selection semantics as kernel_dsv4_router_finalize_one, followed by the
+// exact six-element normalization order from kernel_dsv4_router_weights_one.
+kernel void kernel_dsv4_router_finalize_weights_one(
+        constant ds4_metal_args_dsv4_router_select_one & args,
+        device const float *probs,
+        device const float *bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (tid >= 256) return;
+
+    threadgroup float *sel_scores = scratch;
+    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);
+    const float p = probs[tid];
+    sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    idx[tid] = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (args.hash_mode) {
+        const uint token = args.use_token_buffer ? (uint)tokens[0] : args.token;
+        const uint row = min(token, args.hash_rows - 1u);
+        if (tid < 6) {
+            idx[tid] = hash[row * 6u + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint k = 2; k <= 256; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                const uint other = tid ^ j;
+                if (other > tid) {
+                    if ((tid & k) == 0) {
+                        if (sel_scores[(uint)idx[tid]] < sel_scores[(uint)idx[other]]) {
+                            const int32_t tmp = idx[tid];
+                            idx[tid] = idx[other];
+                            idx[other] = tmp;
+                        }
+                    } else {
+                        if (sel_scores[(uint)idx[tid]] > sel_scores[(uint)idx[other]]) {
+                            const int32_t tmp = idx[tid];
+                            idx[tid] = idx[other];
+                            idx[other] = tmp;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 6) {
+        const int32_t expert = idx[tid];
+        float sum = 0.0f;
+        for (uint i = 0; i < 6; i++) {
+            sum += probs[idx[i]];
+        }
+        sum = max(sum, 6.103515625e-5f);
+        selected[tid] = expert;
+        weights[tid] = probs[expert] / sum * 1.5f;
+    }
+}
+
+// One-token decode router fast path.  This preserves the existing vectorized
+// sqrt(softplus()) expression, writes the same probability row, then performs
+// exact top-k selection and six-weight normalization in one dispatch.
+kernel void kernel_dsv4_router_probs_finalize_weights_one(
+        constant ds4_metal_args_dsv4_router_select_one & args,
+        device const float *logits,
+        device const float *bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device float *probs,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (tid >= 256) return;
+
+    threadgroup float *prob_vals = scratch;
+    threadgroup float *sel_scores = scratch + 256;
+    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 512);
+
+    if (tid < 64) {
+        device const float4 *src = (device const float4 *)logits;
+        device float4 *dst = (device float4 *)probs;
+        threadgroup float4 *prob4 = (threadgroup float4 *)prob_vals;
+        const float4 x = src[tid];
+        const float4 sp = select(log(1.0f + exp(x)), x, x > 20.0f);
+        const float4 p = sqrt(sp);
+        prob4[tid] = p;
+        dst[tid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float p = prob_vals[tid];
+    sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    idx[tid] = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (args.hash_mode) {
+        const uint token = args.use_token_buffer ? (uint)tokens[0] : args.token;
+        const uint row = min(token, args.hash_rows - 1u);
+        if (tid < 6) {
+            idx[tid] = hash[row * 6u + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint k = 2; k <= 256; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                const uint other = tid ^ j;
+                if (other > tid) {
+                    if ((tid & k) == 0) {
+                        if (sel_scores[(uint)idx[tid]] < sel_scores[(uint)idx[other]]) {
+                            const int32_t tmp = idx[tid];
+                            idx[tid] = idx[other];
+                            idx[other] = tmp;
+                        }
+                    } else {
+                        if (sel_scores[(uint)idx[tid]] > sel_scores[(uint)idx[other]]) {
+                            const int32_t tmp = idx[tid];
+                            idx[tid] = idx[other];
+                            idx[other] = tmp;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 6) {
+        const int32_t expert = idx[tid];
+        float sum = 0.0f;
+        for (uint i = 0; i < 6; i++) {
+            sum += prob_vals[idx[i]];
+        }
+        sum = max(sum, 6.103515625e-5f);
+        selected[tid] = expert;
+        weights[tid] = prob_vals[expert] / sum * 1.5f;
+    }
 }
 
 // Fills the dense compressed-attention mask with -inf. The selected top-k rows
@@ -669,6 +813,93 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
     device float4 *dst4 = (device float4 *)(dst +
         (uint64_t)token * args.dst_token_stride +
         (uint64_t)head  * args.dst_head_stride);
+    dst4[lane +  0] = o0 * inv_s;
+    dst4[lane + 32] = o1 * inv_s;
+    dst4[lane + 64] = o2 * inv_s;
+    dst4[lane + 96] = o3 * inv_s;
+}
+
+kernel void kernel_dsv4_gathered_attention_heads8(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup float4 *kv_shared [[threadgroup(0)]],
+        uint   group [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint head = group * 8u + (uint)sg;
+    if (head >= args.n_head) {
+        return;
+    }
+
+    device const float4 *q4 = (device const float4 *)(q +
+        (uint64_t)head * args.q_head_stride);
+    const half4 q0 = (half4)q4[lane +  0];
+    const half4 q1 = (half4)q4[lane + 32];
+    const half4 q2 = (half4)q4[lane + 64];
+    const half4 q3 = (half4)q4[lane + 96];
+
+    float M = -FLT_MAX/2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    for (uint row0 = 0; row0 < args.n_raw; row0 += 4u) {
+        const uint n_rows = min(4u, args.n_raw - row0);
+        for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+            const uint r = off >> 7;
+            const uint c = off & 127u;
+            const uint row = (args.raw_start + row0 + r) % args.raw_cap;
+            device const float4 *src = (device const float4 *)(raw_kv +
+                (uint64_t)row * args.raw_row_stride);
+            kv_shared[off] = src[c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < n_rows; r++) {
+            dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
+                                                 r,
+                                                 q0, q1, q2, q3,
+                                                 args.scale,
+                                                 lane,
+                                                 M, S,
+                                                 o0, o1, o2, o3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint row0 = 0; row0 < args.n_comp; row0 += 4u) {
+        const uint n_rows = min(4u, args.n_comp - row0);
+        for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+            const uint r = off >> 7;
+            const uint c = off & 127u;
+            device const float4 *src = (device const float4 *)(comp_kv +
+                (uint64_t)(row0 + r) * args.comp_row_stride);
+            kv_shared[off] = src[c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < n_rows; r++) {
+            dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
+                                                 r,
+                                                 q0, q1, q2, q3,
+                                                 args.scale,
+                                                 lane,
+                                                 M, S,
+                                                 o0, o1, o2, o3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
+
+    const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
+    device float4 *dst4 = (device float4 *)(dst +
+        (uint64_t)head * args.dst_head_stride);
     dst4[lane +  0] = o0 * inv_s;
     dst4[lane + 32] = o1 * inv_s;
     dst4[lane + 64] = o2 * inv_s;

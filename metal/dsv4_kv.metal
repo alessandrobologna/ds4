@@ -27,12 +27,27 @@ struct ds4_metal_args_dsv4_kv_fp8_store {
     int32_t raw_row;
 };
 
+struct ds4_metal_args_dsv4_raw_store_f16_round {
+    uint32_t head_dim;
+    uint32_t raw_cap;
+    uint32_t pos0;
+    uint32_t n_tokens;
+};
+
 struct ds4_metal_args_dsv4_ratio4_shift {
     uint32_t width;
 };
 
 struct ds4_metal_args_dsv4_compressor_store_one {
     uint32_t width;
+    uint32_t ratio;
+    uint32_t pos;
+    uint32_t ape_type;
+};
+
+struct ds4_metal_args_dsv4_compressor_store_one_capture {
+    uint32_t width;
+    uint32_t state_rows;
     uint32_t ratio;
     uint32_t pos;
     uint32_t ape_type;
@@ -177,6 +192,27 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
     }
 }
 
+// Batched verifier/prefill raw-ring store. The generic graph used to round the
+// whole KV batch through a half scratch buffer, convert it back to float, then
+// set_rows into the SWA raw ring. This preserves the same F16-rounded raw-cache
+// values but writes the destination ring row directly.
+kernel void kernel_dsv4_raw_store_f16_round_batch(
+        constant ds4_metal_args_dsv4_raw_store_f16_round & args,
+        device const float * kv,
+        device       float * raw_cache,
+        uint gid [[thread_position_in_grid]]) {
+    const uint head_dim = args.head_dim;
+    const uint total = args.n_tokens * head_dim;
+    if (head_dim == 0 || args.raw_cap == 0 || gid >= total) {
+        return;
+    }
+
+    const uint token = gid / head_dim;
+    const uint col = gid - token * head_dim;
+    const uint raw_row = (args.pos0 + token) % args.raw_cap;
+    raw_cache[(ulong)raw_row * head_dim + col] = (float)((half)kv[gid]);
+}
+
 // Ratio-4 compression keeps two 4-row halves of recurrent state. After an
 // emitted compressed row, the second half becomes the next window's previous
 // half. The old encoder expressed this as four generic copies; this DS4-specific
@@ -224,4 +260,48 @@ kernel void kernel_dsv4_compressor_store_one(
 
     state_kv[dst] = kv[gid];
     state_score[dst] = score[gid] + ape_v;
+}
+
+// Exact verifier helper for the common N=2 prefix path when token 0 does not
+// emit a compressed row. It applies the one-row compressor store and captures
+// the resulting KV/score frontier in the same ordered compute pass.
+kernel void kernel_dsv4_compressor_store_one_capture(
+        constant ds4_metal_args_dsv4_compressor_store_one_capture & args,
+        device const float * kv,
+        device const float * score,
+        device const char  * ape,
+        device       float * state_kv,
+        device       float * state_score,
+        device       float * prefix_kv,
+        device       float * prefix_score,
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.width * args.state_rows;
+    if (gid >= total || args.width == 0 || args.state_rows == 0 || args.ratio == 0) {
+        return;
+    }
+
+    const uint row = gid / args.width;
+    const uint col = gid - row * args.width;
+    const uint pos_mod = args.pos % args.ratio;
+    const uint dst_row = args.ratio == 4u ? args.ratio + pos_mod : pos_mod;
+
+    if (row == dst_row) {
+        const uint ape_i = pos_mod * args.width + col;
+        float ape_v;
+        if (args.ape_type == 1u) {
+            ape_v = (float)(((device const half *)ape)[ape_i]);
+        } else {
+            ape_v = ((device const float *)ape)[ape_i];
+        }
+
+        const float kv_v = kv[col];
+        const float score_v = score[col] + ape_v;
+        state_kv[gid] = kv_v;
+        state_score[gid] = score_v;
+        prefix_kv[gid] = kv_v;
+        prefix_score[gid] = score_v;
+    } else {
+        prefix_kv[gid] = state_kv[gid];
+        prefix_score[gid] = state_score[gid];
+    }
 }

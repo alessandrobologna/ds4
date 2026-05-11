@@ -7126,8 +7126,10 @@ static void generate_job(server *s, job *j) {
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    const bool mtp_n1_spec = getenv("DS4_MTP_N1_SPEC") != NULL;
     const bool mtp_spec_configured =
-        ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+        (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||
+         (mtp_n1_spec && ds4_engine_mtp_draft_tokens(s->engine) > 0)) &&
         getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
         getenv("DS4_MTP_NO_SPECULATE") == NULL;
     const bool mtp_stop_direct = getenv("DS4_MTP_ADAPTIVE_STOP_DIRECT") != NULL;

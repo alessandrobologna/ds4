@@ -15,6 +15,20 @@
  */
 typedef struct ds4_metal_tensor ds4_metal_tensor;
 
+typedef struct {
+    uint64_t command_buffers;
+    uint64_t command_buffer_flushes;
+    uint64_t compute_encoders;
+    uint64_t blit_encoders;
+    uint64_t dispatches;
+    uint64_t tensor_views;
+    uint64_t tensor_copies;
+    uint64_t tensor_reads;
+    uint64_t tensor_writes;
+    double encode_sec;
+    double execute_sec;
+} ds4_metal_profile;
+
 int ds4_metal_init(void);
 void ds4_metal_cleanup(void);
 
@@ -28,11 +42,18 @@ int ds4_metal_tensor_read(const ds4_metal_tensor *tensor, uint64_t offset, void 
 int ds4_metal_tensor_copy(ds4_metal_tensor *dst, uint64_t dst_offset,
                           const ds4_metal_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_metal_tensor_copy2_f32(ds4_metal_tensor *dst0, uint64_t dst0_offset,
+                               const ds4_metal_tensor *src0, uint64_t src0_offset,
+                               ds4_metal_tensor *dst1, uint64_t dst1_offset,
+                               const ds4_metal_tensor *src1, uint64_t src1_offset,
+                               uint64_t bytes);
 
 int ds4_metal_begin_commands(void);
 int ds4_metal_flush_commands(void);
 int ds4_metal_end_commands(void);
 int ds4_metal_synchronize(void);
+void ds4_metal_profile_reset(void);
+void ds4_metal_profile_get(ds4_metal_profile *profile);
 
 int ds4_metal_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
@@ -373,6 +394,21 @@ int ds4_metal_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps);
+
+int ds4_metal_compressor_store_one_capture_tensor(
+        const ds4_metal_tensor *kv_cur,
+        const ds4_metal_tensor *sc_cur,
+        ds4_metal_tensor       *state_kv,
+        ds4_metal_tensor       *state_score,
+        ds4_metal_tensor       *prefix_kv,
+        ds4_metal_tensor       *prefix_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                width,
+        uint32_t                ratio,
+        uint32_t                pos);
 
 int ds4_metal_compressor_store_batch_tensor(
         const ds4_metal_tensor *kv,

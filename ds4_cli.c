@@ -477,20 +477,55 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool mtp_n1_pipeline = getenv("DS4_MTP_N1_PIPELINE") != NULL;
+    const bool mtp_n1_spec = getenv("DS4_MTP_N1_SPEC") != NULL || mtp_n1_pipeline;
     const bool use_mtp_spec =
         cfg->gen.temperature <= 0.0f &&
-        ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        (ds4_engine_mtp_draft_tokens(engine) > 1 ||
+         (mtp_n1_spec && ds4_engine_mtp_draft_tokens(engine) > 0)) &&
         getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
         getenv("DS4_MTP_NO_SPECULATE") == NULL;
+    const bool use_mtp_n1_pipeline =
+        use_mtp_spec &&
+        mtp_n1_pipeline &&
+        ds4_engine_mtp_draft_tokens(engine) == 1;
     const bool mtp_stop_direct = getenv("DS4_MTP_ADAPTIVE_STOP_DIRECT") != NULL;
+    int mtp_pending_token = -1;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        bool token_already_emitted = false;
+        int token;
+        if (mtp_pending_token >= 0) {
+            token = mtp_pending_token;
+            mtp_pending_token = -1;
+            token_already_emitted = true;
+        } else {
+            token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
+            if (token == ds4_token_eos(engine)) break;
+        }
 
         int toks[17];
         int ntok = 0;
-        if (use_mtp_spec && (!mtp_stop_direct || !ds4_session_mtp_stopped(session))) {
+        if (use_mtp_n1_pipeline && (!mtp_stop_direct || !ds4_session_mtp_stopped(session))) {
+            ntok = ds4_session_eval_mtp_n1_pipeline_argmax(
+                session,
+                token,
+                token_already_emitted,
+                max_tokens - generated,
+                ds4_token_eos(engine),
+                toks,
+                (int)(sizeof(toks) / sizeof(toks[0])),
+                &mtp_pending_token,
+                err,
+                sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+        } else if (use_mtp_spec &&
+                   !token_already_emitted &&
+                   (!mtp_stop_direct || !ds4_session_mtp_stopped(session))) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -510,8 +545,10 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 ds4_session_free(session);
                 return 1;
             }
-            toks[0] = token;
-            ntok = 1;
+            if (!token_already_emitted) {
+                toks[0] = token;
+                ntok = 1;
+            }
         }
 
         bool stop = false;
@@ -786,7 +823,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->gen.temperature > 0.0f ||
+               ds4_engine_mtp_draft_tokens(engine) > 1 ||
+               ((getenv("DS4_MTP_N1_SPEC") != NULL ||
+                 getenv("DS4_MTP_N1_PIPELINE") != NULL) &&
+                ds4_engine_mtp_draft_tokens(engine) > 0)) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -987,25 +1028,59 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool mtp_n1_pipeline = getenv("DS4_MTP_N1_PIPELINE") != NULL;
+    const bool mtp_n1_spec = getenv("DS4_MTP_N1_SPEC") != NULL || mtp_n1_pipeline;
     const bool use_mtp_spec =
         cfg->gen.temperature <= 0.0f &&
-        ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        (ds4_engine_mtp_draft_tokens(engine) > 1 ||
+         (mtp_n1_spec && ds4_engine_mtp_draft_tokens(engine) > 0)) &&
         getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
         getenv("DS4_MTP_NO_SPECULATE") == NULL;
+    const bool use_mtp_n1_pipeline =
+        use_mtp_spec &&
+        mtp_n1_pipeline &&
+        ds4_engine_mtp_draft_tokens(engine) == 1;
     const bool mtp_stop_direct = getenv("DS4_MTP_ADAPTIVE_STOP_DIRECT") != NULL;
+    int mtp_pending_token = -1;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(chat->session,
+        bool token_already_emitted = false;
+        int token;
+        if (mtp_pending_token >= 0) {
+            token = mtp_pending_token;
+            mtp_pending_token = -1;
+            token_already_emitted = true;
+        } else {
+            token = ds4_session_sample(chat->session,
                                        cfg->gen.temperature,
                                        0,
                                        cfg->gen.top_p,
                                        0.0f,
                                        &rng);
-        if (token == ds4_token_eos(engine)) break;
+            if (token == ds4_token_eos(engine)) break;
+        }
 
         int toks[17];
         int ntok = 0;
-        if (use_mtp_spec && (!mtp_stop_direct || !ds4_session_mtp_stopped(chat->session))) {
+        if (use_mtp_n1_pipeline && (!mtp_stop_direct || !ds4_session_mtp_stopped(chat->session))) {
+            ntok = ds4_session_eval_mtp_n1_pipeline_argmax(
+                chat->session,
+                token,
+                token_already_emitted,
+                max_tokens - generated,
+                ds4_token_eos(engine),
+                toks,
+                (int)(sizeof(toks) / sizeof(toks[0])),
+                &mtp_pending_token,
+                err,
+                sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
+        } else if (use_mtp_spec &&
+                   !token_already_emitted &&
+                   (!mtp_stop_direct || !ds4_session_mtp_stopped(chat->session))) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
@@ -1023,8 +1098,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
-            toks[0] = token;
-            ntok = 1;
+            if (!token_already_emitted) {
+                toks[0] = token;
+                ntok = 1;
+            }
         }
 
         bool stop = false;

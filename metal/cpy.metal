@@ -18,6 +18,15 @@ struct ds4_metal_args_cpy {
     uint64_t nb3;
 };
 
+struct ds4_metal_args_cpy2_f32_f16 {
+    uint32_t n0;
+    uint32_t n1;
+};
+
+struct ds4_metal_args_cpy2_f32_f32 {
+    uint32_t n;
+};
+
 // Typed copy/conversion between graph tensors. DS4 uses this for layout
 // materialization and F32/F16 conversions at graph boundaries such as KV/cache
 // packing and compressor pooling.
@@ -55,3 +64,33 @@ typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
 template [[host_name("kernel_cpy_f32_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<float, float>;
 template [[host_name("kernel_cpy_f32_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<float, half>;
 template [[host_name("kernel_cpy_f16_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<half, float>;
+
+kernel void kernel_cpy2_f32_f16_1d(
+        constant ds4_metal_args_cpy2_f32_f16 & args,
+        device const float *src0,
+        device const float *src1,
+        device half *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < args.n0) {
+        dst[gid] = (half)src0[gid];
+    } else {
+        const uint j = gid - args.n0;
+        if (j < args.n1) {
+            dst[args.n0 + j] = (half)src1[j];
+        }
+    }
+}
+
+kernel void kernel_cpy2_f32_f32_1d(
+        constant ds4_metal_args_cpy2_f32_f32 & args,
+        device const float *src0,
+        device const float *src1,
+        device float *dst0,
+        device float *dst1,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n) {
+        return;
+    }
+    dst0[gid] = src0[gid];
+    dst1[gid] = src1[gid];
+}

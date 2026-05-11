@@ -894,6 +894,80 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         sgitg);
 }
 
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_pair2(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+    if (args.nei1 != 2 || args.ne12 != 2) {
+        return;
+    }
+
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NR0 = N_R0_Q8_0;
+
+    const int idx = tgpig.z;
+    const int nb = args.ne00 / QK8_0;
+    const int r0 = tgpig.x * NR0;
+
+    device const char *src0_cur = src0s + idx * args.nb02;
+    device const float *y0 = (device const float *)(src1 + idx * args.nb11);
+    device const float *y1 = (device const float *)(src1 + idx * args.nb11 + args.nb12);
+
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *)(src0_cur + (uint64_t)(r0 + row) * args.nb01);
+    }
+
+    float sum0[NR0] = { 0.f };
+    float sum1[NR0] = { 0.f };
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    float yl0[NQ];
+    float yl1[NQ];
+    device const float *yb0 = y0 + ib0 * QK8_0 + il * NQ;
+    device const float *yb1 = y1 + ib0 * QK8_0 + il * NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl0[i] = yb0[i];
+            yl1[i] = yb1[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            float s0 = 0.f;
+            float s1 = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                const float q = qs[i];
+                s0 += q * yl0[i];
+                s1 += q * yl1[i];
+            }
+            const float d = ax[row][ib].d;
+            sum0[row] += s0 * d;
+            sum1[row] += s1 * d;
+        }
+
+        yb0 += NSG * NQ * QK8_0;
+        yb1 += NSG * NQ * QK8_0;
+    }
+
+    device float *dst0 = (device float *)dst + (uint64_t)idx * args.ne0;
+    device float *dst1 = dst0 + (uint64_t)args.ne1 * args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst0, sum0, r0, args.ne01, tiisg, sgitg, shmem);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    helper_mv_reduce_and_write<NR0>(dst1, sum1, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0_gate,

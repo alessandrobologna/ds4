@@ -145,6 +145,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+int ds4_session_eval_mtp_n1_pipeline_argmax(ds4_session *s, int first_token,
+                                            bool first_already_emitted,
+                                            int max_tokens, int eos_token,
+                                            int *emitted, int emitted_cap,
+                                            int *pending_token,
+                                            char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

@@ -1897,3 +1897,48 @@ This satisfies the current exact-MTP goal for sustained code generation:
 runs with no output drift. The credible path toward a larger margin remains
 heavy-layer work, especially routed MoE and attention/output kernels, but the
 branch now has a hash-identical exact speedup on the target workload.
+
+## 2026-05-11 Routed MoE Tiny Pair+SwiGLU Promotion
+
+The radical routed-MoE pass found one real correctness bug in the opt-in tiny
+batch pair+SwiGLU path. For `n_tokens <= 4`, the fused pair+SwiGLU kernel wrote
+the routed `mid` activation, but the host then fell through into the legacy
+clamp/SwiGLU block and overwrote `mid` without the route weight. That made
+`DS4_METAL_ENABLE_ROUTED_BATCH_PAIR_SWIGLU=1` fail the strict q4 batch2 gate.
+
+After guarding the legacy activation blocks with `!use_tiny_pair_swiglu`, the
+same path became exact:
+
+```text
+artifact: /tmp/ds4-radical-q4-promoted-swiglu-lb.err
+batch2-lb steps: 30
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 55.261 ms
+batch2: 41.386 ms
+layer_dispatch: 1988.0
+```
+
+The q4 oracle also passed without the opt-in env after promoting the fused path
+to the default tiny routed-MoE verifier path. The disable escape hatch remains:
+`DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION=1`.
+
+The final 5-run sustained Python/code benchmark with no special env measured:
+
+```text
+csv: /tmp/ds4-radical-q4-promoted-swiglu-prod.csv
+baseline median: 34.58 TPS, hashes=1
+disabled median: 34.61 TPS, hashes=1, hash_matches_baseline=1
+exact median: 36.61 TPS, hashes=1, hash_matches_baseline=1
+exact_vs_baseline: 1.059
+speed median: 38.51 TPS, hashes=1
+speed_vs_baseline: 1.114
+```
+
+This is a valid default exact improvement and keeps the sustained-code exact
+lane above baseline, but it is not a radical ceiling change. The routed-MoE
+slice removes a repeated activation dispatch and fixes the previously drifting
+fused diagnostic; the remaining gap to `1.5x` still requires a larger verifier
+architecture change, such as branch-local tree rows with coherent compressed
+state or a much broader verifier-layer fusion.

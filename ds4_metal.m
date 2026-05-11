@@ -14306,7 +14306,6 @@ int ds4_metal_routed_moe_batch_tensor(
             tiny_pair_pipeline != nil;
         const bool use_tiny_pair_swiglu =
             use_tiny_pair_mv &&
-            getenv("DS4_METAL_ENABLE_ROUTED_BATCH_PAIR_SWIGLU") != NULL &&
             getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
             tiny_pair_swiglu_pipeline != nil;
         ds4_metal_mul_mm_id_map_args gate_map_args = { 0 };
@@ -14534,7 +14533,7 @@ int ds4_metal_routed_moe_batch_tensor(
                                                     pair_rows,
                                                     clamp,
                                                     use_mid_f16);
-        } else if (ok && clamp > 1.0e-6f) {
+        } else if (ok && !use_tiny_pair_swiglu && clamp > 1.0e-6f) {
             ok = ds4_metal_encode_unary_f32_rows(cb,
                                                  g_unary_clamp_pipeline,
                                                  gatebuf,
@@ -14585,7 +14584,7 @@ int ds4_metal_routed_moe_batch_tensor(
                                                    midbuf,
                                                    ds4_metal_tensor_offset(mid));
             }
-        } else if (ok) {
+        } else if (ok && !use_tiny_pair_swiglu) {
             ok = ds4_metal_encode_swiglu_flat(cb,
                                               gatebuf,
                                               ds4_metal_tensor_offset(gate),

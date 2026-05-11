@@ -4,6 +4,7 @@
 #ifndef DS4_NO_METAL
 #include "../ds4_metal.h"
 #include <math.h>
+#include <time.h>
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -71,6 +72,23 @@ static uint16_t test_float_to_f16(float f) {
     uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
     if (mant & 0x1000u) half++;
     return (uint16_t)half;
+}
+
+static uint32_t test_env_u32(const char *name, uint32_t def, uint32_t min, uint32_t max) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return def;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s) return def;
+    if (v < min) v = min;
+    if (v > max) v = max;
+    return (uint32_t)v;
+}
+
+static double test_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
 static void test_metal_f16_matvec_fast_nr0_4(void) {
@@ -148,6 +166,155 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(out_host);
     ds4_metal_tensor_free(x);
     ds4_metal_tensor_free(out);
+    free(weights_raw);
+}
+
+static void test_metal_q8_pair2_rows(void) {
+    uint32_t in_dim = test_env_u32("DS4_METAL_Q8_PAIR2_BENCH_IN", 512, 32, 65536);
+    uint32_t out_dim = test_env_u32("DS4_METAL_Q8_PAIR2_BENCH_OUT", 256, 1, 131072);
+    const uint32_t repeats = test_env_u32("DS4_METAL_Q8_PAIR2_BENCH_REPEATS", 0, 0, 100000);
+    in_dim = (in_dim + 31u) & ~31u;
+
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+    memset(weights_raw, 0, (size_t)weight_alloc);
+
+    uint8_t *weights = weights_raw;
+    const uint16_t scale_h = test_float_to_f16(0.125f);
+    for (uint32_t o = 0; o < out_dim; o++) {
+        for (uint32_t b = 0; b < blocks; b++) {
+            uint8_t *block = weights + (uint64_t)o * row_bytes + b * 34u;
+            memcpy(block, &scale_h, sizeof(scale_h));
+            int8_t *qs = (int8_t *)(block + 2u);
+            for (uint32_t i = 0; i < 32u; i++) {
+                qs[i] = (int8_t)((int)((o * 3u + b * 5u + i * 7u) % 31u) - 15);
+            }
+        }
+    }
+
+    const uint64_t x_bytes = (uint64_t)2u * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)2u * out_dim * sizeof(float);
+    ds4_metal_tensor *x = ds4_metal_tensor_alloc(x_bytes);
+    ds4_metal_tensor *out_pair = ds4_metal_tensor_alloc(out_bytes);
+    ds4_metal_tensor *out_serial = ds4_metal_tensor_alloc(out_bytes);
+    TEST_ASSERT(x != NULL);
+    TEST_ASSERT(out_pair != NULL);
+    TEST_ASSERT(out_serial != NULL);
+    if (!x || !out_pair || !out_serial) {
+        ds4_metal_tensor_free(out_serial);
+        ds4_metal_tensor_free(out_pair);
+        ds4_metal_tensor_free(x);
+        free(weights_raw);
+        return;
+    }
+
+    float *x_host = malloc((size_t)x_bytes);
+    float *pair_host = malloc((size_t)out_bytes);
+    float *serial_host = malloc((size_t)out_bytes);
+    TEST_ASSERT(x_host != NULL);
+    TEST_ASSERT(pair_host != NULL);
+    TEST_ASSERT(serial_host != NULL);
+    if (!x_host || !pair_host || !serial_host) {
+        free(serial_host);
+        free(pair_host);
+        free(x_host);
+        ds4_metal_tensor_free(out_serial);
+        ds4_metal_tensor_free(out_pair);
+        ds4_metal_tensor_free(x);
+        free(weights_raw);
+        return;
+    }
+
+    for (uint64_t i = 0; i < (uint64_t)2u * in_dim; i++) {
+        x_host[i] = (float)((int)((i * 11u + 3u) % 37u) - 18) / 32.0f;
+    }
+    TEST_ASSERT(ds4_metal_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ds4_metal_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_metal_set_quality(false);
+
+    TEST_ASSERT(ds4_metal_matmul_q8_0_rows_tensor(out_pair, weights_raw, weight_alloc, 0,
+                                                  in_dim, out_dim, x, 2) != 0);
+    for (uint32_t t = 0; t < 2u; t++) {
+        ds4_metal_tensor *x_row = ds4_metal_tensor_view(x,
+                                                        (uint64_t)t * in_dim * sizeof(float),
+                                                        (uint64_t)in_dim * sizeof(float));
+        ds4_metal_tensor *out_row = ds4_metal_tensor_view(out_serial,
+                                                          (uint64_t)t * out_dim * sizeof(float),
+                                                          (uint64_t)out_dim * sizeof(float));
+        TEST_ASSERT(x_row != NULL);
+        TEST_ASSERT(out_row != NULL);
+        if (x_row && out_row) {
+            TEST_ASSERT(ds4_metal_matmul_q8_0_tensor(out_row, weights_raw, weight_alloc, 0,
+                                                     in_dim, out_dim, x_row, 1) != 0);
+        }
+        ds4_metal_tensor_free(out_row);
+        ds4_metal_tensor_free(x_row);
+    }
+
+    TEST_ASSERT(ds4_metal_tensor_read(out_pair, 0, pair_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_metal_tensor_read(out_serial, 0, serial_host, out_bytes) != 0);
+
+    float max_abs = 0.0f;
+    uint64_t max_i = 0;
+    for (uint64_t i = 0; i < (uint64_t)2u * out_dim; i++) {
+        float err = fabsf(pair_host[i] - serial_host[i]);
+        if (err > max_abs) {
+            max_abs = err;
+            max_i = i;
+        }
+    }
+    TEST_ASSERT(max_abs == 0.0f);
+
+    if (repeats > 0) {
+        double t0 = test_now_sec();
+        for (uint32_t i = 0; i < repeats; i++) {
+            TEST_ASSERT(ds4_metal_matmul_q8_0_rows_tensor(out_pair, weights_raw, weight_alloc, 0,
+                                                          in_dim, out_dim, x, 2) != 0);
+        }
+        double pair_sec = test_now_sec() - t0;
+
+        t0 = test_now_sec();
+        for (uint32_t i = 0; i < repeats; i++) {
+            for (uint32_t t = 0; t < 2u; t++) {
+                ds4_metal_tensor *x_row = ds4_metal_tensor_view(x,
+                                                                (uint64_t)t * in_dim * sizeof(float),
+                                                                (uint64_t)in_dim * sizeof(float));
+                ds4_metal_tensor *out_row = ds4_metal_tensor_view(out_serial,
+                                                                  (uint64_t)t * out_dim * sizeof(float),
+                                                                  (uint64_t)out_dim * sizeof(float));
+                TEST_ASSERT(x_row != NULL);
+                TEST_ASSERT(out_row != NULL);
+                if (x_row && out_row) {
+                    TEST_ASSERT(ds4_metal_matmul_q8_0_tensor(out_row, weights_raw, weight_alloc, 0,
+                                                             in_dim, out_dim, x_row, 1) != 0);
+                }
+                ds4_metal_tensor_free(out_row);
+                ds4_metal_tensor_free(x_row);
+            }
+        }
+        double serial_sec = test_now_sec() - t0;
+        printf("ds4-test: q8-pair2 rows in=%u out=%u repeats=%u pair_ms=%.3f serial2_ms=%.3f speedup=%.3fx max_abs=%.9g max_i=%llu\n",
+               in_dim,
+               out_dim,
+               repeats,
+               1000.0 * pair_sec / repeats,
+               1000.0 * serial_sec / repeats,
+               pair_sec > 0.0 ? serial_sec / pair_sec : 0.0,
+               max_abs,
+               (unsigned long long)max_i);
+    }
+
+    free(serial_host);
+    free(pair_host);
+    free(x_host);
+    ds4_metal_tensor_free(out_serial);
+    ds4_metal_tensor_free(out_pair);
+    ds4_metal_tensor_free(x);
     free(weights_raw);
 }
 
@@ -254,6 +421,7 @@ static void test_metal_rope_tail_same_position_batch(void) {
 
 static void test_metal_kernels(void) {
     test_metal_f16_matvec_fast_nr0_4();
+    test_metal_q8_pair2_rows();
     test_metal_rope_tail_same_position_batch();
 }
 

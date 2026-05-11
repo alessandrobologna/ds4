@@ -1833,3 +1833,40 @@ large exact verifier layer pass. The next credible path to a larger exact gain
 would need a deeper rewrite of the heavy kernels themselves, especially Q8 row
 matvecs, raw/compressed attention, or routed MoE arithmetic. Small scheduling
 changes around the existing row kernels are now mostly falsified on Studio q4.
+
+## 2026-05-11 Q8 Pair2 Microkernel Diagnostic
+
+The follow-up pass added an isolated `./ds4_test --metal-kernels` diagnostic for
+`kernel_mul_mv_q8_0_f32_pair2_rows`. It builds synthetic Q8_0 weights and two
+activation rows, compares the exact batch2 row-pair kernel against two serial
+one-row Q8 matvecs, and optionally prints timing with:
+
+```sh
+DS4_METAL_Q8_PAIR2_BENCH_REPEATS=120 \
+DS4_METAL_Q8_PAIR2_BENCH_IN=4096 \
+DS4_METAL_Q8_PAIR2_BENCH_OUT=4096 \
+./ds4_test --metal-kernels
+```
+
+Studio q4 validation:
+
+- default `./ds4_test --metal-kernels`: OK.
+- diagnostic `4096x4096`: `pair_ms=0.286`, `serial2_ms=0.528`,
+  `speedup=1.847x`, `max_abs=0`.
+- earlier sequential probes showed the same exactness and about `1.86x-2.20x`
+  isolated speedup depending on shape.
+
+Two deeper Q8 pair2 rewrites were tested and not kept:
+
+- paired-reduction helper: exact and moved batch2 lower-bound slightly
+  (`41.460 ms` to `41.224 ms`), but production was flat. Both 5-run sustained
+  Python/code benchmarks measured exact median `36.75 TPS`, baseline median
+  about `35.30 TPS`, and strict hash identity (`exact_vs_baseline=1.041`).
+- `nr0=4` row-pair specialization: exact, but slower in isolated Studio
+  probes (`4096x4096` `0.296 ms` vs `0.271 ms`; `7168x8192` `0.306 ms` vs
+  `0.301 ms`).
+
+The current Q8 pair2 kernel is therefore not the missing 1.05x lever. It is
+already a strong isolated win over two serial Q8 rows, but production remains
+limited by the full exact verifier layer stack rather than this reduction path
+alone.

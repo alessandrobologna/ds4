@@ -1870,3 +1870,26 @@ The current Q8 pair2 kernel is therefore not the missing 1.05x lever. It is
 already a strong isolated win over two serial Q8 rows, but production remains
 limited by the full exact verifier layer stack rather than this reduction path
 alone.
+
+The same checkpoint did reach the sustained-code stop condition on a longer
+256-token Python/code prompt:
+
+```text
+prompt: Write a complete Python module that reads CSV rows, groups them by user
+id, computes per-user count, sum, average, min, and max, includes a small
+argparse command line interface, and includes concise unit tests for the pure
+helper functions.
+csv: /tmp/ds4-current-code-256-prod.csv
+baseline median: 34.81 TPS, hashes=1
+disabled median: 34.80 TPS, hashes=1, hash_matches_baseline=1
+exact median: 36.72 TPS, hashes=1, hash_matches_baseline=1
+exact_vs_baseline: 1.055
+speed median: 38.70 TPS, hashes=1
+speed_vs_baseline: 1.112
+```
+
+This satisfies the current exact-MTP goal for sustained code generation:
+`--mtp --mtp-draft 2` is repeatably above baseline over 5 interleaved Studio q4
+runs with no output drift. The credible path toward a larger margin remains
+heavy-layer work, especially routed MoE and attention/output kernels, but the
+branch now has a hash-identical exact speedup on the target workload.

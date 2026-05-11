@@ -1985,3 +1985,31 @@ to amortize roughly two accepted tokens. A tree route remains plausible only as
 a real row-parallel verifier-layer rewrite, with branch-local compressed
 attention/indexer state advanced coherently across siblings; the existing
 command-batched serial row fallback should not be wired into generation.
+
+## 2026-05-11 Shared-Down Rows Fusion Falsifier
+
+The disabled `DS4_MTP_VERIFY_FUSED_SHARED_DOWN_HC=1` path was revisited as a
+broader verifier-layer fusion candidate. The old version was exact but slow
+because the rows wrapper called the one-token fused helper once per verifier row,
+forcing per-row command-buffer submission. A prototype rows API encoded the same
+fused shared-down+HC kernel for all verifier rows into one command buffer.
+
+Studio q4 gates:
+
+```text
+oracle: OK
+artifact: /tmp/ds4-shared-down-rows-lb.err
+batch2-lb steps: 30
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 55.251 ms
+batch2: 41.634 ms
+layer_dispatch: 1988.0
+```
+
+The promoted control for the same prompt was about `41.386 ms`, so the rows
+rewrite moved the lower bound in the wrong direction. It was reverted without a
+production benchmark. The useful conclusion is that shared-down+HC fusion is not
+blocked merely by per-row command submission; the fused kernel itself is not
+better than the current exact rows path on this q4 shape.

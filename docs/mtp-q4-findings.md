@@ -1865,6 +1865,10 @@ Two deeper Q8 pair2 rewrites were tested and not kept:
 - `nr0=4` row-pair specialization: exact, but slower in isolated Studio
   probes (`4096x4096` `0.296 ms` vs `0.271 ms`; `7168x8192` `0.306 ms` vs
   `0.301 ms`).
+- char4 Q-value vector loads with scalar add order preserved: exact in
+  `./ds4_test --metal-kernels`, but the batch2 lower-bound regressed slightly
+  (`41.526 ms` vs the `41.460 ms` restored control), so it was reverted without
+  a production run.
 
 The current Q8 pair2 kernel is therefore not the missing 1.05x lever. It is
 already a strong isolated win over two serial Q8 rows, but production remains

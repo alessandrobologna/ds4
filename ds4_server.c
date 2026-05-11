@@ -9862,19 +9862,28 @@ static void generation_state_finish(generation_state *g) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     const char *final_finish = g->finish;
+    bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
-        bool parsed_ok = parse_generated_message(g->text.ptr ? g->text.ptr : "", &parsed_content,
-                                                 &parsed_reasoning, &parsed_calls);
-        if (!parsed_ok) {
-            free(parsed_content);
-            free(parsed_reasoning);
-            parsed_content = xstrdup(g->text.ptr ? g->text.ptr : "");
-            parsed_reasoning = NULL;
-            tool_calls_free(&parsed_calls);
-            if (j->req.has_tools && g->saw_tool_start && strcmp(final_finish, "error") != 0) {
-                final_finish = "error";
-                snprintf(g->err, sizeof(g->err), "invalid tool call");
-            }
+        bool parsed_ok = parse_generated_message_for_response(
+            g->text.ptr ? g->text.ptr : "",
+            j->req.has_tools,
+            g->saw_tool_start,
+            &final_finish,
+            g->err,
+            sizeof(g->err),
+            &parsed_content,
+            &parsed_reasoning,
+            &parsed_calls,
+            &recovered_tool_parse_failure);
+        if (!parsed_ok && recovered_tool_parse_failure) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: batch slot=%d chat ctx=%s invalid tool call returned as assistant text finish=%s",
+                       g->slot,
+                       g->ctx_span,
+                       final_finish);
+            trace_event(s, g->trace_id,
+                        "invalid tool call returned as assistant text finish=%s",
+                        final_finish);
         }
         if (parsed_calls.len) {
             if (g->openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &g->openai_live);
@@ -13025,6 +13034,59 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     tool_calls_free(&calls);
 }
 
+static void test_batch_finish_recovers_malformed_tool_call_text(void) {
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    server s = {0};
+    job j = {0};
+    generation_state g = {0};
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    j.fd = sv[0];
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_OPENAI;
+    j.req.model = xstrdup("test-model");
+    j.req.has_tools = true;
+
+    g.srv = &s;
+    g.j = &j;
+    g.slot = 0;
+    snprintf(g.id, sizeof(g.id), "chatcmpl_batch_recover");
+    snprintf(g.ctx_span, sizeof(g.ctx_span), "0..4:4");
+    g.finish = "tool_calls";
+    g.saw_tool_start = true;
+    g.saw_tool_end = true;
+    g.completion = 4;
+    g.last_decode_log_completion = g.completion;
+    g.t0 = now_sec();
+    g.decode_t0 = g.t0;
+    buf_puts(&g.text,
+             "trying a tool\n\n"
+             DS4_TOOL_CALLS_START "\n"
+             DS4_INVOKE_START ">\n"
+             DS4_TOOL_CALLS_END);
+
+    generation_state_finish(&g);
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(j.done);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"error\"") == NULL);
+    TEST_ASSERT(strstr(out, "trying a tool") != NULL);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) != NULL);
+
+    free(out);
+    request_free(&j.req);
+    pthread_cond_destroy(&j.cv);
+    pthread_mutex_destroy(&j.mu);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
@@ -14251,6 +14313,7 @@ static void ds4_server_unit_tests_run(void) {
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_tool_parse_failure_returns_recoverable_finish();
+    test_batch_finish_recovers_malformed_tool_call_text();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();

@@ -51,6 +51,7 @@ typedef struct {
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
+typedef struct ds4_batch ds4_batch;
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
@@ -77,6 +78,18 @@ typedef struct {
     uint32_t raw_cap;
     uint32_t comp_cap;
 } ds4_context_memory;
+
+typedef struct {
+    int slot;
+    int token;
+} ds4_batch_step;
+
+typedef struct {
+    int slot;
+    const int *tokens;
+    int n_tokens;
+    int refresh_logits;
+} ds4_batch_prefill_segment;
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
@@ -169,5 +182,55 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s);
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+
+int ds4_batch_create(ds4_batch **out, ds4_engine *e, int ctx_size, int max_slots);
+int ds4_batch_create_with_backend(ds4_batch **out, ds4_engine *e, int ctx_size,
+                                  int max_slots, const char *backend_name);
+void ds4_batch_free(ds4_batch *b);
+int ds4_batch_max_slots(ds4_batch *b);
+int ds4_batch_ctx(ds4_batch *b);
+int ds4_batch_prefill_capacity(ds4_batch *b);
+const char *ds4_batch_backend_name(ds4_batch *b);
+/* Slot lifecycle: inference calls that advance or sample a live request require
+ * a claimed slot.  Released slots may still retain a valid checkpoint for idle
+ * prefix reuse, disk-cache eviction, and shutdown persistence; common_prefix,
+ * tokens, save/load, and payload queries are therefore intentionally valid for
+ * unoccupied slots when their payload state is save-safe. */
+void ds4_batch_claim_slot(ds4_batch *b, int slot);
+void ds4_batch_release_slot(ds4_batch *b, int slot);
+uint64_t ds4_batch_slot_generation(ds4_batch *b, int slot);
+int ds4_batch_slot_occupied(ds4_batch *b, int slot);
+int ds4_batch_slot_logits_valid(ds4_batch *b, int slot);
+int ds4_batch_slot_payload_valid(ds4_batch *b, int slot);
+int ds4_batch_slot_can_save(ds4_batch *b, int slot);
+void ds4_batch_mark_slot_error(ds4_batch *b, int slot);
+void ds4_batch_set_progress(ds4_batch *b, int slot, ds4_session_progress_fn fn, void *ud);
+int ds4_batch_sync(ds4_batch *b, int slot, const ds4_tokens *prompt, char *err, size_t errlen);
+int ds4_batch_common_prefix(ds4_batch *b, int slot, const ds4_tokens *prompt);
+int ds4_batch_sample(ds4_batch *b, int slot, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+int ds4_batch_top_logprobs(ds4_batch *b, int slot, ds4_token_score *out, int k);
+int ds4_batch_eval(ds4_batch *b, const ds4_batch_step *steps, int n_steps, char *err, size_t errlen);
+/* Evaluate one token per slot and return only each slot's next greedy token.
+ * The slot checkpoint advances, but the CPU logits row is not refreshed. */
+int ds4_batch_eval_top(ds4_batch *b, const ds4_batch_step *steps, int n_steps,
+                       int *top_tokens, char *err, size_t errlen);
+/* Advance one prompt token per slot.  refresh_logits is optional; when present,
+ * nonzero entries refresh that slot's CPU logits row after the step. */
+int ds4_batch_prefill(ds4_batch *b, const ds4_batch_step *steps,
+                      const int *refresh_logits, int n_steps,
+                      char *err, size_t errlen);
+/* Advance one contiguous prompt segment per slot.  The implementation may pack
+ * all segment rows into one shared layer-major prefill pass.  refresh_logits
+ * refreshes the final row for that slot and makes the slot payload save-safe. */
+int ds4_batch_prefill_segments(ds4_batch *b, const ds4_batch_prefill_segment *segments,
+                               int n_segments, char *err, size_t errlen);
+void ds4_batch_invalidate_slot(ds4_batch *b, int slot);
+void ds4_batch_rewind_slot(ds4_batch *b, int slot, int pos);
+int ds4_batch_pos(ds4_batch *b, int slot);
+const ds4_tokens *ds4_batch_tokens(ds4_batch *b, int slot);
+uint64_t ds4_batch_slot_payload_bytes(ds4_batch *b, int slot);
+int ds4_batch_save_slot_payload(ds4_batch *b, int slot, FILE *fp, char *err, size_t errlen);
+int ds4_batch_load_slot_payload(ds4_batch *b, int slot, FILE *fp, uint64_t payload_bytes,
+                                char *err, size_t errlen);
 
 #endif

@@ -138,14 +138,75 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
-so stateless clients that resend a longer version of the same prompt can reuse
-the shared prefix instead of pre-filling from token zero.
+The server is Metal-only. By default it keeps one mutable graph/KV checkpoint
+in memory, so stateless clients that resend a longer version of the same prompt
+can reuse the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
-serialized through one Metal worker. The current server does not batch multiple
-independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+serialized through one Metal worker unless the multi-slot scheduler is enabled.
+Start with `--max-slots N` to admit up to `N` independent live inference slots:
+
+```sh
+./ds4-server --ctx 100000 --max-slots 4 --batch-wait-us 500
+```
+
+The default `--max-slots > 1` backend is `shared-decode`: it uses a batch-owned
+Metal graph with slot-indexed KV/frontier storage and row-batched dense,
+feed-forward, and output-head work across active slots. Attention state is
+slot-isolated; some attention subpaths still use row-loop or slot-view execution
+while the row-metadata attention diagnostics continue to mature.
+`--batch-backend session-slots` remains available as the conservative reference
+fallback with independent session/KV slots behind the same scheduler. Both modes
+keep the same logical per-slot payload format as serialized mode so disk KV
+files remain reusable across serialized, `session-slots`, and `shared-decode`
+runs.
+
+MTP drafting is rejected with `--max-slots > 1`. Disk KV checkpoints remain
+supported and keep the same content-addressed token-prefix files used by
+serialized mode. `session-slots` memory use scales with full per-slot session
+graphs; `shared-decode` shares layer work tensors while persistent KV/frontier
+storage still scales with the number of slots. Prompt prefill is advanced in
+bounded chunks; generation then interleaves one sampled token per decode-ready slot.
+Deterministic non-thinking requests use a top-token decode path that avoids host
+readback of the full vocabulary row after every generated token; slots that have
+only this top-token state are not written to disk until full logits are refreshed.
+
+`--experimental-batched-prefill` adds segmented shared-decode prefill experiments.
+Concurrent prompts with a shared token prefix are prefetched once per common
+prefix chunk and fanned out through the same slot payload format used by disk KV.
+Non-identical prompts can also advance bounded multi-token segments by packing
+rows from each active slot into one layer-major shared graph pass when no
+decode-ready slot is waiting. Full logits are refreshed at final prompt tokens
+and cache-save boundaries so disk KV compatibility is preserved, but the mode
+remains opt-in while this path is still being validated.
+
+Diagnostic tuning knobs for this path are intentionally environment-only:
+`DS4_BATCH_PREFILL_ROW_CAP` caps total packed rows per segmented prefill call,
+clamped to a hard maximum of 8192 rows,
+`DS4_BATCH_PREFILL_CHUNK_TOKENS` caps the serialized prefill chunk size used by
+the scheduler,
+`DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS` caps scheduler rows per tick,
+`DS4_BATCH_PREFILL_WAIT_US` controls how long the scheduler can wait to collect
+multiple prefill-ready slots,
+`DS4_BATCH_PREFILL_FANOUT_MIN_TOKENS` controls the minimum common-prefix length
+that is worth payload fanout,
+`DS4_BATCH_PREFILL_ALIGN_TOKENS` can force divergent segments to split on
+compression-style boundaries for profiling,
+`DS4_BATCH_PREFILL_SPAN_MIN_ROWS` controls when exact span prefill attention is
+used when segmented attention is disabled,
+`DS4_BATCH_DISABLE_SEGMENTED_PREFILL_ATTENTION=1` falls back to per-slot span
+attention for all layers,
+`DS4_BATCH_DISABLE_PRECOMPUTED_SPAN_ATTENTION=1` restores the older per-span
+projection path for non-ratio-4 layers,
+`DS4_BATCH_EQUAL_SPAN_FLASH_ATTENTION=1` lets equal-shape spans dispatch through
+one 3D FlashAttention diagnostic call,
+`DS4_BATCH_SEGMENTED_FLASH_ATTENTION=1` enables the row-metadata segmented
+FlashAttention diagnostic, `DS4_BATCH_SEGMENTED_DENSE_MASK_ATTENTION=1` switches
+that diagnostic back to the dense block-mask scaffold, and
+`DS4_BATCH_SEGMENTED_DIRECT_ATTENTION=1` forces the row-metadata attention
+kernel on shared decode. These diagnostics are not default paths because Studio
+benchmarks showed they have not yet beaten serialized prefill despite passing
+correctness gates.
 
 Supported endpoints:
 
@@ -385,11 +446,12 @@ token stream with cached token prefixes. The live in-memory checkpoint covers
 the current session; the disk KV cache makes useful prefixes survive session
 switches and server restarts.
 
-For RAM reasons there is currently only one live KV cache in memory. When a new
-unrelated session replaces it, the old checkpoint can only be resumed without
+In serialized mode there is one live KV cache in memory. When a new unrelated
+session replaces it, the old checkpoint can only be resumed without
 re-processing if it was written to the disk KV cache. In other words, memory
 cache handles the active session; disk cache is the resume mechanism for
-different sessions.
+different sessions. Batch mode keeps multiple isolated live slots and can load
+or save the same content-addressed prefix files into any idle slot.
 
 Enable it with:
 
@@ -553,6 +615,28 @@ make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+
+Model-backed batch checks use `DS4_TEST_MODEL`:
+
+```sh
+DS4_TEST_MODEL=/path/to/ds4flash.gguf ./ds4_test --batch-correctness
+DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batch-smoke
+DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batched-prefill-smoke
+DS4_TEST_MODEL=/path/to/ds4flash.gguf make server-batch-benchmark
+DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 1,2,4,8
+DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 1,4,8 --labels serialized,shared-decode --experimental-batched-prefill
+DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 4,8 --labels serialized,shared-decode --experimental-batched-prefill --prefill-unique-suffix --expect-prefill-fanout
+DS4_TEST_MODEL=/path/to/ds4flash.gguf DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS=32 python3 tests/server_batch_smoke.py benchmark --workload prefill --clients 2 --labels shared-decode --experimental-batched-prefill --prefill-unique-prefix --expect-prefill-batch --expect-prefill-chunk
+DS4_TEST_MODEL=/path/to/ds4flash.gguf python3 tests/server_batch_smoke.py benchmark --workload mixed --clients 2,4,8 --labels shared-decode --experimental-batched-prefill --prefill-unique-prefix
+```
+
+`server-batch-smoke` starts `ds4-server --max-slots 2 --kv-disk-dir ...` for
+both `session-slots` and `shared-decode`, warms a disk KV prefix, sends two
+concurrent streaming requests, and fails if the logs do not show disk KV hits
+plus a decode batch of two. The benchmark prints three-trial median aggregate
+completion tokens/sec for serialized, `session-slots`, and `shared-decode`
+backends with one, two, four, and eight clients. The same harness can run a
+prefill-heavy workload and reports prompt tokens/sec for that mode.
 
 ## Debugging Notes
 

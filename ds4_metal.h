@@ -15,6 +15,20 @@
  */
 typedef struct ds4_metal_tensor ds4_metal_tensor;
 
+typedef struct {
+        uint32_t slot;
+        uint32_t pos;
+        uint32_t n_raw;
+        uint32_t raw_start;
+        uint32_t n_comp;
+        uint32_t top_k;
+        uint32_t key_offset;
+        uint32_t n_keys_padded;
+        uint32_t raw_first_pos;
+        uint32_t raw_window;
+        uint32_t ratio;
+} ds4_metal_segmented_attention_row;
+
 int ds4_metal_init(void);
 void ds4_metal_cleanup(void);
 
@@ -487,6 +501,66 @@ int ds4_metal_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                top_k,
         uint32_t                window,
         uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+int ds4_metal_attention_segmented_mixed_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const ds4_metal_tensor *comp_kv,
+        const ds4_metal_tensor *topk,
+        const ds4_metal_tensor *rows,
+        uint32_t                n_tokens,
+        uint32_t                n_slots,
+        uint32_t                raw_cap,
+        uint32_t                comp_cap,
+        uint32_t                top_k,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+int ds4_metal_attention_prefill_masked_raw_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const uint16_t         *mask,
+        uint32_t                n_tokens,
+        uint32_t                n_keys,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+int ds4_metal_attention_prefill_masked_multi_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *packed_kv,
+        const uint16_t         *mask,
+        uint32_t                n_batches,
+        uint32_t                n_tokens,
+        uint32_t                n_keys,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+int ds4_metal_attention_prefill_segmented_flash_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *packed_kv,
+        const ds4_metal_tensor *rows,
+        uint32_t                n_tokens,
+        uint32_t                n_packed_keys,
+        uint32_t                max_keys,
         uint32_t                n_head,
         uint32_t                head_dim);
 

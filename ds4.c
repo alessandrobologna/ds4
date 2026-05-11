@@ -2073,13 +2073,15 @@ static void tensor_expect_plain_layout(
 }
 
 static bool tensor_is_routed_expert_type(uint32_t type) {
-    return type == DS4_TENSOR_IQ2_XXS ||
+    return type == DS4_TENSOR_Q8_0 ||
+           type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
+    case DS4_TENSOR_Q8_0:     return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
@@ -2089,8 +2091,10 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
-    if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
-    return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
+    const gguf_type_info *info = tensor_type(t->type);
+    if (!info || info->block_elems == 0) ds4_die("unsupported routed expert tensor type");
+    if ((t->dim[0] % info->block_elems) != 0) ds4_die("routed expert row is not quant-block aligned");
+    return (t->dim[0] / info->block_elems) * routed_expert_block_bytes(t->type);
 }
 
 static void tensor_expect_routed_expert(

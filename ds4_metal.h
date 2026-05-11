@@ -666,7 +666,7 @@ int ds4_metal_attention_output_low_q8_tensor(
  * =========================================================================
  *
  * These kernels implement the FFN body: router probabilities/top-k or hash
- * routing, shared SwiGLU, and the IQ2_XXS/Q2_K/Q4_K routed experts.
+ * routing, shared SwiGLU, and the Q8_0/IQ2_XXS/Q2_K/Q4_K routed experts.
  */
 
 int ds4_metal_swiglu_tensor(

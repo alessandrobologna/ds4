@@ -2013,3 +2013,98 @@ rewrite moved the lower bound in the wrong direction. It was reverted without a
 production benchmark. The useful conclusion is that shared-down+HC fusion is not
 blocked merely by per-row command submission; the fused kernel itself is not
 better than the current exact rows path on this q4 shape.
+
+## 2026-05-11 Attention Output + HC Rows Fusion Falsifier
+
+A broader verifier-layer fusion was tested for the attention tail: compute only
+the attention low projection, then fuse the Q8 output projection with HC post
+expansion for all exact verifier rows. The prototype was gated behind
+`DS4_MTP_VERIFY_FUSED_ATTN_OUT_HC=1`, preserving the default path while testing
+the rewrite.
+
+Studio q4 gates:
+
+```text
+oracle: OK
+artifact: /tmp/ds4-attn-out-hc-rows-lb.err
+batch2-lb steps: 30
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 55.332 ms
+batch2: 42.114 ms
+layer_dispatch: 1988.0
+```
+
+A same-build no-fusion control on the same prompt measured:
+
+```text
+artifact: /tmp/ds4-attn-out-hc-control-lb.err
+seq2: 55.293 ms
+batch2: 41.205 ms
+layer_dispatch: 1988.0
+```
+
+The fused attention-output+HC path was exact but slower by about `0.9 ms` in the
+batch2 lower bound, so it was reverted without a production benchmark. This
+falsifies another local tail fusion as a radical ceiling change; the remaining
+high-leverage options need to change the dominant routed-MoE/attention
+verification economics rather than combine already-small post-projection
+helpers.
+
+## 2026-05-11 Routed MoE Radical Falsifiers
+
+Two routed-MoE kernel-family changes were tested after the promoted row-pair
+matvec/SwiGLU path.
+
+First, `DS4_METAL_ROUTED_BATCH_FORCE_MM_ID=1` forced tiny verifier batches onto
+the expert-major MM path instead of the pair matvec path. The q4 oracle stayed
+exact, but the lower-bound verifier regressed badly:
+
+```text
+artifact: /tmp/ds4-force-mm-lb.err
+batch2-lb steps: 30
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 54.834 ms
+batch2: 88.242 ms
+layer_dispatch: 2330.5
+```
+
+Second, a prototype split routed MoE after gate/up+SwiGLU, computed the shared
+expert output, then fused Q4 routed-down `sum6` with FFN HC post. This was exact
+for the strict verifier and reduced dispatch count, but it did not improve
+time:
+
+```text
+artifact: /tmp/ds4-routed-down-hc-lb100.err
+batch2-lb steps: 100
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 56.789 ms
+batch2: 42.727 ms
+layers: 41.461 ms
+layer_encode: 1.537 ms
+layer_execute: 39.894 ms
+layer_dispatch: 1879.1
+```
+
+The same-build control on the same sustained-code prompt measured:
+
+```text
+artifact: /tmp/ds4-routed-down-hc-control-lb100.err
+seq2: 56.854 ms
+batch2: 42.662 ms
+layers: 41.395 ms
+layer_encode: 1.495 ms
+layer_execute: 39.870 ms
+layer_dispatch: 1922.1
+```
+
+The fused routed-down+HC path saved about `43` dispatches per batch2 verifier
+but was still slightly slower. It was reverted without production benchmarking.
+This is useful evidence: the remaining MoE gap is not dominated by the final
+routed-down write/read plus HC-post dispatch. A future MoE rewrite would need to
+change the gate/up/down math shape itself, not just fuse the tail.

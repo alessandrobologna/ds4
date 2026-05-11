@@ -2108,3 +2108,142 @@ but was still slightly slower. It was reverted without production benchmarking.
 This is useful evidence: the remaining MoE gap is not dominated by the final
 routed-down write/read plus HC-post dispatch. A future MoE rewrite would need to
 change the gate/up/down math shape itself, not just fuse the tail.
+
+## 2026-05-11 Exact Batch-Attention Fusion Falsifier
+
+A verifier-layer attention batching prototype tried to replace the per-row
+attention fallback inside exact batch2 verification with a shared batched
+attention call when verifier rows had identical compressed/indexer frontiers.
+The broad version was a meaningful lower-bound speed signal, but it was not
+exact:
+
+```text
+env: DS4_MTP_VERIFY_EXACT_BATCH_ATTENTION=1
+artifact: /tmp/ds4-batchattn-lb.err
+batch2-lb steps: 80
+failures: 0
+top_mismatch: 0
+final_mismatch: 1
+seq2: 56.552 ms
+batch2: 39.826 ms
+layers: 38.560 ms
+layer_dispatch: 1900.7
+first mismatch: pos=106 row0=38272 batch_next=201 expected=3820
+```
+
+Narrowing the prototype to indexed compressed attention only restored exactness,
+but removed the useful speed signal:
+
+```text
+artifact: /tmp/ds4-batchattn-indexed-lb.err
+batch2-lb steps: 80
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 56.476 ms
+batch2: 42.375 ms
+layers: 41.104 ms
+layer_dispatch: 1929.6
+```
+
+The required production gate also showed no ceiling movement:
+
+```text
+artifact: /tmp/ds4-batchattn-indexed-prod/results.csv
+baseline_median_tps: 34.99
+disabled_median_tps: 35.02
+exact_median_tps: 37.03
+exact_vs_baseline: 1.058
+hash_matches_baseline: 1
+speed_median_tps: 39.02
+```
+
+The prototype was reverted. The broad version proves there is a few-millisecond
+attention-layer lower-bound opportunity if raw/non-indexed batch semantics can
+be made exact, but the exact indexed-only subset is too small to materially
+change sustained-code TPS.
+
+## 2026-05-11 Routed Down Expert-Parallel Falsifier
+
+The routed MoE stage profile showed the tiny exact batch down projection was
+heavier than gate/up under synchronized stage probes. A diagnostic build forced
+the batch path away from the fused Q4 `sum6` down kernel and back to the generic
+expert-parallel routed matvec plus expert-sum path, to test whether M3 Ultra
+preferred more parallel expert rows over the serial six-expert fused kernel.
+
+Studio q4 gates:
+
+```text
+env: DS4_METAL_DISABLE_ROUTED_DOWN_SUM6=1
+oracle: OK
+artifact: /tmp/ds4-downsum-disable-lb.err
+batch2-lb steps: 80
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 56.575 ms
+batch2: 44.452 ms
+layers: 43.189 ms
+layer_dispatch: 2156.2
+```
+
+This was slower than the promoted direct `sum6` path, which stays in the
+`~41-42 ms` batch2 lower-bound range with fewer dispatches. The diagnostic hook
+was reverted. The result falsifies the simple expert-parallel down rewrite: a
+useful routed-MoE radical rewrite would need to improve the fused down math
+itself, not replace it with the older split expert path.
+
+## 2026-05-11 Pair-SwiGLU Dead-Store Probe
+
+The routed pair-SwiGLU kernels were also tested with the obvious dead
+intermediate writes guarded off in the fused path. This remained exact, but did
+not improve the verifier lower bound:
+
+```text
+artifact: /tmp/ds4-pairstore-lb.err
+oracle: OK
+batch2-lb steps: 80
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 56.536 ms
+batch2: 42.434 ms
+layers: 41.166 ms
+layer_dispatch: 1929.6
+```
+
+The q4 reason is structural: the existing Q4 pair-SwiGLU kernel gets gate/up by
+calling the normal Q4 matvec helper, which writes those rows before the fused
+activation can read them. Guarding only the later redundant writes is too small
+to matter. A real MoE rewrite would need a new Q4 matvec primitive that returns
+gate/up reductions directly to the activation without first materializing the
+full gate/up rows.
+
+## 2026-05-11 True Fused Q4 Pair-SwiGLU Falsifier
+
+The next routed-MoE attempt replaced the Q4 pair-SwiGLU kernel's two calls into
+the generic Q4 matvec helper with a single combined Q4 loop that computed gate
+and up reductions side by side, then wrote only the routed `mid` activation.
+This was the intended heavy-kernel version of the dead-store probe above.
+
+Studio q4 gates:
+
+```text
+artifact: /tmp/ds4-q4truefuse-lb.err
+metal-kernels: OK
+oracle: OK
+batch2-lb steps: 80
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 58.357 ms
+batch2: 43.387 ms
+layers: 42.130 ms
+layer_dispatch: 1976.9
+```
+
+The rewrite preserved exactness but was slower than the promoted Q4 pair helper
+path. The likely cause is register pressure or instruction-cache pressure from
+carrying both Q4 reductions in one kernel; avoiding gate/up materialization did
+not compensate. The prototype was reverted. This falsifies the most direct
+single-kernel routed gate/up rewrite for q4.

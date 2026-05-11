@@ -1772,3 +1772,64 @@ This is intentionally not a speed path. It is a guardrail for the next Metal
 slice: replace `ds4_mtp_tree_decode_rows_command_batch()` one depth at a time,
 starting with root siblings for `4x2x2`, while prioritizing the compressed
 ratio-4 and ratio-128 layers that dominate the serial row probe.
+
+## 2026-05-11 Heavy-Kernel Exact N=2 Pass
+
+Starting from pushed checkpoint `bb55c09`, the next q4 pass focused only on
+heavy matvec/MoE/compressor candidates for exact `--mtp --mtp-draft 2`. The
+long-code benchmark prompt was:
+
+> Write a complete Python module implementing a small asyncio task runner with
+> retries, exponential backoff, cancellation, typed dataclasses, and
+> unit-testable pure helper functions. Include clear docstrings and a short
+> example.
+
+The one kept change is an exact batch2 compressor F16 paired-projection kernel.
+The verifier previously computed `attn/indexer_compressor_kv` and
+`attn/indexer_compressor_gate` as two separate exact F16 row-pair matvecs.
+`ds4_metal_matmul_f16_pair_rows_tensor()` now computes both projections for the
+two verifier rows in one dispatch while preserving the same row-reduction order
+for each matrix. It is gated to exact verifier rows and can be disabled with
+`DS4_METAL_DISABLE_COMPRESSOR_F16_PAIR_ROWS2=1`.
+
+Validation:
+
+- Studio q4 `./ds4_test --mtp-oracle`: OK.
+- Warm lower-bound A/B:
+  `/tmp/ds4-compressor-pairrows-lb2-20260511-125243`
+  - disabled: `batch2=42.194 ms`, `layers=40.925 ms`,
+    `layer_dispatch=2059.4`
+  - fused: `batch2=42.090 ms`, `layers=40.817 ms`,
+    `layer_dispatch=1997.4`
+- 5-run interleaved sustained Python/code benchmark:
+  `/tmp/ds4-compressor-pairrows-prod-20260511-125416/results.csv`
+  - baseline median: `34.18 TPS`
+  - exact with compressor pair disabled: `35.13 TPS`
+  - exact with compressor pair fused: `35.14 TPS`
+  - all modes produced one hash, and both exact modes matched baseline output.
+
+This is a real but tiny win: about `1.028x` baseline on the sustained code
+prompt, and only `+0.01 TPS` over the previous exact path in that 5-run sample.
+It does not reach the `1.05x` goal by itself.
+
+Falsified heavy-kernel candidates in the same pass:
+
+- Routed batch pair+SwiGLU: a device-barrier attempt stayed exact in the oracle
+  but failed batch2 lower-bound (`top_mismatch=8`, `final_mismatch=3`) and was
+  slower. A deeper register-sum Q4 rewrite failed the q4 oracle. Not kept.
+- Q8 exact row-pair `nsg=8`: exact but slower
+  (`batch2=44.756 ms` vs `42.284 ms`). Not kept.
+- F16 exact row-pair `nr0=4` for all pair2 rows: exact but slower
+  (`batch2=42.822 ms` vs `42.231 ms`). Not kept.
+- Existing shared-down + HC fusion:
+  exact but slower (`batch2=42.504 ms` vs `42.253 ms`). Kept disabled.
+- Existing shared gate/up fusion:
+  exact and reduced dispatches, but still slightly slower
+  (`batch2=42.200 ms` vs `42.144 ms`). Kept disabled.
+
+The practical heavy-kernel knob pass therefore leaves the branch with a small
+compressor dispatch reduction, but the remaining gap is still dominated by the
+large exact verifier layer pass. The next credible path to a larger exact gain
+would need a deeper rewrite of the heavy kernels themselves, especially Q8 row
+matvecs, raw/compressed attention, or routed MoE arithmetic. Small scheduling
+changes around the existing row kernels are now mostly falsified on Studio q4.

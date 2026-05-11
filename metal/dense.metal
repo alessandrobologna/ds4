@@ -740,6 +740,147 @@ kernel void kernel_mul_mv_f16_f32_4_pair2_rows(
     }
 }
 
+// Exact verifier batch2 paired F16 projections.  DS4 compressor paths compute
+// kv and score projections from the same two activation rows; this keeps the
+// row-pair reduction order used by kernel_mul_mv_f16_f32_4_pair2_rows for each
+// matrix while sharing one dispatch and activation stream.
+template<short NR0>
+void kernel_mul_mv_f16_f32_pair_4_pair2_rows_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF / 4;
+
+    if (args.ne11 != 2 || args.ne1 != 2 || args.nr0 != NR0) {
+        return;
+    }
+
+    const int nb = args.ne00 / NB;
+    const int r0 = tgpig.x * NR0;
+    const int im = tgpig.z;
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+    const uint64_t base1 = i12 * args.nb12 + i13 * args.nb13;
+
+    device const float  *y0  = (device const float  *)(src1 + base1);
+    device const float4 *y04 = (device const float4 *)(src1 + base1);
+    device const float  *y1  = (device const float  *)(src1 + args.nb11 + base1);
+    device const float4 *y14 = (device const float4 *)(src1 + args.nb11 + base1);
+
+    device const half  *ax_a[NR0];
+    device const half4 *ax4_a[NR0];
+    device const half  *ax_b[NR0];
+    device const half4 *ax4_b[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)(r0 + row) * args.nb01 +
+                                 (i12 / args.r2) * args.nb02 +
+                                 (i13 / args.r3) * args.nb03;
+        ax_a[row] = (device const half *)((device const char *)src0_a + offset0);
+        ax4_a[row] = (device const half4 *)((device const char *)src0_a + offset0);
+        ax_b[row] = (device const half *)((device const char *)src0_b + offset0);
+        ax4_b[row] = (device const half4 *)((device const char *)src0_b + offset0);
+    }
+
+    float sum_a0[NR0] = { 0.f };
+    float sum_a1[NR0] = { 0.f };
+    float sum_b0[NR0] = { 0.f };
+    float sum_b1[NR0] = { 0.f };
+    const short ix = tiisg / (NW / NF);
+    const short il = tiisg % (NW / NF);
+    const int ib0 = sgitg * NF + ix;
+    float4 yl04[NF4];
+    float4 yl14[NF4];
+    device const float4 *yb04 = y04 + (ib0 * NB + il * NF) / 4;
+    device const float4 *yb14 = y14 + (ib0 * NB + il * NF) / 4;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        FOR_UNROLL (short i = 0; i < NF4; ++i) {
+            yl04[i] = yb04[i];
+            yl14[i] = yb14[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const half4 *xb4_a = ax4_a[row] + (ib * NB + il * NF) / 4;
+            device const half4 *xb4_b = ax4_b[row] + (ib * NB + il * NF) / 4;
+            float sa0 = 0.f;
+            float sa1 = 0.f;
+            float sb0 = 0.f;
+            float sb1 = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                const float4 xa = float4(xb4_a[i]);
+                const float4 xb = float4(xb4_b[i]);
+                sa0 += dot(xa, yl04[i]);
+                sa1 += dot(xa, yl14[i]);
+                sb0 += dot(xb, yl04[i]);
+                sb1 += dot(xb, yl14[i]);
+            }
+            sum_a0[row] += sa0;
+            sum_a1[row] += sa1;
+            sum_b0[row] += sb0;
+            sum_b1[row] += sb1;
+        }
+
+        yb04 += NSG * NF * NW / 4;
+        yb14 += NSG * NF * NW / 4;
+    }
+
+    for (int i = nb * NB + sgitg * NW + tiisg; i < args.ne00; i += NW * NSG) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            const float ya0 = y0[i];
+            const float ya1 = y1[i];
+            sum_a0[row] += ax_a[row][i] * ya0;
+            sum_a1[row] += ax_a[row][i] * ya1;
+            sum_b0[row] += ax_b[row][i] * ya0;
+            sum_b1[row] += ax_b[row][i] * ya1;
+        }
+    }
+
+    device float *dst_a0 = (device float *)dst_a + (uint64_t)im * args.ne0 * args.ne1;
+    device float *dst_a1 = dst_a0 + args.ne0;
+    device float *dst_b0 = (device float *)dst_b + (uint64_t)im * args.ne0 * args.ne1;
+    device float *dst_b1 = dst_b0 + args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst_a0, sum_a0, r0, args.ne01, tiisg, sgitg, shmem);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    helper_mv_reduce_and_write<NR0>(dst_a1, sum_a1, r0, args.ne01, tiisg, sgitg, shmem);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    helper_mv_reduce_and_write<NR0>(dst_b0, sum_b0, r0, args.ne01, tiisg, sgitg, shmem);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    helper_mv_reduce_and_write<NR0>(dst_b1, sum_b1, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+[[host_name("kernel_mul_mv_f16_f32_pair_4_pair2_rows")]]
+kernel void kernel_mul_mv_f16_f32_pair_4_pair2_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    switch (args.nr0) {
+        case 2:
+            kernel_mul_mv_f16_f32_pair_4_pair2_rows_impl<2>(args, src0_a, src0_b, src1, dst_a, dst_b, shmem, tgpig, tiisg, sgitg);
+            break;
+        case 4:
+            kernel_mul_mv_f16_f32_pair_4_pair2_rows_impl<4>(args, src0_a, src0_b, src1, dst_a, dst_b, shmem, tgpig, tiisg, sgitg);
+            break;
+    }
+}
+
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling
 // scores.  This paired variant keeps the exact dense F16 row-reduction shape

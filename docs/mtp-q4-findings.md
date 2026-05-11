@@ -1942,3 +1942,46 @@ slice removes a repeated activation dispatch and fixes the previously drifting
 fused diagnostic; the remaining gap to `1.5x` still requires a larger verifier
 architecture change, such as branch-local tree rows with coherent compressed
 state or a much broader verifier-layer fusion.
+
+## 2026-05-11 Sustained-Code Tree Lower Bound
+
+The same sustained Python/code prompt was also rerun through the existing exact
+`4x2x2` depth-batched tree probe after the routed-MoE promotion:
+
+```sh
+DS4_MTP_TREE_DEPTH_BATCH_PROBE=4x2x2 \
+DS4_MTP_TREE_PROBE_STEPS=5 \
+DS4_MTP_NO_ADAPTIVE=1 \
+DS4_MTP_NO_TARGET_MARGIN_SKIP=1 \
+./ds4 ... --mtp ... --mtp-draft 2 --temp 0 --nothink -n 96
+```
+
+Artifact: `/tmp/ds4-radical-tree-code-lb.err`.
+
+The probe stayed exact for all five sampled positions:
+
+```text
+branches: 16
+mismatches: 0
+max_delta: 0
+branch verifier range: 768.132-805.891 ms
+normal serial replay range: 1309.477-1323.608 ms
+MTP tree build range: 23.392-24.091 ms
+```
+
+But the containment ceiling on this code sample was still too low for that cost:
+
+```text
+shape 4x2x2 avg_accept_len: 2.12, avg_nodes: 28.0
+shape 4x4x2 avg_accept_len: 2.21, avg_nodes: 52.0
+dynamic depth>=2:2_else4 avg_accept_len: 2.19, avg_nodes: 41.2
+full top8 avg_accept_len: 2.60, avg_nodes: 584.0
+```
+
+This falsifies the current depth-batched tree implementation as a near-term
+speed path for sustained code generation. It is exact and faster than fully
+serial branch replay, but it is still orders of magnitude above the cost needed
+to amortize roughly two accepted tokens. A tree route remains plausible only as
+a real row-parallel verifier-layer rewrite, with branch-local compressed
+attention/indexer state advanced coherently across siblings; the existing
+command-batched serial row fallback should not be wired into generation.

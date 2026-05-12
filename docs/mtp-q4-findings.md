@@ -3341,3 +3341,105 @@ remain on the conservative decode2 path if exactness is required, or be treated
 as approximate when using the fast verifier. Future q4 kernel changes should be
 accepted or rejected by q4 hash-identical production gates; Q2 should be rerun
 periodically as a divergence watch, not as the primary optimization target.
+
+## 2026-05-12 Imatrix Exactness Repair: Batch Attention Falsified
+
+The q4-imatrix sustained-code divergence was traced to the optimized exact
+batch-attention path, not to the MTP sidecar wiring or the row-pair matvec/MoE
+fusions.  A token-dump diagnostic was added:
+
+```text
+DS4_DUMP_GENERATED_TOKENS=/tmp/tokens.csv
+```
+
+It logs generated `step,token` pairs from the sampled/MTP CLI path and was used
+to locate the first q4-imatrix optimized-exact divergence:
+
+```text
+artifact: /tmp/ds4-q4i-token-div-20260512055039
+first differing emitted token: step 80
+decode2/baseline: 38272
+optimized exact: 23074
+visible drift: ```csv -> ```json import/code-fence branch
+```
+
+Broad and narrow verifier toggles showed:
+
+```text
+DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION=1: hash-identical
+DS4_MTP_DECODE2_EXACT=1: hash-identical
+DS4_METAL_DISABLE_EXACT_BATCH_RAW_ATTENTION=1: still diverged
+DS4_METAL_DISABLE_EXACT_BATCH_MIXED_ATTENTION=1: still diverged
+raw+mixed disabled together: hash-identical
+DS4_METAL_DISABLE_RAW_STORE_FUSION=1: still diverged
+```
+
+So the unsafe area is the batched raw/mixed FlashAttention-style verifier state,
+not raw-cache batch-store fusion.  The strict exact verifier now keeps
+speculative attention row-preserving by default.  The previous batched attention
+path is still available only as an explicit diagnostic:
+
+```text
+DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1
+DS4_METAL_DISABLE_EXACT_BATCH_RAW_ATTENTION=1
+DS4_METAL_DISABLE_EXACT_BATCH_MIXED_ATTENTION=1
+```
+
+Smoke test after the repair:
+
+```text
+artifact: /tmp/ds4-q4i-repaired-smoke-20260512061141
+decode2 sha: d83dd8bbe8a103b5d1b9730c8d119bd126c37fa19775c6d63798496bf9450f4f
+repaired default sha: d83dd8bbe8a103b5d1b9730c8d119bd126c37fa19775c6d63798496bf9450f4f
+unsafe batch-attention sha: e8f0a423a35a85a6064667281caad436c41f65c543cfa0427fd701601a53f0f1
+unsafe first_diff: 80:38272/23074
+```
+
+Five-run sustained-code benchmark, q4-imatrix:
+
+```text
+csv: /tmp/ds4-q4i-repaired-5run-20260512061232.csv
+baseline median: 34.81 TPS
+disabled median: 34.84 TPS, hash-identical
+exact median: 36.36 TPS, 1.045x baseline, hash-identical
+decode2 median: 33.36 TPS, 0.958x baseline, hash-identical
+```
+
+Five-run sustained-code benchmark, old q4:
+
+```text
+csv: /tmp/ds4-oldq4-repaired-5run-20260512061616.csv
+baseline median: 34.84 TPS
+disabled median: 34.87 TPS, hash-identical
+exact median: 37.93 TPS, 1.089x baseline, hash-identical
+decode2 median: 33.55 TPS, 0.963x baseline, hash-identical
+```
+
+Five-run sustained-code benchmark, Q2-imatrix:
+
+```text
+csv: /tmp/ds4-q2i-repaired-5run-20260512062200.csv
+baseline median: 36.12 TPS
+disabled median: 36.12 TPS, hash-identical
+exact median: 38.46 TPS, 1.065x baseline, hash-identical
+decode2 median: 34.85 TPS, 0.965x baseline, hash-identical
+```
+
+Oracle checks passed for q4-imatrix, old q4, and Q2-imatrix.  Batch2
+lower-bound diagnostics also had zero mismatches on q4-imatrix and old q4, but
+they now measure the repaired row-preserving path and are intentionally much
+slower than the unsafe batch-attention path:
+
+```text
+artifact: /tmp/ds4-repaired-lb-20260512062102
+q4-imatrix: failures=0 top_mismatch=0 final_mismatch=0 batch2=163.882 ms
+old q4: failures=0 top_mismatch=0 final_mismatch=0 batch2=167.880 ms
+```
+
+Conclusion: q4-imatrix exposed that the old optimized exact batch-attention
+state was not exact enough to commit.  Exact MTP is now robust across the tested
+old q4, q4-imatrix, and Q2-imatrix sustained-code gates, at the cost of giving
+up the unsafe batch-attention peak.  Future kernel work should treat
+`DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1` as an unsafe diagnostic/falsified
+path unless a new attention implementation proves row-preserving final-state
+equivalence, not just immediate top-1 equivalence.

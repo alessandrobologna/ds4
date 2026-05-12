@@ -492,6 +492,17 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     const bool mtp_stop_direct = getenv("DS4_MTP_ADAPTIVE_STOP_DIRECT") != NULL;
     int mtp_pending_token = -1;
     const double t_decode0 = cli_now_sec();
+    const char *token_dump_path = getenv("DS4_DUMP_GENERATED_TOKENS");
+    FILE *token_dump = NULL;
+    if (token_dump_path && token_dump_path[0]) {
+        token_dump = fopen(token_dump_path, "wb");
+        if (!token_dump) {
+            fprintf(stderr, "ds4: failed to open DS4_DUMP_GENERATED_TOKENS path: %s\n",
+                    token_dump_path);
+            ds4_session_free(session);
+            return 1;
+        }
+    }
     while (generated < max_tokens && !cli_interrupt_requested()) {
         bool token_already_emitted = false;
         int token;
@@ -520,6 +531,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 sizeof(err));
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
+                if (token_dump) fclose(token_dump);
                 ds4_session_free(session);
                 return 1;
             }
@@ -536,12 +548,14 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                                        sizeof(err));
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
+                if (token_dump) fclose(token_dump);
                 ds4_session_free(session);
                 return 1;
             }
         } else {
             if (ds4_session_eval_no_mtp_probe(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
+                if (token_dump) fclose(token_dump);
                 ds4_session_free(session);
                 return 1;
             }
@@ -561,12 +575,16 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             char *piece = ds4_token_text(engine, toks[j], &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
+            if (token_dump) {
+                fprintf(token_dump, "%d,%d\n", generated, toks[j]);
+            }
             free(piece);
             generated++;
             if (generated >= max_tokens) break;
         }
         if (stop) break;
     }
+    if (token_dump) fclose(token_dump);
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();

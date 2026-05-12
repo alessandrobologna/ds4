@@ -35,6 +35,8 @@ PROMPT="Explain Redis streams in one paragraph."
 CSV=""
 INCLUDE_RESIDENT=0
 INCLUDE_SESSION=0
+INCLUDE_DECODE2=0
+INCLUDE_SPEED=1
 
 usage() {
     cat <<EOF
@@ -53,6 +55,9 @@ Options:
                    Add a resident no-spec lane: MTP opened/mapped with draft=1.
   --include-session
                    Add a session no-spec lane: MTP opened/mapped, draft=N, no speculation.
+  --include-decode2
+                   Add the sequential-shape exact N=2 verifier lane.
+  --no-speed       Skip the approximate --mtp-speed lane.
   -h, --help        Show this help.
 EOF
 }
@@ -69,6 +74,8 @@ while [ "$#" -gt 0 ]; do
         --csv) CSV="$2"; shift 2 ;;
         --include-resident) INCLUDE_RESIDENT=1; shift ;;
         --include-session) INCLUDE_SESSION=1; shift ;;
+        --include-decode2) INCLUDE_DECODE2=1; shift ;;
+        --no-speed) INCLUDE_SPEED=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -119,6 +126,10 @@ run_mode() {
             cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
             ;;
         exact)
+            cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
+            ;;
+        decode2)
+            envcmd=(env DS4_MTP_DECODE2_EXACT=1)
             cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
             ;;
         speed)
@@ -197,7 +208,13 @@ fi
 if [ "$INCLUDE_SESSION" -ne 0 ]; then
     MODES+=(session)
 fi
-MODES+=(exact speed)
+MODES+=(exact)
+if [ "$INCLUDE_DECODE2" -ne 0 ]; then
+    MODES+=(decode2)
+fi
+if [ "$INCLUDE_SPEED" -ne 0 ]; then
+    MODES+=(speed)
+fi
 for run in $(seq 1 "$RUNS"); do
     offset=$(( (run - 1) % ${#MODES[@]} ))
     for i in "${!MODES[@]}"; do
@@ -217,7 +234,14 @@ if [ "$INCLUDE_SESSION" -ne 0 ]; then
     session_med="$(median_for_mode session)"
 fi
 exact_med="$(median_for_mode exact)"
-speed_med="$(median_for_mode speed)"
+decode2_med=""
+if [ "$INCLUDE_DECODE2" -ne 0 ]; then
+    decode2_med="$(median_for_mode decode2)"
+fi
+speed_med=""
+if [ "$INCLUDE_SPEED" -ne 0 ]; then
+    speed_med="$(median_for_mode speed)"
+fi
 baseline_hash="$(first_hash_for_mode baseline)"
 disabled_ratio="$(ratio_to_baseline "$disabled_med" "$base_med")"
 resident_ratio=""
@@ -229,7 +253,14 @@ if [ "$INCLUDE_SESSION" -ne 0 ]; then
     session_ratio="$(ratio_to_baseline "$session_med" "$base_med")"
 fi
 exact_ratio="$(ratio_to_baseline "$exact_med" "$base_med")"
-speed_ratio="$(ratio_to_baseline "$speed_med" "$base_med")"
+decode2_ratio=""
+if [ "$INCLUDE_DECODE2" -ne 0 ]; then
+    decode2_ratio="$(ratio_to_baseline "$decode2_med" "$base_med")"
+fi
+speed_ratio=""
+if [ "$INCLUDE_SPEED" -ne 0 ]; then
+    speed_ratio="$(ratio_to_baseline "$speed_med" "$base_med")"
+fi
 
 cat <<EOF
 csv=$CSV
@@ -252,6 +283,17 @@ $(if [ "$INCLUDE_SESSION" -ne 0 ]; then
 fi)
 exact_median_tps=$exact_med hashes=$(unique_hashes_for_mode exact)
 exact_vs_baseline=$exact_ratio hash_matches_baseline=$(hash_matches_baseline exact "$baseline_hash")
-speed_median_tps=$speed_med hashes=$(unique_hashes_for_mode speed)
-speed_vs_baseline=$speed_ratio
+$(if [ "$INCLUDE_DECODE2" -ne 0 ]; then
+    printf 'decode2_median_tps=%s hashes=%s\ndecode2_vs_baseline=%s hash_matches_baseline=%s\n' \
+        "$decode2_med" \
+        "$(unique_hashes_for_mode decode2)" \
+        "$decode2_ratio" \
+        "$(hash_matches_baseline decode2 "$baseline_hash")"
+fi)
+$(if [ "$INCLUDE_SPEED" -ne 0 ]; then
+    printf 'speed_median_tps=%s hashes=%s\nspeed_vs_baseline=%s\n' \
+        "$speed_med" \
+        "$(unique_hashes_for_mode speed)" \
+        "$speed_ratio"
+fi)
 EOF

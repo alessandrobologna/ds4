@@ -4100,3 +4100,84 @@ standard sustained-code one-off: drift, 37.12 TPS
 Decision: do not promote all-layer exact batch attention. The safe default
 remains late-only (`layer >= 29`) until the row/batch attention state mismatch
 is understood across prompts.
+
+## 2026-05-12 Batch-Attention Selector Follow-Up
+
+After the routed-MoE, dual q/kv, and attention-output pair2 rewrites failed to
+produce a material production win, the remaining high-ceiling exact path was to
+see whether the safe batch-attention layer subset could be widened without
+drift.
+
+A bounded q4-imatrix selector sweep tested two prompts at 128 generated tokens:
+
+```text
+artifact: /tmp/ds4-attn-layer-sweep-20260512142224/results.csv
+
+standard prompt:
+  29-42: exact, 38.12 TPS
+  28-42: exact, 38.12 TPS
+  27-42: exact, 38.07 TPS
+  26-42..23-42: drift
+  22-42..20-42: exact on this prompt
+
+long code prompt:
+  29-42: exact, 38.67 TPS
+  28-42: exact, 38.87 TPS
+  27-42: exact, 38.87 TPS
+  26-42..20-42: exact on this prompt
+  14,16,29-42: drift
+```
+
+The monotonic safe candidate `27-42` passed the q4-imatrix MTP oracle, but did
+not separate from the current default in a 5-run sustained-code benchmark:
+
+```text
+artifact: /tmp/ds4-attn-27-42-bench-20260512142611.csv
+baseline median: 34.70 TPS, hash-identical
+disabled median: 34.70 TPS, hash-identical
+exact default median: 38.94 TPS, hash-identical
+fast_attn 27-42 median: 38.95 TPS, hash-identical
+```
+
+The wider `20-42` selector had a measurable sustained-code lift and also passed
+the q4-imatrix MTP oracle:
+
+```text
+artifact: /tmp/ds4-attn-20-42-bench-20260512143004.csv
+baseline median: 34.65 TPS, hash-identical
+disabled median: 34.66 TPS, hash-identical
+exact default median: 38.80 TPS, hash-identical
+fast_attn 20-42 median: 39.15 TPS, hash-identical
+```
+
+However, a five-prompt suite caught an immediate output drift on the Redis
+explanation prompt:
+
+```text
+artifact: /tmp/ds4-attn-20-42-suite-20260512143453/results.csv
+case 1 Redis paragraph:
+  baseline: 36.18 TPS, bytes=614, sha=4fea96356997810d83529fe58b551d6b8216606d87bca07433a53dd7e78a2b23
+  exact20:  36.92 TPS, bytes=665, sha=9f012382d324c40edcd973507ab37edc9807f4badc92c2a42d0d8af11cf7bd79
+  match: 0
+cases 2-5: hash-identical
+```
+
+Decision: do not promote `20-42`. It is a useful proof that wider batched
+attention can buy a little speed, but the current implementation is still not a
+correctness-preserving committed-state replacement across prompts. `27-42` is
+safe in these checks but neutral versus the current default, so the default
+remains `29-42`.
+
+An attention-output low-projection row-pair grouped-MM prototype was also tested
+and reverted. It was exact, but made the lower-bound worse:
+
+```text
+default:
+  batch2=171.015 ms, output_proj=13.869 ms/step, dispatch=1887.9
+
+DS4_METAL_ENABLE_ATTN_OUT_LOW_MM_PAIR2=1:
+  batch2=176.933 ms, output_proj=19.514 ms/step, dispatch=1930.9
+```
+
+This closes the current attention-output fusion avenue. The retained direct
+low-output path is better than the grouped-ID replacement for exact N=2.

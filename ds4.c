@@ -11552,6 +11552,10 @@ static bool metal_graph_encode_layer_attention_batch(
      * unless accepted tokens are replayed exactly. */
     const bool spec_row_fallback =
         metal_graph_use_exact_verify_stage(g, "DS4_MTP_VERIFY_FAST_FRONTIER");
+    const bool exact_batch_attention =
+        g->spec_verify_mode && getenv("DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION") == NULL;
+    const bool spec_attention_row_fallback =
+        spec_row_fallback && !exact_batch_attention;
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     const bool layer_stage_profile = metal_graph_layer_stage_profile_enabled();
     const bool q_stage_profile = metal_graph_q_stage_profile_enabled();
@@ -11897,7 +11901,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           DS4_N_HEAD,
                                                           DS4_N_HEAD_DIM) != 0;
         if (ok) batch_attention_done = true;
-    } else if (ok && !spec_row_fallback && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
+    } else if (ok && !spec_attention_row_fallback && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
         /*
          * The ubatch path stores the whole batch in the SWA cache, then runs
          * one batched attention kernel with an absolute-position causal/window
@@ -12519,7 +12523,7 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         if (ratio == 4) DS4_METAL_PROFILE_ATTN_STAGE("indexer_setup");
 
-        if (ok && !spec_row_fallback && !zero_prefix && n_tokens <= g->raw_cap) {
+        if (ok && !spec_attention_row_fallback && !zero_prefix && n_tokens <= g->raw_cap) {
             const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, n_tokens);
             /* See the raw-only branch above: batched mixed attention also
              * consumes a logical raw window, linearized out of the ring. */

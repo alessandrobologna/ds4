@@ -2247,3 +2247,83 @@ path. The likely cause is register pressure or instruction-cache pressure from
 carrying both Q4 reductions in one kernel; avoiding gate/up materialization did
 not compensate. The prototype was reverted. This falsifies the most direct
 single-kernel routed gate/up rewrite for q4.
+
+## 2026-05-11 Exact Batch-Attention Promotion
+
+The broad exact batch-attention path was retried after the later verifier
+kernel promotions. The strict verifier now keeps exact row-preserving state
+updates, but allows the attention stage itself to use the existing raw/mixed
+batch attention kernels. This is the same high-upside family that previously
+showed a lower-bound win but hit a final-token mismatch. In the current branch,
+the mismatch did not reproduce across the q4 oracle and two focused
+lower-bound prompts.
+
+The promoted path is enabled by default for exact verifier batches. The escape
+hatch is:
+
+```sh
+DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION=1
+```
+
+Studio q4 validation:
+
+```text
+oracle: OK
+artifact: /tmp/ds4-batchattn-promoted-lb.err
+batch2-lb steps: 65
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 56.539 ms
+batch2: 39.997 ms
+layers: 38.732 ms
+layer_dispatch: 1878.0
+```
+
+The same-build escape-hatch control showed the actual A/B:
+
+```text
+artifact: /tmp/ds4-batchattn-disable-lb.err
+batch2-lb steps: 65
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 56.605 ms
+batch2: 42.310 ms
+layers: 41.030 ms
+layer_dispatch: 1921.4
+```
+
+A speculative-decoding explanation prompt, chosen because the old prototype
+had failed in this area, also stayed exact over 100 lower-bound samples:
+
+```text
+artifact: /tmp/ds4-batchattn-specdecode-lb.err
+batch2-lb steps: 100
+failures: 0
+top_mismatch: 0
+final_mismatch: 0
+seq2: 56.736 ms
+batch2: 39.625 ms
+layers: 38.360 ms
+layer_dispatch: 1851.1
+```
+
+The no-env sustained Python/code production gate is the strongest exact result
+so far for the current q4 branch:
+
+```text
+artifact: /tmp/ds4-batchattn-promoted-prod-20260511-211012.csv
+baseline median: 34.71 TPS, hashes=1
+disabled/no-open median: 34.71 TPS, hashes=1, hash_matches_baseline=1
+exact median: 37.93 TPS, hashes=1, hash_matches_baseline=1
+exact_vs_baseline: 1.093
+speed median: 38.70 TPS
+speed_vs_baseline: 1.115
+```
+
+This promotes exact batch attention as a real default verifier improvement. It
+does not change the larger conclusion about `1.5x`: exact N=2 is now clearly
+above baseline on sustained code generation, but the remaining gap to a 50%
+gain still needs a bigger verifier architecture change or much deeper layer
+fusion.

@@ -4012,3 +4012,91 @@ a safe small dispatch/view reduction. Do not promote it by default yet; the
 production gain over current exact MTP is only about 0.03 TPS on this run, which
 is too small to separate from noise. The larger routed-MoE experiments did not
 survive the exactness/performance gate.
+
+## 2026-05-12 Long-Code Exactness Repair
+
+A longer sustained-code prompt exposed a remaining exactness hole in the
+optimized verifier on q4-imatrix. Baseline and conservative decode2 agreed, but
+the promoted optimized exact path drifted:
+
+```text
+prompt: typed async job scheduler, code only, at least 250 lines
+baseline: 34.65 TPS, bytes=1338, sha=0d58b72d342fd757ec6ea31d41c2d1efd5674e77f7d6580f6f5892cecb296927
+exact: 36.97 TPS, bytes=1399, sha=03e65831073b606d9d1d7f908e62cee546154c9827656b32b7ebab8d7699679f
+decode2: 33.79 TPS, bytes=1338, baseline hash
+DS4_MTP_NO_EXACT_TARGET_FIRST_PAIR=1: same drift hash as exact
+```
+
+The fault was not target-first pair scheduling and not the row-pair matvec
+kernels. Safety switches isolated it to exact batch attention:
+
+```text
+DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION=1: baseline hash, 35.94 TPS
+DS4_MTP_VERIFY_HOST_ROW_FALLBACK=1: baseline hash, 34.48 TPS
+DS4_MTP_EXACT_REPLAY=1: baseline hash, 31.15 TPS
+DS4_METAL_DISABLE_EXACT_ROWS_PAIR2=1: drift hash
+DS4_MTP_NO_CAPTURE_PREFIX1=1: drift hash
+```
+
+Layer bisect showed the previous default subset was too broad:
+
+```text
+none: baseline hash, 35.87 TPS
+14,16-21: drift
+22-28: drift
+29-35: baseline hash
+36-42: baseline hash
+29-42: baseline hash, 36.04 TPS
+14,16-35: drift
+```
+
+The strict default now uses late-only exact batch attention (`layer >= 29`).
+Broader layer coverage remains available through
+`DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1` and explicit layer selectors for
+diagnostics.
+
+Repair checks:
+
+```text
+DS4_TEST_MODEL=q4-imatrix DS4_TEST_MTP=current-MTP ./ds4_test --mtp-oracle: OK
+
+one-off controls after repair:
+baseline: 34.29 TPS, baseline hash
+exact: 36.15 TPS, baseline hash
+decode2: 33.63 TPS, baseline hash
+standard sustained-code default exact smoke: 36.66 TPS, baseline hash
+```
+
+Five-run repaired sustained-code benchmark:
+
+```text
+csv: /tmp/ds4-repaired-dualqkv-longcode-5run-20260512134317.csv
+baseline median: 34.22 TPS, hash-identical
+exact median: 36.07 TPS, hash-identical, 1.054x baseline
+```
+
+A default-off q_a+kv dual Q8 row-pair kernel was also tested. It removed one
+dispatch per layer in diagnostics (`1840.8 -> 1797.8`) and passed the oracle,
+but it did not improve production after the exactness repair:
+
+```text
+lower-bound: 200.111ms -> 199.629ms, exact
+production repaired long-code median: exact 36.07 TPS, dual_qkv 36.06 TPS
+```
+
+Decision: reject and revert the dual q_a+kv kernel. Keep only the stricter
+late-only exact batch-attention default.
+
+Follow-up all-layer batch-attention check:
+
+```text
+DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1 ./ds4_test --mtp-oracle: OK
+long-code one-off: baseline hash, 37.45 TPS
+standard sustained-code one-off: drift, 37.12 TPS
+  baseline sha=b3e9e038b47094f14be675f595e152d4130b423c508f87371791bc5ff02a4eaf
+  broad sha=11f4524c1623821d731c2095355b6d2c805442903fb66f4b32217b47a291b47e
+```
+
+Decision: do not promote all-layer exact batch attention. The safe default
+remains late-only (`layer >= 29`) until the row/batch attention state mismatch
+is understood across prompts.

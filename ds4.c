@@ -11559,7 +11559,13 @@ static bool metal_graph_exact_batch_attention_layer_enabled(uint32_t il, bool di
 
     if (diagnostic_all_layers) return true;
 
-    return il == 14u || il >= 16u;
+    /*
+     * The early/mid exact batch-attention rows can preserve local verifier
+     * tops while still drifting later q4-imatrix sustained-code generation.
+     * Keep the default subset late-only; DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION
+     * plus layer selectors remains available for diagnostics.
+     */
+    return il >= 29u;
 }
 
 static void metal_graph_stage_summary_reset(void) {

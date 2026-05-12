@@ -12331,24 +12331,19 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
                 ds4_metal_tensor_free(comp_view);
             } else {
-                for (uint32_t t = 0; ok && t < n_tokens; t++) {
-                    const uint32_t pos = pos0 + t;
-                    const bool emit = ((pos + 1u) % ratio) == 0u;
-                    if (emit && g->layer_n_comp[il] >= g->comp_cap) {
-                        fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
-                        ok = false;
-                        break;
-                    }
-                    ds4_metal_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
-                    ds4_metal_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
-                    const uint32_t comp_row = g->layer_n_comp[il];
-                    ok = kv_view && sc_view;
-                    bool used_store_capture = false;
-                    if (ok && t == 0 && g->spec_capture_prefix1 && !emit &&
-                        getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_CAPTURE") == NULL) {
-                        ok = ds4_metal_compressor_store_one_capture_tensor(
-                                kv_view,
-                                sc_view,
+                bool used_pair_store_capture = false;
+                if (ok &&
+                    g->spec_verify_mode &&
+                    n_tokens == 2 &&
+                    g->spec_capture_prefix1 &&
+                    getenv("DS4_METAL_ENABLE_COMPRESSOR_UPDATE_PAIR2") != NULL &&
+                    getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_CAPTURE") == NULL) {
+                    const bool emit0 = ((pos0 + 1u) % ratio) == 0u;
+                    const bool emit1 = ((pos0 + 2u) % ratio) == 0u;
+                    if (!emit0 && !emit1) {
+                        ok = ds4_metal_compressor_store_pair_capture_tensor(
+                                g->batch_comp_kv,
+                                g->batch_comp_sc,
                                 g->layer_attn_state_kv[il],
                                 g->layer_attn_state_score[il],
                                 g->spec_prefix1_attn_state_kv[il],
@@ -12359,64 +12354,104 @@ static bool metal_graph_encode_layer_attention_batch(
                                 layer->attn_compressor_ape->type,
                                 comp_width,
                                 ratio,
-                                pos) != 0;
+                                pos0) != 0;
                         if (ok) {
                             g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
-                            used_store_capture = true;
+                            if (comp_counts) {
+                                comp_counts[0] = g->layer_n_comp[il];
+                                comp_counts[1] = g->layer_n_comp[il];
+                            }
+                            used_pair_store_capture = true;
                         }
                     }
-                    if (ok && !used_store_capture) {
-                        ok = ds4_metal_compressor_update_tensor(kv_view,
-                                                                sc_view,
-                                                                g->layer_attn_state_kv[il],
-                                                                g->layer_attn_state_score[il],
-                                                                g->layer_attn_comp_cache[il],
-                                                                model->map,
-                                                                model->size,
-                                                                layer->attn_compressor_ape->abs_offset,
-                                                                layer->attn_compressor_ape->type,
-                                                                layer->attn_compressor_norm->abs_offset,
-                                                                layer->attn_compressor_norm->type,
-                                                                DS4_N_HEAD_DIM,
-                                                                ratio,
-                                                                pos,
-                                                                comp_row,
-                                                                DS4_N_ROT,
-                                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                                freq_base,
-                                                                freq_scale,
-                                                                ext_factor,
-                                                                attn_factor,
-                                                                DS4_ROPE_YARN_BETA_FAST,
-                                                                DS4_ROPE_YARN_BETA_SLOW,
-                                                                DS4_RMS_EPS) != 0;
-                    }
-                    if (ok && emit) {
-                        ds4_metal_tensor *comp_row_view = ds4_metal_tensor_view(
-                                g->layer_attn_comp_cache[il],
-                                (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
-                                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-                        ok = comp_row_view &&
-                             ds4_metal_dsv4_fp8_kv_quantize_tensor(comp_row_view,
-                                                                   1,
-                                                                   DS4_N_HEAD_DIM,
-                                                                   DS4_N_ROT) != 0;
-                        if (ok) {
-                            metal_graph_debug_dump_tensor("KVcompress",
-                                                          comp_row_view,
-                                                          DS4_N_HEAD_DIM,
-                                                          il,
-                                                          pos);
-                        }
-                        ds4_metal_tensor_free(comp_row_view);
-                    }
-                    if (ok && emit) g->layer_n_comp[il]++;
-                    if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
-                    if (ok && t == 0 && !used_store_capture) ok = metal_graph_capture_prefix1_attn_state(g, il);
-                    ds4_metal_tensor_free(sc_view);
-                    ds4_metal_tensor_free(kv_view);
                 }
-            }
+                if (!used_pair_store_capture) {
+                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                        const uint32_t pos = pos0 + t;
+                        const bool emit = ((pos + 1u) % ratio) == 0u;
+                        if (emit && g->layer_n_comp[il] >= g->comp_cap) {
+                            fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+                            ok = false;
+                            break;
+                        }
+                        ds4_metal_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
+                        ds4_metal_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
+                        const uint32_t comp_row = g->layer_n_comp[il];
+                        ok = kv_view && sc_view;
+                        bool used_store_capture = false;
+                        if (ok && t == 0 && g->spec_capture_prefix1 && !emit &&
+                            getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_CAPTURE") == NULL) {
+                            ok = ds4_metal_compressor_store_one_capture_tensor(
+                                    kv_view,
+                                    sc_view,
+                                    g->layer_attn_state_kv[il],
+                                    g->layer_attn_state_score[il],
+                                    g->spec_prefix1_attn_state_kv[il],
+                                    g->spec_prefix1_attn_state_score[il],
+                                    model->map,
+                                    model->size,
+                                    layer->attn_compressor_ape->abs_offset,
+                                    layer->attn_compressor_ape->type,
+                                    comp_width,
+                                    ratio,
+                                    pos) != 0;
+                            if (ok) {
+                                g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
+                                used_store_capture = true;
+                            }
+                        }
+                        if (ok && !used_store_capture) {
+                            ok = ds4_metal_compressor_update_tensor(kv_view,
+                                                                    sc_view,
+                                                                    g->layer_attn_state_kv[il],
+                                                                    g->layer_attn_state_score[il],
+                                                                    g->layer_attn_comp_cache[il],
+                                                                    model->map,
+                                                                    model->size,
+                                                                    layer->attn_compressor_ape->abs_offset,
+                                                                    layer->attn_compressor_ape->type,
+                                                                    layer->attn_compressor_norm->abs_offset,
+                                                                    layer->attn_compressor_norm->type,
+                                                                    DS4_N_HEAD_DIM,
+                                                                    ratio,
+                                                                    pos,
+                                                                    comp_row,
+                                                                    DS4_N_ROT,
+                                                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                                    freq_base,
+                                                                    freq_scale,
+                                                                    ext_factor,
+                                                                    attn_factor,
+                                                                    DS4_ROPE_YARN_BETA_FAST,
+                                                                    DS4_ROPE_YARN_BETA_SLOW,
+                                                                    DS4_RMS_EPS) != 0;
+                        }
+                        if (ok && emit) {
+                            ds4_metal_tensor *comp_row_view = ds4_metal_tensor_view(
+                                    g->layer_attn_comp_cache[il],
+                                    (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
+                                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                            ok = comp_row_view &&
+                                 ds4_metal_dsv4_fp8_kv_quantize_tensor(comp_row_view,
+                                                                       1,
+                                                                       DS4_N_HEAD_DIM,
+                                                                       DS4_N_ROT) != 0;
+                            if (ok) {
+                                metal_graph_debug_dump_tensor("KVcompress",
+                                                              comp_row_view,
+                                                              DS4_N_HEAD_DIM,
+                                                              il,
+                                                              pos);
+                            }
+                            ds4_metal_tensor_free(comp_row_view);
+                        }
+                        if (ok && emit) g->layer_n_comp[il]++;
+                        if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
+                        if (ok && t == 0 && !used_store_capture) ok = metal_graph_capture_prefix1_attn_state(g, il);
+                        ds4_metal_tensor_free(sc_view);
+                        ds4_metal_tensor_free(kv_view);
+                    }
+                }
             n_comp = g->layer_n_comp[il];
         }
         DS4_METAL_PROFILE_ATTN_STAGE("compressor");
@@ -12630,24 +12665,19 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                     ds4_metal_tensor_free(index_view);
                 } else {
-                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
-                        const uint32_t pos = pos0 + t;
-                        const bool emit = ((pos + 1u) % ratio) == 0u;
-                        if (emit && g->layer_n_index_comp[il] >= g->comp_cap) {
-                            fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
-                            ok = false;
-                            break;
-                        }
-                        ds4_metal_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
-                        ds4_metal_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
-                        const uint32_t index_row = g->layer_n_index_comp[il];
-                        ok = kv_view && sc_view;
-                        bool used_store_capture = false;
-                        if (ok && t == 0 && g->spec_capture_prefix1 && !emit &&
-                            getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_CAPTURE") == NULL) {
-                            ok = ds4_metal_compressor_store_one_capture_tensor(
-                                    kv_view,
-                                    sc_view,
+                    bool used_pair_store_capture = false;
+                    if (ok &&
+                        g->spec_verify_mode &&
+                        n_tokens == 2 &&
+                        g->spec_capture_prefix1 &&
+                        getenv("DS4_METAL_ENABLE_COMPRESSOR_UPDATE_PAIR2") != NULL &&
+                        getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_CAPTURE") == NULL) {
+                        const bool emit0 = ((pos0 + 1u) % ratio) == 0u;
+                        const bool emit1 = ((pos0 + 2u) % ratio) == 0u;
+                        if (!emit0 && !emit1) {
+                            ok = ds4_metal_compressor_store_pair_capture_tensor(
+                                    g->batch_comp_kv,
+                                    g->batch_comp_sc,
                                     g->layer_index_state_kv[il],
                                     g->layer_index_state_score[il],
                                     g->spec_prefix1_index_state_kv[il],
@@ -12658,46 +12688,88 @@ static bool metal_graph_encode_layer_attention_batch(
                                     layer->indexer_compressor_ape->type,
                                     index_width,
                                     ratio,
-                                    pos) != 0;
+                                    pos0) != 0;
                             if (ok) {
                                 g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
-                                used_store_capture = true;
+                                if (index_counts) {
+                                    index_counts[0] = g->layer_n_index_comp[il];
+                                    index_counts[1] = g->layer_n_index_comp[il];
+                                }
+                                used_pair_store_capture = true;
                             }
                         }
-                        if (ok && !used_store_capture) {
-                            ok = ds4_metal_compressor_update_tensor(kv_view,
-                                                                    sc_view,
-                                                                    g->layer_index_state_kv[il],
-                                                                    g->layer_index_state_score[il],
-                                                                    g->layer_index_comp_cache[il],
-                                                                    model->map,
-                                                                    model->size,
-                                                                    layer->indexer_compressor_ape->abs_offset,
-                                                                    layer->indexer_compressor_ape->type,
-                                                                    layer->indexer_compressor_norm->abs_offset,
-                                                                    layer->indexer_compressor_norm->type,
-                                                                    DS4_N_INDEXER_HEAD_DIM,
-                                                                    ratio,
-                                                                    pos,
-                                                                    index_row,
-                                                                    DS4_N_ROT,
-                                                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                                    freq_base,
-                                                                    freq_scale,
-                                                                    ext_factor,
-                                                                    attn_factor,
-                                                                    DS4_ROPE_YARN_BETA_FAST,
-                                                                    DS4_ROPE_YARN_BETA_SLOW,
-                                                                    DS4_RMS_EPS) != 0;
+                    }
+                    if (!used_pair_store_capture) {
+                        for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                            const uint32_t pos = pos0 + t;
+                            const bool emit = ((pos + 1u) % ratio) == 0u;
+                            if (emit && g->layer_n_index_comp[il] >= g->comp_cap) {
+                                fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
+                                ok = false;
+                                break;
+                            }
+                            ds4_metal_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
+                            ds4_metal_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
+                            const uint32_t index_row = g->layer_n_index_comp[il];
+                            ok = kv_view && sc_view;
+                            bool used_store_capture = false;
+                            if (ok && t == 0 && g->spec_capture_prefix1 && !emit &&
+                                getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_CAPTURE") == NULL) {
+                                ok = ds4_metal_compressor_store_one_capture_tensor(
+                                        kv_view,
+                                        sc_view,
+                                        g->layer_index_state_kv[il],
+                                        g->layer_index_state_score[il],
+                                        g->spec_prefix1_index_state_kv[il],
+                                        g->spec_prefix1_index_state_score[il],
+                                        model->map,
+                                        model->size,
+                                        layer->indexer_compressor_ape->abs_offset,
+                                        layer->indexer_compressor_ape->type,
+                                        index_width,
+                                        ratio,
+                                        pos) != 0;
+                                if (ok) {
+                                    g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
+                                    used_store_capture = true;
+                                }
+                            }
+                            if (ok && !used_store_capture) {
+                                ok = ds4_metal_compressor_update_tensor(kv_view,
+                                                                        sc_view,
+                                                                        g->layer_index_state_kv[il],
+                                                                        g->layer_index_state_score[il],
+                                                                        g->layer_index_comp_cache[il],
+                                                                        model->map,
+                                                                        model->size,
+                                                                        layer->indexer_compressor_ape->abs_offset,
+                                                                        layer->indexer_compressor_ape->type,
+                                                                        layer->indexer_compressor_norm->abs_offset,
+                                                                        layer->indexer_compressor_norm->type,
+                                                                        DS4_N_INDEXER_HEAD_DIM,
+                                                                        ratio,
+                                                                        pos,
+                                                                        index_row,
+                                                                        DS4_N_ROT,
+                                                                        compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                                        freq_base,
+                                                                        freq_scale,
+                                                                        ext_factor,
+                                                                        attn_factor,
+                                                                        DS4_ROPE_YARN_BETA_FAST,
+                                                                        DS4_ROPE_YARN_BETA_SLOW,
+                                                                        DS4_RMS_EPS) != 0;
+                            }
+                            if (ok && emit) g->layer_n_index_comp[il]++;
+                            if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
+                            if (ok && t == 0 && !used_store_capture) ok = metal_graph_capture_prefix1_index_state(g, il);
+                            ds4_metal_tensor_free(sc_view);
+                            ds4_metal_tensor_free(kv_view);
                         }
-                        if (ok && emit) g->layer_n_index_comp[il]++;
-                        if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
-                        if (ok && t == 0 && !used_store_capture) ok = metal_graph_capture_prefix1_index_state(g, il);
-                        ds4_metal_tensor_free(sc_view);
-                        ds4_metal_tensor_free(kv_view);
                     }
                 }
             }
+        }
         }
         if (ratio == 4) DS4_METAL_PROFILE_ATTN_STAGE("indexer_setup");
 

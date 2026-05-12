@@ -438,6 +438,21 @@ int ds4_metal_compressor_store_one_capture_tensor(
         uint32_t                ratio,
         uint32_t                pos);
 
+int ds4_metal_compressor_store_pair_capture_tensor(
+        const ds4_metal_tensor *kv_cur,
+        const ds4_metal_tensor *sc_cur,
+        ds4_metal_tensor       *state_kv,
+        ds4_metal_tensor       *state_score,
+        ds4_metal_tensor       *prefix_kv,
+        ds4_metal_tensor       *prefix_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                width,
+        uint32_t                ratio,
+        uint32_t                pos0);
+
 int ds4_metal_compressor_store_batch_tensor(
         const ds4_metal_tensor *kv,
         const ds4_metal_tensor *sc,

@@ -40,6 +40,7 @@ INCLUDE_TARGET_PAIR=0
 INCLUDE_NO_TARGET_PAIR=0
 INCLUDE_FAST_ATTN=0
 INCLUDE_NO_FAST_ATTN=0
+INCLUDE_COMPRESSOR_PAIR2=0
 FAST_ATTN_LAYERS="${DS4_MTP_FAST_ATTN_LAYERS:-14,16-42}"
 INCLUDE_SPEED=1
 
@@ -71,6 +72,8 @@ Options:
                    Layer list defaults to $FAST_ATTN_LAYERS; override with DS4_MTP_FAST_ATTN_LAYERS.
   --include-no-fast-attn
                    Add exact verifier with fast batch attention disabled.
+  --include-compressor-pair2
+                   Add exact verifier with diagnostic compressor pair store/capture.
   --no-speed       Skip the approximate --mtp-speed lane.
   -h, --help        Show this help.
 EOF
@@ -93,6 +96,7 @@ while [ "$#" -gt 0 ]; do
         --include-no-target-pair) INCLUDE_NO_TARGET_PAIR=1; shift ;;
         --include-fast-attn) INCLUDE_FAST_ATTN=1; shift ;;
         --include-no-fast-attn) INCLUDE_NO_FAST_ATTN=1; shift ;;
+        --include-compressor-pair2) INCLUDE_COMPRESSOR_PAIR2=1; shift ;;
         --no-speed) INCLUDE_SPEED=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -164,6 +168,10 @@ run_mode() {
             ;;
         no_fast_attn)
             envcmd=(env DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION=1)
+            cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
+            ;;
+        compressor_pair2)
+            envcmd=(env DS4_METAL_ENABLE_COMPRESSOR_UPDATE_PAIR2=1)
             cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
             ;;
         speed)
@@ -258,6 +266,9 @@ fi
 if [ "$INCLUDE_NO_FAST_ATTN" -ne 0 ]; then
     MODES+=(no_fast_attn)
 fi
+if [ "$INCLUDE_COMPRESSOR_PAIR2" -ne 0 ]; then
+    MODES+=(compressor_pair2)
+fi
 if [ "$INCLUDE_SPEED" -ne 0 ]; then
     MODES+=(speed)
 fi
@@ -300,6 +311,10 @@ no_fast_attn_med=""
 if [ "$INCLUDE_NO_FAST_ATTN" -ne 0 ]; then
     no_fast_attn_med="$(median_for_mode no_fast_attn)"
 fi
+compressor_pair2_med=""
+if [ "$INCLUDE_COMPRESSOR_PAIR2" -ne 0 ]; then
+    compressor_pair2_med="$(median_for_mode compressor_pair2)"
+fi
 speed_med=""
 if [ "$INCLUDE_SPEED" -ne 0 ]; then
     speed_med="$(median_for_mode speed)"
@@ -334,6 +349,10 @@ fi
 no_fast_attn_ratio=""
 if [ "$INCLUDE_NO_FAST_ATTN" -ne 0 ]; then
     no_fast_attn_ratio="$(ratio_to_baseline "$no_fast_attn_med" "$base_med")"
+fi
+compressor_pair2_ratio=""
+if [ "$INCLUDE_COMPRESSOR_PAIR2" -ne 0 ]; then
+    compressor_pair2_ratio="$(ratio_to_baseline "$compressor_pair2_med" "$base_med")"
 fi
 speed_ratio=""
 if [ "$INCLUDE_SPEED" -ne 0 ]; then
@@ -396,6 +415,13 @@ $(if [ "$INCLUDE_NO_FAST_ATTN" -ne 0 ]; then
         "$(unique_hashes_for_mode no_fast_attn)" \
         "$no_fast_attn_ratio" \
         "$(hash_matches_baseline no_fast_attn "$baseline_hash")"
+fi)
+$(if [ "$INCLUDE_COMPRESSOR_PAIR2" -ne 0 ]; then
+    printf 'compressor_pair2_median_tps=%s hashes=%s\ncompressor_pair2_vs_baseline=%s hash_matches_baseline=%s\n' \
+        "$compressor_pair2_med" \
+        "$(unique_hashes_for_mode compressor_pair2)" \
+        "$compressor_pair2_ratio" \
+        "$(hash_matches_baseline compressor_pair2 "$baseline_hash")"
 fi)
 $(if [ "$INCLUDE_SPEED" -ne 0 ]; then
     printf 'speed_median_tps=%s hashes=%s\nspeed_vs_baseline=%s\n' \

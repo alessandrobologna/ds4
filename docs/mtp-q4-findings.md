@@ -3899,3 +3899,116 @@ chooses the same greedy tokens, but its committed verifier state is not exact.
 Disabling prefix capture did not repair drift, so the unsafe state is not only
 the partial-accept path. A real repair would need exact committed hidden/KV
 state from the fast attention rows, not just a different partial-accept policy.
+
+## 2026-05-12 deeper kernel rewrite pass
+
+This pass started from the promoted q4-imatrix exact verifier and looked only at
+default-off exact pair2 kernel rewrites. The profiling backbone was:
+
+```text
+DS4_MTP_BATCH2_LB=1
+DS4_MTP_BATCH2_LB_STAGE_SUMMARY=1
+DS4_METAL_LAYER_STAGE_PROFILE=1
+DS4_METAL_MOE_STAGE_PROFILE=1
+DS4_METAL_ATTN_OUT_STAGE_PROFILE=1
+DS4_MTP_ROUTE_OVERLAP_PROFILE=1
+
+profile: /tmp/ds4-deeper-kernel-profile-20260512105439.err
+```
+
+The stage-profiled run was intentionally instrumentation-heavy, so the absolute
+times are not production numbers. It still ranked the exact batch2 verifier
+costs clearly:
+
+```text
+steps=18
+seq2=55.622ms
+batch2=194.263ms
+layers=192.966ms
+layer_dispatch=1875.9/step
+
+routed_moe=33.626ms/step
+attn/output_proj=23.618ms/step
+attention=13.624ms/step
+q_path=13.370ms/step
+compressor=11.351ms/step
+shared_gate_up=10.822ms/step
+router=10.795ms/step
+
+attn low_proj=0.256ms/step
+attn out_proj=0.264ms/step
+```
+
+Routed-MoE overlap was meaningful enough to test, but not enough to keep the
+first shared-route down kernel:
+
+```text
+route overlap samples=946
+same_avg=0.803
+intersect_avg=2.527
+same_slot_hist: 0=457, 1=300, 2=130, 3=39, 4=17, 5=3
+intersect_hist: 0=90, 1=131, 2=219, 3=263, 4=188, 5=49, 6=6
+
+default lower-bound:
+  steps=40 failures=0
+  seq2=55.944ms batch2=39.659ms layers=38.374ms dispatch=1837.9
+
+DS4_METAL_ENABLE_ROUTED_MOE_OVERLAP_PAIR2=1:
+  oracle OK
+  seq2=56.040ms batch2=42.478ms layers=41.210ms dispatch=1837.9
+  rejected: exact but slower and no dispatch reduction
+```
+
+A direct Q4 pair+SwiGLU gate/up rewrite was also rejected. It passed the short
+oracle but failed the stricter lower-bound equivalence check:
+
+```text
+DS4_METAL_ENABLE_ROUTED_MOE_Q4_DIRECT_PAIR_SWIGLU=1:
+  lower-bound failures=0 top_mismatch=11 final_mismatch=13
+  batch2=40.833ms layers=39.557ms dispatch=1850.1
+  rejected: not exact under the batch2 verifier oracle
+```
+
+The only retained experiment is a default-off compressor store/capture pair
+helper:
+
+```text
+DS4_METAL_ENABLE_COMPRESSOR_UPDATE_PAIR2=1
+```
+
+It fuses the common exact verifier N=2 case where neither speculative row emits
+a compressed row. The kernel stores row 0 into the prefix capture and live
+state, then stores row 1 into the live state, preserving the existing non-emitting
+frontier semantics. It applies to both attention compressor and indexer
+compressor state, and falls back to the previous per-token path for emitting
+positions.
+
+Lower-bound A/B:
+
+```text
+default:
+  steps=40 failures=0 top_mismatch=0 final_mismatch=0
+  seq2=56.025ms batch2=39.667ms layers=38.394ms
+  dispatch=1840.8 views=711.9
+
+DS4_METAL_ENABLE_COMPRESSOR_UPDATE_PAIR2=1:
+  steps=40 failures=0 top_mismatch=0 final_mismatch=0
+  seq2=56.163ms batch2=39.563ms layers=38.290ms
+  dispatch=1798.7 views=543.7
+```
+
+Production sustained-code benchmark:
+
+```text
+csv: /tmp/ds4-compressor-pair2-bench-20260512111245.csv
+baseline median: 34.77 TPS, hash d83dd8bbe8a103b5d1b9730c8d119bd126c37fa19775c6d63798496bf9450f4f
+disabled median: 34.71 TPS, hash-identical
+exact median: 37.20 TPS, hash-identical
+compressor_pair2 median: 37.23 TPS, hash-identical
+```
+
+Decision: keep the compressor pair2 path as default-off instrumentation and as
+a safe small dispatch/view reduction. Do not promote it by default yet; the
+production gain over current exact MTP is only about 0.03 TPS on this run, which
+is too small to separate from noise. The larger routed-MoE experiments did not
+survive the exactness/performance gate.

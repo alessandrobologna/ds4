@@ -53,6 +53,14 @@ struct ds4_metal_args_dsv4_compressor_store_one_capture {
     uint32_t ape_type;
 };
 
+struct ds4_metal_args_dsv4_compressor_store_pair_capture {
+    uint32_t width;
+    uint32_t state_rows;
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t ape_type;
+};
+
 static inline float dsv4_e4m3fn_value(int i) {
     const int exp  = (i >> 3) & 0x0f;
     const int mant = i & 0x07;
@@ -304,4 +312,66 @@ kernel void kernel_dsv4_compressor_store_one_capture(
         prefix_kv[gid] = state_kv[gid];
         prefix_score[gid] = state_score[gid];
     }
+}
+
+// Exact verifier N=2 helper for the common non-emitting pair.  It captures the
+// prefix frontier after token 0, then stores token 1 into the live state in the
+// same ordered compute pass.
+kernel void kernel_dsv4_compressor_store_pair_capture(
+        constant ds4_metal_args_dsv4_compressor_store_pair_capture & args,
+        device const float * kv,
+        device const float * score,
+        device const char  * ape,
+        device       float * state_kv,
+        device       float * state_score,
+        device       float * prefix_kv,
+        device       float * prefix_score,
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.width * args.state_rows;
+    if (gid >= total || args.width == 0 || args.state_rows == 0 || args.ratio == 0) {
+        return;
+    }
+
+    const uint row = gid / args.width;
+    const uint col = gid - row * args.width;
+    const uint pos0_mod = args.pos0 % args.ratio;
+    const uint pos1_mod = (args.pos0 + 1u) % args.ratio;
+    const uint dst0_row = args.ratio == 4u ? args.ratio + pos0_mod : pos0_mod;
+    const uint dst1_row = args.ratio == 4u ? args.ratio + pos1_mod : pos1_mod;
+
+    float prefix_kv_v = state_kv[gid];
+    float prefix_score_v = state_score[gid];
+    float state_kv_v = prefix_kv_v;
+    float state_score_v = prefix_score_v;
+
+    if (row == dst0_row) {
+        const uint ape_i = pos0_mod * args.width + col;
+        float ape_v;
+        if (args.ape_type == 1u) {
+            ape_v = (float)(((device const half *)ape)[ape_i]);
+        } else {
+            ape_v = ((device const float *)ape)[ape_i];
+        }
+        prefix_kv_v = kv[col];
+        prefix_score_v = score[col] + ape_v;
+        state_kv_v = prefix_kv_v;
+        state_score_v = prefix_score_v;
+    }
+
+    if (row == dst1_row) {
+        const uint ape_i = pos1_mod * args.width + col;
+        float ape_v;
+        if (args.ape_type == 1u) {
+            ape_v = (float)(((device const half *)ape)[ape_i]);
+        } else {
+            ape_v = ((device const float *)ape)[ape_i];
+        }
+        state_kv_v = kv[args.width + col];
+        state_score_v = score[args.width + col] + ape_v;
+    }
+
+    prefix_kv[gid] = prefix_kv_v;
+    prefix_score[gid] = prefix_score_v;
+    state_kv[gid] = state_kv_v;
+    state_score[gid] = state_score_v;
 }

@@ -99,6 +99,7 @@ static id<MTLComputePipelineState> g_dsv4_indexer_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_score_one_direct_pipeline;
 static id<MTLComputePipelineState> g_dsv4_compressor_store_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_compressor_store_one_capture_pipeline;
+static id<MTLComputePipelineState> g_dsv4_compressor_store_pair_capture_pipeline;
 static id<MTLComputePipelineState> g_dsv4_sort_i32_rows_asc_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb4_pipeline;
@@ -2707,6 +2708,14 @@ typedef struct {
 } ds4_metal_dsv4_compressor_store_one_capture_args;
 
 typedef struct {
+    uint32_t width;
+    uint32_t state_rows;
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t ape_type;
+} ds4_metal_dsv4_compressor_store_pair_capture_args;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;
@@ -4022,6 +4031,8 @@ int ds4_metal_init(void) {
             ds4_metal_get_pipeline("kernel_dsv4_compressor_store_one");
         g_dsv4_compressor_store_one_capture_pipeline =
             ds4_metal_get_pipeline("kernel_dsv4_compressor_store_one_capture");
+        g_dsv4_compressor_store_pair_capture_pipeline =
+            ds4_metal_get_pipeline("kernel_dsv4_compressor_store_pair_capture");
         g_dsv4_sort_i32_rows_asc_pipeline =
             ds4_metal_get_pipeline("kernel_dsv4_sort_i32_rows_asc");
         g_dsv4_indexed_attention_heads8_pipeline =
@@ -4047,6 +4058,7 @@ int ds4_metal_init(void) {
         if (!g_dsv4_indexer_score_one_direct_pipeline ||
             !g_dsv4_compressor_store_one_pipeline ||
             !g_dsv4_compressor_store_one_capture_pipeline ||
+            !g_dsv4_compressor_store_pair_capture_pipeline ||
             !g_dsv4_sort_i32_rows_asc_pipeline ||
             !g_dsv4_indexed_attention_heads8_pipeline ||
             !g_dsv4_indexed_attention_heads8_rb4_pipeline ||
@@ -4378,6 +4390,7 @@ void ds4_metal_cleanup(void) {
         g_dsv4_indexer_score_one_direct_pipeline = nil;
         g_dsv4_compressor_store_one_pipeline = nil;
         g_dsv4_compressor_store_one_capture_pipeline = nil;
+        g_dsv4_compressor_store_pair_capture_pipeline = nil;
         g_dsv4_sort_i32_rows_asc_pipeline = nil;
         g_dsv4_indexed_attention_heads8_pipeline = nil;
         g_dsv4_indexed_attention_heads8_rb4_pipeline = nil;
@@ -7399,6 +7412,94 @@ int ds4_metal_compressor_store_one_capture_tensor(
     ds4_metal_end_compute_encoder(cb, enc);
 
     return ds4_metal_finish_command_buffer(cb, owned, "compressor store/capture");
+}
+
+int ds4_metal_compressor_store_pair_capture_tensor(
+        const ds4_metal_tensor *kv,
+        const ds4_metal_tensor *sc,
+        ds4_metal_tensor       *state_kv,
+        ds4_metal_tensor       *state_score,
+        ds4_metal_tensor       *prefix_kv,
+        ds4_metal_tensor       *prefix_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                width,
+        uint32_t                ratio,
+        uint32_t                pos0) {
+    if (!kv || !sc || !state_kv || !state_score || !prefix_kv || !prefix_score ||
+        !model_map || width == 0 || ratio == 0 || (ape_type != 0u && ape_type != 1u)) {
+        return 0;
+    }
+
+    id<MTLComputePipelineState> pipeline =
+        ds4_metal_hot_pipeline(g_dsv4_compressor_store_pair_capture_pipeline,
+                                "kernel_dsv4_compressor_store_pair_capture");
+    if (!pipeline) return 0;
+
+    const uint32_t state_rows = ratio == 4u ? 2u * ratio : ratio;
+    if (state_rows > UINT32_MAX / width) return 0;
+    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    const uint64_t row_bytes = (uint64_t)width * sizeof(float);
+    const uint64_t pair_bytes = 2u * row_bytes;
+    const uint64_t state_bytes = (uint64_t)state_rows * row_bytes;
+    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        ds4_metal_tensor_bytes(kv) < pair_bytes ||
+        ds4_metal_tensor_bytes(sc) < pair_bytes ||
+        ds4_metal_tensor_bytes(state_kv) < state_bytes ||
+        ds4_metal_tensor_bytes(state_score) < state_bytes ||
+        ds4_metal_tensor_bytes(prefix_kv) < state_bytes ||
+        ds4_metal_tensor_bytes(prefix_score) < state_bytes) {
+        return 0;
+    }
+
+    uint64_t ape_inner = 0;
+    id<MTLBuffer> apebuf = ds4_metal_wrap_model_range(model_map, model_size,
+                                                       ape_offset, ape_bytes,
+                                                       &ape_inner);
+    id<MTLBuffer> kvbuf = ds4_metal_tensor_buffer(kv);
+    id<MTLBuffer> scbuf = ds4_metal_tensor_buffer(sc);
+    id<MTLBuffer> statekvbuf = ds4_metal_tensor_buffer(state_kv);
+    id<MTLBuffer> statescbuf = ds4_metal_tensor_buffer(state_score);
+    id<MTLBuffer> prefixkvbuf = ds4_metal_tensor_buffer(prefix_kv);
+    id<MTLBuffer> prefixscbuf = ds4_metal_tensor_buffer(prefix_score);
+    if (!apebuf || !kvbuf || !scbuf || !statekvbuf || !statescbuf ||
+        !prefixkvbuf || !prefixscbuf) {
+        return 0;
+    }
+
+    ds4_metal_dsv4_compressor_store_pair_capture_args args = {
+        .width = width,
+        .state_rows = state_rows,
+        .ratio = ratio,
+        .pos0 = pos0,
+        .ape_type = ape_type,
+    };
+
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+    if (!cb) return 0;
+
+    const NSUInteger total = (NSUInteger)width * state_rows;
+    const NSUInteger nth = 256u;
+    id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:kvbuf offset:ds4_metal_tensor_offset(kv) atIndex:1];
+    [enc setBuffer:scbuf offset:ds4_metal_tensor_offset(sc) atIndex:2];
+    [enc setBuffer:apebuf offset:(NSUInteger)ape_inner atIndex:3];
+    [enc setBuffer:statekvbuf offset:ds4_metal_tensor_offset(state_kv) atIndex:4];
+    [enc setBuffer:statescbuf offset:ds4_metal_tensor_offset(state_score) atIndex:5];
+    [enc setBuffer:prefixkvbuf offset:ds4_metal_tensor_offset(prefix_kv) atIndex:6];
+    [enc setBuffer:prefixscbuf offset:ds4_metal_tensor_offset(prefix_score) atIndex:7];
+    DS4_METAL_NOTE_DISPATCH();
+    [enc dispatchThreadgroups:MTLSizeMake((total + nth - 1u) / nth, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    ds4_metal_end_compute_encoder(cb, enc);
+
+    return ds4_metal_finish_command_buffer(cb, owned, "compressor pair store/capture");
 }
 
 int ds4_metal_compressor_store_batch_tensor(

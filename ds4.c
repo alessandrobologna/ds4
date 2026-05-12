@@ -11815,29 +11815,53 @@ static bool metal_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
         }
     }
-    if (ok) ok = ds4_metal_rope_tail_tensor(g->batch_kv,
-                                            n_tokens,
-                                            DS4_N_HEAD_KV,
-                                            DS4_N_HEAD_DIM,
-                                            DS4_N_ROT,
-                                            pos0,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
+    const bool fused_kv_rope_fp8 =
+        g->spec_verify_mode &&
+        DS4_N_HEAD_KV == 1 &&
+        getenv("DS4_METAL_DISABLE_KV_ROPE_FP8_FUSION") == NULL;
+    if (fused_kv_rope_fp8) {
+        if (ok) ok = ds4_metal_kv_rope_tail_fp8_quantize_tensor(
+                g->batch_kv,
+                n_tokens,
+                DS4_N_HEAD_KV,
+                DS4_N_HEAD_DIM,
+                DS4_N_ROT,
+                pos0,
+                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                false,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW) != 0;
+    } else {
+        if (ok) ok = ds4_metal_rope_tail_tensor(g->batch_kv,
+                                                n_tokens,
+                                                DS4_N_HEAD_KV,
+                                                DS4_N_HEAD_DIM,
+                                                DS4_N_ROT,
+                                                pos0,
+                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                false,
+                                                freq_base,
+                                                freq_scale,
+                                                ext_factor,
+                                                attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW) != 0;
+    }
     DS4_METAL_STAGE_PROBE("KVrope", g->batch_kv, DS4_N_HEAD_DIM);
     if (ok) {
         metal_graph_debug_dump_tensor("KVrope", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
-    if (ok) ok = ds4_metal_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
-                                                       n_tokens,
-                                                       DS4_N_HEAD_DIM,
-                                                       DS4_N_ROT) != 0;
+    if (!fused_kv_rope_fp8) {
+        if (ok) ok = ds4_metal_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
+                                                           n_tokens,
+                                                           DS4_N_HEAD_DIM,
+                                                           DS4_N_ROT) != 0;
+    }
     DS4_METAL_STAGE_PROBE("KVcur", g->batch_kv, DS4_N_HEAD_DIM);
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->batch_kv,

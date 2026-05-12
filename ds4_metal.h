@@ -326,6 +326,22 @@ int ds4_metal_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow);
 
+int ds4_metal_kv_rope_tail_fp8_quantize_tensor(
+        ds4_metal_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
 int ds4_metal_rope_tail_tensor_step(
         ds4_metal_tensor *x,
         uint32_t          n_tok,

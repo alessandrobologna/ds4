@@ -82,6 +82,7 @@ static id<MTLComputePipelineState> g_moe_mul_mm_id_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_q2_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
+static id<MTLComputePipelineState> g_kv_rope_fp8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_raw_store_f16_round_pipeline;
@@ -2489,6 +2490,31 @@ typedef struct {
     bool src2;
 } ds4_metal_rope_tail_batch_args;
 
+typedef struct {
+    int64_t ne00;
+    int64_t ne01;
+    int64_t ne02;
+    int64_t ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t n_dims;
+    int32_t mode;
+    int32_t n_ctx_orig;
+    int32_t inverse;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+} ds4_metal_kv_rope_fp8_args;
+
 static ds4_metal_rope_tail_batch_args ds4_metal_make_rope_tail_args(
         uint32_t n_tok,
         uint32_t n_head,
@@ -2528,6 +2554,47 @@ static ds4_metal_rope_tail_batch_args ds4_metal_make_rope_tail_args(
         .beta_fast = beta_fast,
         .beta_slow = beta_slow,
         .src2 = false,
+    };
+}
+
+static ds4_metal_kv_rope_fp8_args ds4_metal_make_kv_rope_fp8_args(
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t n_ctx_orig,
+        bool     inverse,
+        float    freq_base,
+        float    freq_scale,
+        float    ext_factor,
+        float    attn_factor,
+        float    beta_fast,
+        float    beta_slow) {
+    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    const uint64_t tok_bytes = (uint64_t)n_head * row_bytes;
+    return (ds4_metal_kv_rope_fp8_args) {
+        .ne00 = head_dim,
+        .ne01 = n_head,
+        .ne02 = n_tok,
+        .ne03 = 1,
+        .nb00 = sizeof(float),
+        .nb01 = row_bytes,
+        .nb02 = tok_bytes,
+        .nb03 = (uint64_t)n_tok * tok_bytes,
+        .nb0 = sizeof(float),
+        .nb1 = row_bytes,
+        .nb2 = tok_bytes,
+        .nb3 = (uint64_t)n_tok * tok_bytes,
+        .n_dims = (int32_t)n_rot,
+        .mode = 0,
+        .n_ctx_orig = (int32_t)n_ctx_orig,
+        .inverse = inverse ? 1 : 0,
+        .freq_base = freq_base,
+        .freq_scale = freq_scale,
+        .ext_factor = ext_factor,
+        .attn_factor = attn_factor,
+        .beta_fast = beta_fast,
+        .beta_slow = beta_slow,
     };
 }
 
@@ -3504,6 +3571,22 @@ int ds4_metal_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_dsv4_kv_rope_tail_fp8_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_kv_rope_tail_fp8_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_kv_rope_fp8_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_kv_rope_fp8_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_kv_rope_tail_fp8_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_dsv4_softmax_pool"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_softmax_pool function not found\n");
@@ -4274,6 +4357,7 @@ void ds4_metal_cleanup(void) {
         g_moe_mul_mm_id_q2_k_pipeline = nil;
         g_moe_mul_mm_id_q4_k_pipeline = nil;
         g_rope_tail_batch_pipeline = nil;
+        g_kv_rope_fp8_pipeline = nil;
         g_dsv4_fp8_kv_quantize_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
         g_dsv4_raw_store_f16_round_pipeline = nil;
@@ -6441,6 +6525,92 @@ int ds4_metal_rope_tail_tensor(
                                            attn_factor,
                                            beta_fast,
                                            beta_slow);
+}
+
+int ds4_metal_kv_rope_tail_fp8_quantize_tensor(
+        ds4_metal_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 ||
+        n_rot > head_dim || (n_rot & 1u) != 0 || n_rot == head_dim) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
+        const uint64_t bytes = (uint64_t)n_tok * n_head * head_dim * sizeof(float);
+        if (!xbuf || ds4_metal_tensor_bytes(x) < bytes) {
+            fprintf(stderr, "ds4: Metal fused KV RoPE/FP8 received undersized activation buffer\n");
+            return 0;
+        }
+
+        ds4_metal_kv_rope_fp8_args args = ds4_metal_make_kv_rope_fp8_args(
+            n_tok, n_head, head_dim, n_rot, n_ctx_orig, inverse,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+
+        int32_t pos_stack[256];
+        int32_t *pos = pos_stack;
+        if (n_tok > (uint32_t)(sizeof(pos_stack) / sizeof(pos_stack[0]))) {
+            pos = malloc((size_t)n_tok * sizeof(*pos));
+            if (!pos) {
+                fprintf(stderr, "ds4: failed to allocate fused KV RoPE/FP8 position buffer\n");
+                return 0;
+            }
+        }
+        for (uint32_t t = 0; t < n_tok; t++) pos[t] = (int32_t)(pos0 + t);
+
+        const NSUInteger pos_bytes = (NSUInteger)n_tok * sizeof(*pos);
+        id<MTLBuffer> posbuf = nil;
+        if (pos_bytes > 4096u) {
+            posbuf = ds4_metal_new_transient_buffer(pos_bytes, "ds4_kv_rope_fp8_positions");
+            if (!posbuf) {
+                if (pos != pos_stack) free(pos);
+                return 0;
+            }
+            memcpy([posbuf contents], pos, pos_bytes);
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) {
+            if (pos != pos_stack) free(pos);
+            return 0;
+        }
+
+        const NSUInteger nth = head_dim < 256u ? head_dim : 256u;
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:g_kv_rope_fp8_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:1];
+        if (posbuf) {
+            [enc setBuffer:posbuf offset:0 atIndex:2];
+        } else {
+            [enc setBytes:pos length:pos_bytes atIndex:2];
+        }
+        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:3];
+        [enc setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
+        DS4_METAL_NOTE_DISPATCH();
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth ? nth : 1u, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (pos != pos_stack) free(pos);
+        if (!ds4_metal_finish_command_buffer(cb, owned, "fused KV RoPE/FP8")) return 0;
+    }
+
+    return 1;
 }
 
 int ds4_metal_dsv4_fp8_kv_quantize_tensor(

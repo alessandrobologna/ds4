@@ -11507,6 +11507,61 @@ static bool metal_graph_q_stage_profile_enabled(void) {
            g_metal_q_stage_summary_active;
 }
 
+static bool metal_graph_exact_batch_attention_layer_enabled(uint32_t il, bool diagnostic_all_layers) {
+    const char *single_env = getenv("DS4_METAL_EXACT_BATCH_ATTENTION_LAYER");
+    if (single_env && single_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(single_env, &end, 10);
+        return end != single_env && v <= UINT32_MAX && il == (uint32_t)v;
+    }
+
+    const char *list_env = getenv("DS4_METAL_EXACT_BATCH_ATTENTION_LAYERS");
+    if (list_env && list_env[0]) {
+        const char *p = list_env;
+        while (*p) {
+            while (*p == ' ' || *p == '\t' || *p == ',') p++;
+            if (!*p) break;
+            char *end = NULL;
+            unsigned long lo = strtoul(p, &end, 10);
+            if (end == p || lo > UINT32_MAX) return false;
+            unsigned long hi = lo;
+            p = end;
+            if (*p == '-') {
+                p++;
+                hi = strtoul(p, &end, 10);
+                if (end == p || hi > UINT32_MAX) return false;
+                p = end;
+            }
+            if (lo <= il && il <= hi) return true;
+            while (*p && *p != ',') {
+                if (*p != ' ' && *p != '\t') return false;
+                p++;
+            }
+        }
+        return false;
+    }
+
+    uint32_t min_layer = 0;
+    uint32_t max_layer = DS4_N_LAYER - 1u;
+    const char *min_env = getenv("DS4_METAL_EXACT_BATCH_ATTENTION_LAYER_MIN");
+    if (min_env && min_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(min_env, &end, 10);
+        if (end != min_env && v <= UINT32_MAX) min_layer = (uint32_t)v;
+    }
+    const char *max_env = getenv("DS4_METAL_EXACT_BATCH_ATTENTION_LAYER_MAX");
+    if (max_env && max_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(max_env, &end, 10);
+        if (end != max_env && v <= UINT32_MAX) max_layer = (uint32_t)v;
+    }
+    if (min_env || max_env) return min_layer <= il && il <= max_layer;
+
+    if (diagnostic_all_layers) return true;
+
+    return il == 14u || il >= 16u;
+}
+
 static void metal_graph_stage_summary_reset(void) {
     memset(g_metal_stage_summary, 0, sizeof(g_metal_stage_summary));
     g_metal_stage_summary_count = 0;
@@ -11656,17 +11711,19 @@ static bool metal_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
-    /* In strict verifier mode, keep speculative rows on the row-preserving
-     * attention path by default.  DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1 is
-     * a diagnostic override: it can preserve local top-1 decisions, but
-     * q4-imatrix tests showed that committing batched raw/mixed attention state
-     * drifts later generation unless accepted tokens are replayed exactly. */
+    /* In strict verifier mode, only a measured q4-imatrix-safe layer subset
+     * uses batched attention by default.  DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1
+     * remains a diagnostic override for all layers unless a layer selector is
+     * supplied; q4-imatrix tests showed that early raw/mixed batched attention
+     * can preserve local top-1 decisions while still drifting later generation. */
     const bool spec_row_fallback =
         metal_graph_use_exact_verify_stage(g, "DS4_MTP_VERIFY_FAST_FRONTIER");
     const bool exact_batch_attention =
         g->spec_verify_mode &&
-        getenv("DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION") != NULL &&
-        getenv("DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION") == NULL;
+        getenv("DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION") == NULL &&
+        metal_graph_exact_batch_attention_layer_enabled(
+                il,
+                getenv("DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION") != NULL);
     const bool exact_batch_raw_attention =
         exact_batch_attention &&
         getenv("DS4_METAL_DISABLE_EXACT_BATCH_RAW_ATTENTION") == NULL;
@@ -17002,7 +17059,47 @@ static void ds4_mtp_wiring_stats_print(const char *name,
             (double)st->max);
 }
 
+static void ds4_mtp_wiring_tensor_print(const char *label, const ds4_tensor *t) {
+    if (!t) {
+        fprintf(stderr, "ds4: mtp wiring tensor %s=missing\n", label);
+        return;
+    }
+    fprintf(stderr,
+            "ds4: mtp wiring tensor %s name=%.*s type=%s dims=[",
+            label,
+            (int)t->name.len,
+            t->name.ptr,
+            tensor_type_name(t->type));
+    for (uint32_t i = 0; i < t->ndim; i++) {
+        if (i) fputc('x', stderr);
+        fprintf(stderr, "%llu", (unsigned long long)t->dim[i]);
+    }
+    fprintf(stderr, "] elements=%llu bytes=%llu\n",
+            (unsigned long long)t->elements,
+            (unsigned long long)t->bytes);
+}
+
+static void ds4_mtp_wiring_tensor_map_print(const ds4_weights *base_weights,
+                                            const ds4_mtp_weights *mtp) {
+    fprintf(stderr,
+            "ds4: mtp wiring map source=compact_gguf "
+            "base_hidden=target_pre_hc_head token_embedding=base_token_embd "
+            "head=mtp_hc_head_plus_mtp_norm_plus_base_output\n");
+    ds4_mtp_wiring_tensor_print("base.token_embd", base_weights ? base_weights->token_embd : NULL);
+    ds4_mtp_wiring_tensor_print("base.output", base_weights ? base_weights->output : NULL);
+    ds4_mtp_wiring_tensor_print("mtp.enorm", mtp ? mtp->enorm : NULL);
+    ds4_mtp_wiring_tensor_print("mtp.e_proj", mtp ? mtp->e_proj : NULL);
+    ds4_mtp_wiring_tensor_print("mtp.hnorm", mtp ? mtp->hnorm : NULL);
+    ds4_mtp_wiring_tensor_print("mtp.h_proj", mtp ? mtp->h_proj : NULL);
+    ds4_mtp_wiring_tensor_print("mtp.hc_head_fn", mtp ? mtp->hc_head_fn : NULL);
+    ds4_mtp_wiring_tensor_print("mtp.hc_head_scale", mtp ? mtp->hc_head_scale : NULL);
+    ds4_mtp_wiring_tensor_print("mtp.hc_head_base", mtp ? mtp->hc_head_base : NULL);
+    ds4_mtp_wiring_tensor_print("mtp.shared_head.norm", mtp ? mtp->norm : NULL);
+}
+
 static void ds4_mtp_wiring_audit_root(ds4_session *s,
+                                      const ds4_weights *base_weights,
+                                      const ds4_mtp_weights *mtp_weights,
                                       uint32_t     start,
                                       int          target_token,
                                       int          mtp_rank,
@@ -17016,11 +17113,23 @@ static void ds4_mtp_wiring_audit_root(ds4_session *s,
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     ds4_mtp_wiring_stats target_hc = {0};
     ds4_mtp_wiring_stats token_embed = {0};
+    ds4_mtp_wiring_stats token_enorm = {0};
+    ds4_mtp_wiring_stats e_proj = {0};
+    ds4_mtp_wiring_stats hnorm_hc = {0};
+    ds4_mtp_wiring_stats h_proj_hc = {0};
     ds4_mtp_wiring_stats mtp_input = {0};
     ds4_mtp_wiring_stats mtp_out = {0};
 
+    if (s->mtp_wiring_audit_steps == 0) {
+        ds4_mtp_wiring_tensor_map_print(base_weights, mtp_weights);
+    }
+
     const bool have_target_hc = ds4_metal_tensor_stats_f32(g->cur_hc, hc_dim, &target_hc);
     const bool have_token_embed = ds4_metal_tensor_stats_f32(g->mtp_embed, embd_dim, &token_embed);
+    const bool have_token_enorm = ds4_metal_tensor_stats_f32(g->mtp_enorm, embd_dim, &token_enorm);
+    const bool have_e_proj = ds4_metal_tensor_stats_f32(g->mtp_eproj, embd_dim, &e_proj);
+    const bool have_hnorm_hc = ds4_metal_tensor_stats_f32(g->mtp_hnorm_hc, hc_dim, &hnorm_hc);
+    const bool have_h_proj_hc = ds4_metal_tensor_stats_f32(g->mtp_hproj_hc, hc_dim, &h_proj_hc);
     const bool have_mtp_input = ds4_metal_tensor_stats_f32(g->mtp_input_hc, hc_dim, &mtp_input);
     const bool have_mtp_out = ds4_metal_tensor_stats_f32(root_out_hc, hc_dim, &mtp_out);
 
@@ -17028,13 +17137,17 @@ static void ds4_mtp_wiring_audit_root(ds4_session *s,
     int mtp_second = -1;
     float mtp_v0 = DS4_NEG_INF;
     float mtp_v1 = DS4_NEG_INF;
+    int top8_ids[8];
+    for (int i = 0; i < 8; i++) top8_ids[i] = -1;
     logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_top, &mtp_v0, &mtp_second, &mtp_v1);
+    const int top8_n = logits_top_k_ids(s->mtp_logits, DS4_N_VOCAB, top8_ids, 8);
 
     fprintf(stderr,
             "ds4: mtp wiring step=%llu pos=%u source=target_pre_hc_head "
             "hidden_shape=%ux%u flat=%llu token_embed_shape=%u "
-            "target_token=%d mtp_top=%d mtp_second=%d target_rank_top8=%d "
-            "mtp_margin=%.6g",
+            "target_token=%d mtp_top=%d mtp_second=%d target_rank=%d "
+            "contains_top1=%d contains_top2=%d contains_top4=%d contains_top8=%d "
+            "mtp_margin=%.6g top8=[",
             (unsigned long long)(s->mtp_wiring_audit_steps + 1),
             start,
             (unsigned)DS4_N_HC,
@@ -17045,9 +17158,22 @@ static void ds4_mtp_wiring_audit_root(ds4_session *s,
             mtp_top,
             mtp_second,
             mtp_rank,
+            mtp_rank <= 1,
+            mtp_rank <= 2,
+            mtp_rank <= 4,
+            mtp_rank <= 8,
             (double)mtp_margin);
+    for (int i = 0; i < top8_n; i++) {
+        if (i) fputc(',', stderr);
+        fprintf(stderr, "%d", top8_ids[i]);
+    }
+    fputc(']', stderr);
     ds4_mtp_wiring_stats_print("target_hc", have_target_hc ? &target_hc : NULL);
     ds4_mtp_wiring_stats_print("token_embed", have_token_embed ? &token_embed : NULL);
+    ds4_mtp_wiring_stats_print("token_enorm", have_token_enorm ? &token_enorm : NULL);
+    ds4_mtp_wiring_stats_print("e_proj", have_e_proj ? &e_proj : NULL);
+    ds4_mtp_wiring_stats_print("hnorm_hc", have_hnorm_hc ? &hnorm_hc : NULL);
+    ds4_mtp_wiring_stats_print("h_proj_hc", have_h_proj_hc ? &h_proj_hc : NULL);
     ds4_mtp_wiring_stats_print("mtp_input_hc", have_mtp_input ? &mtp_input : NULL);
     ds4_mtp_wiring_stats_print("mtp_out_hc", have_mtp_out ? &mtp_out : NULL);
     fputc('\n', stderr);
@@ -22044,6 +22170,8 @@ static void ds4_mtp_tree_oracle_check(ds4_session *s, uint32_t start) {
     logits_top2(saved_mtp_logits, DS4_N_VOCAB, NULL, &mtp_v0, NULL, &mtp_v1);
     mtp_margins[0] = mtp_v0 - mtp_v1;
     ds4_mtp_wiring_audit_root(s,
+                              &e->weights,
+                              &e->mtp_weights,
                               start,
                               target_path[0],
                               ranks[0],
@@ -24270,13 +24398,17 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         const double probe_t0 = mtp_collect_stats ? now_sec() : 0.0;
         const bool target_first_pair_probe =
             exact_target_first_probe &&
-            getenv("DS4_MTP_EXACT_TARGET_FIRST_PAIR") != NULL &&
+            getenv("DS4_MTP_NO_EXACT_TARGET_FIRST_PAIR") == NULL &&
             getenv("DS4_MTP_EXACT_SECOND_TOPK") == NULL &&
             getenv("DS4_MTP_EXACT_SECOND_TOPK_REPLAY") == NULL &&
             getenv("DS4_MTP_EXACT_SECOND_TOPK_BRANCH") == NULL &&
             e->mtp_draft_tokens == 2;
         int prefetched_second_top = -1;
-        bool probe_ok = fused_probe || target_first_fused_probe;
+        const bool n1_zero_probe =
+            exact_target_first_probe &&
+            e->mtp_draft_tokens == 1 &&
+            getenv("DS4_MTP_N1_ZERO_PROBE") != NULL;
+        bool probe_ok = fused_probe || target_first_fused_probe || n1_zero_probe;
         if (target_first_pair_probe) {
             if (target_top_for_mtp < 0) {
                 target_top_for_mtp = sample_argmax(s->logits, DS4_N_VOCAB);
@@ -24292,7 +24424,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                               (uint32_t)s->checkpoint.len,
                                                               s->mtp_logits,
                                                               &prefetched_second_top);
-        } else if (!fused_probe && !target_first_fused_probe) {
+        } else if (!fused_probe && !target_first_fused_probe && !n1_zero_probe) {
             probe_ok = metal_graph_eval_mtp_draft(&s->graph,
                                                   &e->model,
                                                   &e->weights,
@@ -24311,7 +24443,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             }
             mtp_top = target_top_for_mtp;
         }
-        if (mtp_collect_stats && !fused_probe && !target_first_fused_probe) {
+        if (mtp_collect_stats && !fused_probe && !target_first_fused_probe && !n1_zero_probe) {
             s->mtp_stats.mtp_probe_count++;
             s->mtp_stats.mtp_probe_sec += now_sec() - probe_t0;
         }

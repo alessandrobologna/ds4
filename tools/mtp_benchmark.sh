@@ -36,6 +36,11 @@ CSV=""
 INCLUDE_RESIDENT=0
 INCLUDE_SESSION=0
 INCLUDE_DECODE2=0
+INCLUDE_TARGET_PAIR=0
+INCLUDE_NO_TARGET_PAIR=0
+INCLUDE_FAST_ATTN=0
+INCLUDE_NO_FAST_ATTN=0
+FAST_ATTN_LAYERS="${DS4_MTP_FAST_ATTN_LAYERS:-14,16-42}"
 INCLUDE_SPEED=1
 
 usage() {
@@ -57,6 +62,15 @@ Options:
                    Add a session no-spec lane: MTP opened/mapped, draft=N, no speculation.
   --include-decode2
                    Add the sequential-shape exact N=2 verifier lane.
+  --include-target-pair
+                   Add the target-first pair-prefetch verifier lane.
+  --include-no-target-pair
+                   Add the exact verifier lane with target-first pair disabled.
+  --include-fast-attn
+                   Add exact verifier with diagnostic fast batch attention layers.
+                   Layer list defaults to $FAST_ATTN_LAYERS; override with DS4_MTP_FAST_ATTN_LAYERS.
+  --include-no-fast-attn
+                   Add exact verifier with fast batch attention disabled.
   --no-speed       Skip the approximate --mtp-speed lane.
   -h, --help        Show this help.
 EOF
@@ -75,6 +89,10 @@ while [ "$#" -gt 0 ]; do
         --include-resident) INCLUDE_RESIDENT=1; shift ;;
         --include-session) INCLUDE_SESSION=1; shift ;;
         --include-decode2) INCLUDE_DECODE2=1; shift ;;
+        --include-target-pair) INCLUDE_TARGET_PAIR=1; shift ;;
+        --include-no-target-pair) INCLUDE_NO_TARGET_PAIR=1; shift ;;
+        --include-fast-attn) INCLUDE_FAST_ATTN=1; shift ;;
+        --include-no-fast-attn) INCLUDE_NO_FAST_ATTN=1; shift ;;
         --no-speed) INCLUDE_SPEED=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -130,6 +148,22 @@ run_mode() {
             ;;
         decode2)
             envcmd=(env DS4_MTP_DECODE2_EXACT=1)
+            cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
+            ;;
+        target_pair)
+            envcmd=(env DS4_MTP_EXACT_TARGET_FIRST_PAIR=1)
+            cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
+            ;;
+        no_target_pair)
+            envcmd=(env DS4_MTP_NO_EXACT_TARGET_FIRST_PAIR=1)
+            cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
+            ;;
+        fast_attn)
+            envcmd=(env DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1 DS4_METAL_EXACT_BATCH_ATTENTION_LAYERS="$FAST_ATTN_LAYERS")
+            cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
+            ;;
+        no_fast_attn)
+            envcmd=(env DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION=1)
             cmd+=("--mtp" "$MTP" "--mtp-draft" "$DRAFT" "--mtp-margin" "$MARGIN")
             ;;
         speed)
@@ -212,6 +246,18 @@ MODES+=(exact)
 if [ "$INCLUDE_DECODE2" -ne 0 ]; then
     MODES+=(decode2)
 fi
+if [ "$INCLUDE_TARGET_PAIR" -ne 0 ]; then
+    MODES+=(target_pair)
+fi
+if [ "$INCLUDE_NO_TARGET_PAIR" -ne 0 ]; then
+    MODES+=(no_target_pair)
+fi
+if [ "$INCLUDE_FAST_ATTN" -ne 0 ]; then
+    MODES+=(fast_attn)
+fi
+if [ "$INCLUDE_NO_FAST_ATTN" -ne 0 ]; then
+    MODES+=(no_fast_attn)
+fi
 if [ "$INCLUDE_SPEED" -ne 0 ]; then
     MODES+=(speed)
 fi
@@ -238,6 +284,22 @@ decode2_med=""
 if [ "$INCLUDE_DECODE2" -ne 0 ]; then
     decode2_med="$(median_for_mode decode2)"
 fi
+target_pair_med=""
+if [ "$INCLUDE_TARGET_PAIR" -ne 0 ]; then
+    target_pair_med="$(median_for_mode target_pair)"
+fi
+no_target_pair_med=""
+if [ "$INCLUDE_NO_TARGET_PAIR" -ne 0 ]; then
+    no_target_pair_med="$(median_for_mode no_target_pair)"
+fi
+fast_attn_med=""
+if [ "$INCLUDE_FAST_ATTN" -ne 0 ]; then
+    fast_attn_med="$(median_for_mode fast_attn)"
+fi
+no_fast_attn_med=""
+if [ "$INCLUDE_NO_FAST_ATTN" -ne 0 ]; then
+    no_fast_attn_med="$(median_for_mode no_fast_attn)"
+fi
 speed_med=""
 if [ "$INCLUDE_SPEED" -ne 0 ]; then
     speed_med="$(median_for_mode speed)"
@@ -256,6 +318,22 @@ exact_ratio="$(ratio_to_baseline "$exact_med" "$base_med")"
 decode2_ratio=""
 if [ "$INCLUDE_DECODE2" -ne 0 ]; then
     decode2_ratio="$(ratio_to_baseline "$decode2_med" "$base_med")"
+fi
+target_pair_ratio=""
+if [ "$INCLUDE_TARGET_PAIR" -ne 0 ]; then
+    target_pair_ratio="$(ratio_to_baseline "$target_pair_med" "$base_med")"
+fi
+no_target_pair_ratio=""
+if [ "$INCLUDE_NO_TARGET_PAIR" -ne 0 ]; then
+    no_target_pair_ratio="$(ratio_to_baseline "$no_target_pair_med" "$base_med")"
+fi
+fast_attn_ratio=""
+if [ "$INCLUDE_FAST_ATTN" -ne 0 ]; then
+    fast_attn_ratio="$(ratio_to_baseline "$fast_attn_med" "$base_med")"
+fi
+no_fast_attn_ratio=""
+if [ "$INCLUDE_NO_FAST_ATTN" -ne 0 ]; then
+    no_fast_attn_ratio="$(ratio_to_baseline "$no_fast_attn_med" "$base_med")"
 fi
 speed_ratio=""
 if [ "$INCLUDE_SPEED" -ne 0 ]; then
@@ -289,6 +367,35 @@ $(if [ "$INCLUDE_DECODE2" -ne 0 ]; then
         "$(unique_hashes_for_mode decode2)" \
         "$decode2_ratio" \
         "$(hash_matches_baseline decode2 "$baseline_hash")"
+fi)
+$(if [ "$INCLUDE_TARGET_PAIR" -ne 0 ]; then
+    printf 'target_pair_median_tps=%s hashes=%s\ntarget_pair_vs_baseline=%s hash_matches_baseline=%s\n' \
+        "$target_pair_med" \
+        "$(unique_hashes_for_mode target_pair)" \
+        "$target_pair_ratio" \
+        "$(hash_matches_baseline target_pair "$baseline_hash")"
+fi)
+$(if [ "$INCLUDE_NO_TARGET_PAIR" -ne 0 ]; then
+    printf 'no_target_pair_median_tps=%s hashes=%s\nno_target_pair_vs_baseline=%s hash_matches_baseline=%s\n' \
+        "$no_target_pair_med" \
+        "$(unique_hashes_for_mode no_target_pair)" \
+        "$no_target_pair_ratio" \
+        "$(hash_matches_baseline no_target_pair "$baseline_hash")"
+fi)
+$(if [ "$INCLUDE_FAST_ATTN" -ne 0 ]; then
+    printf 'fast_attn_layers=%s\nfast_attn_median_tps=%s hashes=%s\nfast_attn_vs_baseline=%s hash_matches_baseline=%s\n' \
+        "$FAST_ATTN_LAYERS" \
+        "$fast_attn_med" \
+        "$(unique_hashes_for_mode fast_attn)" \
+        "$fast_attn_ratio" \
+        "$(hash_matches_baseline fast_attn "$baseline_hash")"
+fi)
+$(if [ "$INCLUDE_NO_FAST_ATTN" -ne 0 ]; then
+    printf 'no_fast_attn_median_tps=%s hashes=%s\nno_fast_attn_vs_baseline=%s hash_matches_baseline=%s\n' \
+        "$no_fast_attn_med" \
+        "$(unique_hashes_for_mode no_fast_attn)" \
+        "$no_fast_attn_ratio" \
+        "$(hash_matches_baseline no_fast_attn "$baseline_hash")"
 fi)
 $(if [ "$INCLUDE_SPEED" -ne 0 ]; then
     printf 'speed_median_tps=%s hashes=%s\nspeed_vs_baseline=%s\n' \

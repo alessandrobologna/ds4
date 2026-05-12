@@ -3443,3 +3443,459 @@ up the unsafe batch-attention peak.  Future kernel work should treat
 `DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1` as an unsafe diagnostic/falsified
 path unless a new attention implementation proves row-preserving final-state
 equivalence, not just immediate top-1 equivalence.
+
+## 2026-05-12 MTP Wiring Audit Against vLLM / Acti
+
+Before resuming q4 kernel work, the MTP drafter wiring was checked against the
+current vLLM DeepSeek V4 MTP implementation and Acti's
+`DeepSeek-V4-Flash-Acti-MTP-W4A16-FP8` patch/manifest files.
+
+Reference sources:
+
+- vLLM `deepseek_v4_mtp.py`:
+  `https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/deepseek_v4_mtp.py`
+- vLLM `deepseek_v4.py`:
+  `https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/deepseek_v4.py`
+- Acti manifest/config:
+  `https://huggingface.co/LordNeel/DeepSeek-V4-Flash-Acti-MTP-W4A16-FP8`
+
+The vLLM path does:
+
+```text
+target decode stores pre-hc_head HC residual
+MTP input = h_proj(hnorm(previous_hidden_states.view(T, hc_mult, D)))
+          + e_proj(enorm(current_token_embedding)).unsqueeze(HC)
+MTP decoder block runs at the speculative position
+MTP logits = hc_head(MTP pre-hc residual) -> shared_head.norm -> shared_head.head
+```
+
+DS4's current path matches that shape:
+
+| Area | vLLM expected | DS4 current | Status |
+|---|---|---|---|
+| Base hidden source | `get_mtp_target_hidden_states()` copies target hidden before target `hc_head` and final norm | `g->cur_hc` after target layer loop, before `metal_graph_encode_output_head()` collapse | matches |
+| Hidden norm | `hnorm(previous_hidden_states.view(-1, hc_mult, hidden_size))` | `ds4_metal_rms_norm_weight_rows_tensor(... mtp->hnorm, DS4_N_HC)` | matches |
+| Token embedding | MTP receives current token embedding, zeroed only at position 0 | DS4 embeds current token through base `token_embd.weight`; normal decode positions are non-zero | matches for decode positions |
+| Embedding norm/proj | `enorm(inputs_embeds)` then separate `e_proj` | `mtp_enorm` then `mtp_eproj`, repeated across HC streams | matches |
+| Hidden proj | separate `h_proj` applied to each HC row | `mtp_hproj_hc` Q8 matmul over `DS4_N_HC` rows | matches |
+| MTP fused input | `h_proj + e_proj.unsqueeze(-2)` | `ds4_metal_add_tensor(mtp_input_hc, mtp_eproj_hc, mtp_hproj_hc)` | matches |
+| Position/RoPE | MTP block receives `positions=positions` at the speculative token position | DS4 passes `pos` into `metal_graph_encode_decode_layer()` for the MTP block and maintains a separate MTP raw cache | structurally matches |
+| Output head | MTP pre-HC residual goes through MTP `hc_head`, `shared_head.norm`, `shared_head.head` | DS4 uses MTP `hc_head_*`, MTP `norm`, and the base output head; this matches the compact sidecar where shared head weight is not duplicated | matches compact format |
+| Tensor remap | vLLM remaps `.head.weight` -> `.shared_head.head.weight`, `.norm.weight` -> `.shared_head.norm.weight`, and keeps MTP layer-local `e_proj/h_proj/enorm/hnorm/hc_head_*` | DS4 converter/binder stores `mtp.0.e_proj`, `mtp.0.h_proj`, `mtp.0.enorm`, `mtp.0.hnorm`, `mtp.0.norm`, `mtp.0.hc_head_*`, and one compact MTP decoder block | matches intended compact format |
+
+The Acti patch files did not indicate a different MTP math path. They patch
+vLLM loader plumbing for `e_proj/h_proj` prefixes, add packed-module mapping,
+and select `.weight_scale` in the loader branch. Acti's manifest also says the
+quality-preserving sidecar calibration kept RMSNorms, `h_proj/e_proj`, gate,
+and per-expert MLP path real.
+
+Tensor count comparison:
+
+```text
+DeepSeek original safetensors index: 69187 tensors total, 1575 mtp.* tensors
+Acti safetensors index:             102990 tensors total, 2338 mtp.* tensors
+DS4 Antirez compact MTP GGUF:           32 tensors, 19 F32 + 10 Q8_0 + 3 Q4_K
+DS4 upstream-Q8 compact MTP GGUF:       32 tensors, 19 F32 + 13 Q8_0
+```
+
+The tensor-count difference is expected: DS4's sidecar stores one layer-local
+MTP block in a DS4-specific compact GGUF, collapses 256 per-expert `w1/w2/w3`
+tensors into three 3-D expert tensors, and does not duplicate the shared token
+embedding or output head from the base GGUF.
+
+`DS4_MTP_WIRING_AUDIT=1` now prints the compact tensor map once and, for a few
+oracle positions, logs:
+
+```text
+target_hc, token_embed, token_enorm, e_proj, hnorm_hc, h_proj_hc,
+mtp_input_hc, mtp_out_hc
+```
+
+plus MTP top-8 IDs and whether the baseline greedy token is contained in
+top-1/top-2/top-4/top-8. The diagnostic is default-off and does not affect
+production runs unless explicitly enabled.
+
+Studio q4-imatrix audit command:
+
+```text
+DS4_MTP_WIRING_AUDIT=1 \
+DS4_MTP_WIRING_AUDIT_LIMIT=4 \
+DS4_MTP_TREE_ORACLE_DEPTH=3 \
+DS4_MTP_NO_ADAPTIVE=1 \
+DS4_MTP_NO_TARGET_MARGIN_SKIP=1 \
+./ds4 -m ~/.ds4/cache/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
+  --mtp ~/.ds4/cache/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+  --mtp-draft 2 --temp 0 --nothink -n 80 \
+  -p "Write a Python function that parses a CSV file, groups rows by a named column, and returns aggregate counts and sums with clear error handling."
+```
+
+Current Antirez compact sidecar artifact:
+`/tmp/ds4-mtp-wiring-antirez-q4k-20260512071045.err`
+
+```text
+first four wiring-audit positions: target_rank=1 for all 4
+step 1 top8=[734,344,442,477,28138,63530,342,9]
+step 1 rms: target_hc=7.66785 token_embed=0.0804089 token_enorm=0.0572461
+step 1 rms: e_proj=0.106123 hnorm_hc=0.106411 h_proj_hc=0.209865
+step 1 rms: mtp_input_hc=0.236743 mtp_out_hc=0.529782
+
+tree oracle steps=35 failures=0
+full-top1 avg_accept_len=2.00
+full-top2 avg_accept_len=2.54
+full-top4 avg_accept_len=2.86
+full-top8 avg_accept_len=2.94
+pos1 <=top1/top2/top4/top8: 88.6% / 97.1% / 100.0% / 100.0%
+pos2 <=top1/top2/top4/top8: 85.7% / 94.3% / 100.0% / 100.0%
+pos3 <=top1/top2/top4/top8: 48.6% / 74.3% / 85.7% / 94.3%
+```
+
+Upstream-Q8 compact sidecar artifact:
+`/tmp/ds4-mtp-wiring-upstream-q8-20260512071053.err`
+
+```text
+first four wiring-audit positions: target_rank=1 for all 4
+tree oracle steps=43 failures=0
+full-top1 avg_accept_len=1.42
+full-top2 avg_accept_len=1.91
+full-top4 avg_accept_len=2.14
+full-top8 avg_accept_len=2.28
+pos1 <=top1/top2/top4/top8: 72.1% / 93.0% / 97.7% / 100.0%
+pos2 <=top1/top2/top4/top8: 72.1% / 72.1% / 76.7% / 83.7%
+pos3 <=top1/top2/top4/top8: 30.2% / 37.2% / 48.8% / 53.5%
+```
+
+The two sidecar runs do not sample identical speculative start positions because
+exact MTP commits different prefix lengths, so this is not a perfect
+side-by-side quality benchmark. Still, it does not support the hypothesis that
+the current Antirez MTP sidecar is obviously miswired or lower quality than the
+higher-precision compact conversion. The first audited positions are plausible
+top-1 hits, activation norms are finite at every expected stage, and the current
+sidecar's broader tree-oracle containment is stronger on this q4-imatrix prompt.
+
+Verification after adding the audit detail:
+
+```text
+make ds4: OK locally and on studio.local
+DS4_TEST_MODEL=q4-imatrix DS4_TEST_MTP=current-MTP ./ds4_test --mtp-oracle: OK
+```
+
+Conclusion: no wiring mismatch was found. The low exact-MTP speed ceiling should
+continue to be treated as verifier/kernel economics plus modest deeper draft
+containment, not as evidence that DS4 is feeding the MTP module the wrong hidden
+state or projection inputs.
+
+## 2026-05-12 N=1 Pipeline Recheck
+
+After the q4-imatrix wiring audit, the existing N=1 shapes were remeasured on
+Studio using the sustained Python/code prompt and the q4-imatrix base:
+
+```text
+prompt: Write a complete Python module that reads CSV rows, groups them by user
+id, computes per-user count, sum, average, min, and max, includes a small
+argparse command line interface, and includes concise unit tests for the pure
+helper functions.
+base: DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf
+mtp:  DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+tokens: 256
+```
+
+Plain `--mtp-draft 1` remains the resident/no-spec floor because N=1
+speculation is only enabled by explicit diagnostics:
+
+```text
+csv: /tmp/ds4-n1-resident-floor-20260512080059.csv
+baseline median: 34.90 TPS
+disabled median: 34.85 TPS, hash-identical
+draft1 resident median: 34.79 TPS, 0.997x baseline, hash-identical
+```
+
+The vLLM-shaped pending-token N=1 pipeline was then rerun:
+
+```text
+csv: /tmp/ds4-n1-pipeline-targetfirst-20260512080059.csv
+DS4_MTP_N1_PIPELINE=1
+baseline median: 34.77 TPS
+exact median: 33.75 TPS, 0.971x baseline, hash-identical
+
+csv: /tmp/ds4-n1-pipeline-realmtp-20260512080059.csv
+DS4_MTP_N1_PIPELINE=1 DS4_MTP_NO_EXACT_TARGET_FIRST=1
+DS4_MTP_NO_TARGET_MARGIN_SKIP=1 DS4_MTP_NO_ADAPTIVE=1
+baseline median: 34.79 TPS
+exact median: 32.50 TPS, 0.934x baseline, hash-identical
+```
+
+Existing fused-probe hooks did not rescue the path:
+
+```text
+csv: /tmp/ds4-n1-targetfirst-fused-20260512081213.csv
+DS4_MTP_N1_PIPELINE=1 DS4_MTP_EXACT_TARGET_FIRST_FUSED=1
+baseline median: 34.83 TPS
+exact median: 33.70 TPS, 0.968x baseline, hash-identical
+
+csv: /tmp/ds4-n1-realmtp-fused-20260512081213.csv
+DS4_MTP_N1_PIPELINE=1 DS4_MTP_NO_EXACT_TARGET_FIRST=1
+DS4_MTP_NO_TARGET_MARGIN_SKIP=1 DS4_MTP_NO_ADAPTIVE=1 DS4_MTP_FUSED_PROBE=1
+baseline median: 34.70 TPS
+exact median: 32.89 TPS, 0.948x baseline, hash-identical
+```
+
+The decisive diagnostic is `DS4_MTP_N1_ZERO_PROBE=1`, a default-off lower bound
+that makes the N=1 probe free and perfect while preserving the same
+pending-token exactness rule. It sets the next draft from target top-1 without
+running the MTP probe, so it is a ceiling test, not a production feature.
+
+```text
+csv: /tmp/ds4-n1-zero-probe-20260512081901.csv
+DS4_MTP_N1_PIPELINE=1 DS4_MTP_N1_ZERO_PROBE=1
+DS4_MTP_NO_TARGET_MARGIN_SKIP=1 DS4_MTP_NO_ADAPTIVE=1
+baseline median: 34.59 TPS
+disabled median: 34.60 TPS, hash-identical
+zero-probe N1 median: 34.48 TPS, 0.997x baseline, hash-identical
+
+stats artifact: /tmp/ds4-n1-zero-probe-stats-20260512081901.err
+target_eval=255, probe=0, steps=254, drafted=254, committed=254
+generation: 34.43 TPS
+```
+
+Conclusion: the pending-token N=1 pipeline cannot become an Acti-style speedup
+by making the MTP probe cheap. Even with a free and perfect probe it only saves
+about one target evaluation over the finite 256-token run, because the pending
+bonus still has to be evaluated before the session can continue exactly.
+
+The closer DS4 equivalent of vLLM's `num_speculative_tokens=1` is therefore the
+target-first pair shape: one normal target token plus one MTP-proposed token.
+That is expressed in this branch as `--mtp-draft 2` with the target-first
+verifier. Rechecking the explicit pair-prefetch path on the current q4-imatrix
+branch measured:
+
+```text
+csv: /tmp/ds4-targetfirst-pair-current-20260512082246.csv
+DS4_MTP_EXACT_TARGET_FIRST_PAIR=1 --mtp-draft 2
+baseline median: 34.60 TPS
+disabled median: 34.58 TPS, hash-identical
+exact median: 36.14 TPS, 1.045x baseline, hash-identical
+
+stats artifact: /tmp/ds4-targetfirst-pair-current-stats-20260512082246.err
+target_eval=192, target_avg=28.969ms, probe=45, probe_avg=2.754ms
+steps=45, drafted=90, committed=64, full=31, partial=2, adaptive_skip=120
+verify=1399.796ms, est_saved=1854.001ms, est_extra=1529.407ms, est_net=324.594ms
+```
+
+This matches the current repaired q4-imatrix exact-MTP band: real speedup comes
+from reducing target evaluations with a two-row verifier, not from the
+standalone pending-token N=1 schedule. Future "N=1" work should use the vLLM
+definition, meaning one extra speculative token beyond the normal target token,
+and should optimize the target-first pair verifier/probe path rather than
+continuing the pending-token N=1 implementation.
+
+## 2026-05-12 Target-First Pair Default
+
+`tools/mtp_benchmark.sh --include-target-pair` now adds an interleaved
+`target_pair` lane that runs exact MTP with
+`DS4_MTP_EXACT_TARGET_FIRST_PAIR=1`. This makes default exact and the explicit
+pair-prefetch verifier easy to compare in the same host band.
+
+On q4-imatrix, before promotion:
+
+```text
+csv: /tmp/ds4-targetpair-ab-20260512091222.csv
+baseline median: 34.69 TPS
+disabled median: 34.70 TPS, hash-identical
+exact median: 36.11 TPS, 1.041x baseline, hash-identical
+target_pair median: 36.24 TPS, 1.045x baseline, hash-identical
+```
+
+Target-pair profiling on a 128-token run showed the MTP pair probe is not the
+main cost:
+
+```text
+artifact: /tmp/ds4-targetpair-profile-20260512091722.err
+target_eval=91, target_avg=28.694ms
+probe=25, probe_avg=2.767ms
+steps=25, drafted=49, committed=37, full=18, partial=2, adaptive_skip=50
+verify=827.461ms, est_saved=1061.679ms, est_extra=900.141ms, est_net=161.538ms
+```
+
+The exact batch2 stage summary remained dominated by layer work:
+
+```text
+routed_moe:       20.064 ms/step
+attention:        14.333 ms/step
+attn/output_proj: 13.748 ms/step
+attn/q_path:      13.350 ms/step
+shared_gate_up:   11.243 ms/step
+compressor:       10.894 ms/step
+```
+
+Two split-head variants were checked and rejected for the target-pair lane:
+
+```text
+csv: /tmp/ds4-targetpair-splithead-20260512091813.csv
+DS4_MTP_EXACT_TARGET_FIRST_PAIR=1 DS4_MTP_EXACT_N2_SPLIT_HEAD=1
+exact median: 35.61 TPS, 1.030x baseline, hash_matches_baseline=0
+
+csv: /tmp/ds4-targetpair-splithead-capture-20260512092119.csv
+DS4_MTP_EXACT_TARGET_FIRST_PAIR=1 DS4_MTP_EXACT_N2_SPLIT_HEAD=1
+DS4_MTP_N2_CAPTURE_PREFIX1=1
+exact median: 35.73 TPS, 1.034x baseline, hash-identical
+```
+
+The prefix-capture split-head path repaired exactness but remained slower than
+the simpler target-pair default. The current branch therefore promotes
+target-first pair prefetch for strict `--mtp-draft 2` by default. The escape
+hatch is:
+
+```text
+DS4_MTP_NO_EXACT_TARGET_FIRST_PAIR=1
+```
+
+Promotion gate:
+
+```text
+DS4_TEST_MODEL=q4-imatrix DS4_TEST_MTP=current-MTP ./ds4_test --mtp-oracle: OK
+
+csv: /tmp/ds4-targetpair-promoted-20260512092701.csv
+baseline median: 34.60 TPS
+disabled median: 34.56 TPS, hash-identical
+exact median: 36.14 TPS, 1.045x baseline, hash-identical
+target_pair median: 36.16 TPS, 1.045x baseline, hash-identical
+no_target_pair median: 36.00 TPS, 1.040x baseline, hash-identical
+```
+
+This makes target-first pair prefetch the default exact path, but the measured
+win over the previous exact lane is small. The next useful work remains the
+two-row target verifier layer cost, not the MTP pair-probe itself.
+
+No-adaptive ceiling check:
+
+```text
+csv: /tmp/ds4-targetpair-noadaptive-20260512093239.csv
+DS4_MTP_NO_ADAPTIVE=1
+baseline median: 34.56 TPS
+disabled median: 34.60 TPS, hash-identical
+exact median: 36.14 TPS, 1.046x baseline, hash-identical
+no_target_pair median: 36.02 TPS, 1.042x baseline, hash-identical
+```
+
+Removing adaptive cooldown did not materially change the promoted target-pair
+result. Keep the net-aware adaptive path and focus on verifier layer cost.
+
+## 2026-05-12 Exact Batch-Attention Safe Suffix
+
+The all-layer exact batch-attention diagnostic remained fast but unsafe on
+q4-imatrix. A layer-range selector was added:
+
+```text
+DS4_METAL_EXACT_BATCH_ATTENTION_LAYER=N
+DS4_METAL_EXACT_BATCH_ATTENTION_LAYERS=0-3,8,10-42
+DS4_METAL_EXACT_BATCH_ATTENTION_LAYER_MIN=N
+DS4_METAL_EXACT_BATCH_ATTENTION_LAYER_MAX=N
+DS4_METAL_DISABLE_EXACT_BATCH_ATTENTION=1
+```
+
+Coarse and single-layer sweeps showed that early layers can drift even when
+local top-1 checks look fine. On the sustained Python/code prompt:
+
+```text
+full all-layer fast attention: drift, ~37.84 TPS one-shot
+0-10: drift
+11-21: drift
+22-42: hash-identical
+33-42: hash-identical
+```
+
+Single-layer 160-token checks identified candidate-safe early layers, but the
+oracle rejected most composed sets. The strongest q4-imatrix oracle-safe set was:
+
+```text
+14,16-42
+```
+
+Rejected examples:
+
+```text
+7,10,14,16-42: sustained-prompt hash-identical, but q4-imatrix oracle failed
+10,16-42: oracle failed
+7,16-42: oracle failed
+3,14,16-42: oracle failed
+```
+
+The exact verifier now enables fast batch attention by default only for
+`14,16-42`. `DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1` remains the explicit
+diagnostic override for all layers unless a layer selector is supplied.
+
+Promotion gate:
+
+```text
+DS4_TEST_MODEL=q4-imatrix DS4_TEST_MTP=current-MTP ./ds4_test --mtp-oracle: OK
+
+csv: /tmp/ds4-mtp-promoted-fast-attn-20260512102610.csv
+baseline median: 34.60 TPS
+disabled median: 34.62 TPS, hash-identical
+exact median: 37.05 TPS, 1.071x baseline, hash-identical
+no_fast_attn median: 36.11 TPS, 1.044x baseline, hash-identical
+```
+
+This recovered about 2.6% relative to the previous exact verifier on the same
+q4-imatrix sustained-code benchmark. The remaining exact path is still limited
+by verifier layer cost; the full unsafe attention diagnostic suggests the
+remaining fast-attention headroom is small unless the early-layer state drift is
+repaired rather than merely avoided.
+
+Follow-up diagnostics after promotion:
+
+```text
+promoted lower-bound profile: /tmp/ds4-promoted-lb-20260512103056.err
+no-fast lower-bound profile: /tmp/ds4-nofast-lb-20260512103127.err
+
+promoted batch2-lb:
+layers=165.475ms, dispatches=1821.8/step
+routed_moe=20.044ms/step
+attn/output_proj=13.667ms/step
+attn/q_path=13.309ms/step
+attn/attention=13.002ms/step
+shared_gate_up=11.063ms/step
+compressor=10.952ms/step
+
+no-fast batch2-lb:
+layers=167.511ms, dispatches=1871.8/step
+attn/attention=14.326ms/step
+```
+
+The promoted suffix mostly cuts attention dispatches/time, but the largest
+remaining buckets are still heavy layer kernels.
+
+Rejected after promotion:
+
+```text
+DS4_METAL_ROUTED_BATCH_FORCE_MM_ID=1:
+  drifted and slowed to ~32.58 TPS one-shot
+
+DS4_MTP_VERIFY_FUSED_SHARED_GATE_UP=1:
+  hash-identical, ~36.40 TPS one-shot vs exact ~36.42
+
+DS4_MTP_VERIFY_FUSED_SHARED_DOWN_HC=1:
+  hash-identical, ~36.36 TPS one-shot vs exact ~36.42
+
+--mtp-draft 3 / --mtp-draft 4:
+  hash-identical but flat/slower than draft 2 in one-shot checks
+```
+
+All-layer fast attention replay diagnostics:
+
+```text
+DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1:
+  drifted, ~36.85 TPS one-shot
+
+DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1 DS4_MTP_EXACT_REPLAY=1:
+  hash-identical, but slow at ~32.13 TPS
+
+DS4_METAL_ENABLE_EXACT_BATCH_ATTENTION=1 DS4_MTP_NO_CAPTURE_PREFIX1=1:
+  drifted
+```
+
+Replay-all being exact indicates the all-layer fast attention verifier usually
+chooses the same greedy tokens, but its committed verifier state is not exact.
+Disabling prefix capture did not repair drift, so the unsafe state is not only
+the partial-accept path. A real repair would need exact committed hidden/KV
+state from the fast attention rows, not just a different partial-accept policy.

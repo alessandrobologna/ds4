@@ -8195,6 +8195,7 @@ typedef struct {
     const char *name;
     uint64_t n_f32;
     uint64_t hash;
+    float *row;
 } ds4_metal_stage_hash;
 
 typedef struct {
@@ -8202,6 +8203,20 @@ typedef struct {
     uint32_t len;
     bool overflow;
 } ds4_metal_stage_capture;
+
+static bool metal_graph_stage_probe_store_rows(void) {
+    return getenv("DS4_MTP_BATCH_STAGE_DIFF") != NULL;
+}
+
+static void metal_graph_stage_capture_free(ds4_metal_stage_capture *capture) {
+    if (!capture) return;
+    for (uint32_t i = 0; i < capture->len; i++) {
+        free(capture->items[i].row);
+        capture->items[i].row = NULL;
+    }
+    capture->len = 0;
+    capture->overflow = false;
+}
 
 static struct {
     bool active;
@@ -8262,6 +8277,11 @@ static bool metal_graph_stage_probe_capture_tensor(const char *name,
         item->name = name;
         item->n_f32 = row_f32;
         item->hash = hash_bytes(row, bytes);
+        item->row = NULL;
+        if (metal_graph_stage_probe_store_rows()) {
+            item->row = xmalloc((size_t)bytes);
+            memcpy(item->row, row, (size_t)bytes);
+        }
     } else {
         fprintf(stderr, "ds4: failed to read stage probe %s layer %u pos %u n=%u\n",
                 name, il, pos, n_tokens);
@@ -10977,6 +10997,26 @@ static bool metal_graph_router_select_maybe_rows(
                                                     n_tokens) != 0;
     }
 
+    if (getenv("DS4_MTP_VERIFY_HOST_ROW_FALLBACK") == NULL &&
+        getenv("DS4_METAL_DISABLE_ROUTER_EXACT_ROWS_FUSION") == NULL)
+    {
+        return ds4_metal_router_select_exact_rows_tensor(selected,
+                                                        weights,
+                                                        probs,
+                                                        model->map,
+                                                        model->size,
+                                                        exp_probs_b_offset,
+                                                        tid2eid_offset,
+                                                        tid2eid_rows,
+                                                        token_offset,
+                                                        expert_offset,
+                                                        have_exp_probs_b,
+                                                        have_tid2eid,
+                                                        logits,
+                                                        tokens,
+                                                        n_tokens) != 0;
+    }
+
     bool ok = true;
     for (uint32_t t = 0; ok && t < n_tokens; t++) {
         ds4_metal_tensor *selected_row = ds4_metal_tensor_view(
@@ -11143,6 +11183,77 @@ static bool metal_graph_shared_down_hc_q8_maybe_rows(
         ds4_metal_tensor_free(out_hc_row);
     }
     return ok;
+}
+
+static bool metal_graph_route_overlap_profile(uint32_t          il,
+                                              uint32_t          pos0,
+                                              ds4_metal_tensor *selected,
+                                              uint32_t          n_tokens) {
+    static int route_overlap_profile_cache = -1;
+    if (!metal_graph_env_flag("DS4_MTP_ROUTE_OVERLAP_PROFILE", &route_overlap_profile_cache) ||
+        n_tokens != 2 ||
+        !selected)
+    {
+        return true;
+    }
+    if (ds4_metal_synchronize() == 0) {
+        fprintf(stderr,
+                "ds4: failed to synchronize before route-overlap profile layer %u pos %u\n",
+                il,
+                pos0);
+        return false;
+    }
+
+    int32_t ids[2 * DS4_N_EXPERT_USED];
+    if (ds4_metal_tensor_read(selected, 0, ids, sizeof(ids)) == 0) {
+        fprintf(stderr,
+                "ds4: failed to read route-overlap ids layer %u pos %u\n",
+                il,
+                pos0);
+        return false;
+    }
+    if (ds4_metal_begin_commands() == 0) {
+        fprintf(stderr,
+                "ds4: failed to resume Metal command batch after route-overlap profile layer %u pos %u\n",
+                il,
+                pos0);
+        return false;
+    }
+
+    uint32_t same_slot = 0;
+    uint32_t intersect = 0;
+    uint32_t row1_unique[DS4_N_EXPERT_USED];
+    uint32_t row1_unique_len = 0;
+    for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+        bool seen = false;
+        for (uint32_t k = 0; k < row1_unique_len; k++) {
+            if ((int32_t)row1_unique[k] == ids[DS4_N_EXPERT_USED + j]) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) row1_unique[row1_unique_len++] = (uint32_t)ids[DS4_N_EXPERT_USED + j];
+    }
+
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        if (ids[i] == ids[DS4_N_EXPERT_USED + i]) same_slot++;
+        for (uint32_t j = 0; j < row1_unique_len; j++) {
+            if (ids[i] == (int32_t)row1_unique[j]) {
+                intersect++;
+                break;
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: mtp route-overlap layer=%u pos=%u same_slot=%u intersect=%u row0=%d,%d,%d,%d,%d,%d row1=%d,%d,%d,%d,%d,%d\n",
+            il,
+            pos0,
+            same_slot,
+            intersect,
+            ids[0], ids[1], ids[2], ids[3], ids[4], ids[5],
+            ids[6], ids[7], ids[8], ids[9], ids[10], ids[11]);
+    return true;
 }
 
 /* Upload prompt token ids for kernels that need token-aware hash routing. */
@@ -13097,6 +13208,10 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       g->batch_router_logits,
                                                       g->prefill_tokens,
                                                       n_tokens);
+    if (ok) ok = metal_graph_route_overlap_profile(il,
+                                                   pos0,
+                                                   g->batch_router_selected,
+                                                   n_tokens);
     DS4_METAL_FFN_STAGE_PROBE("ffn_moe_probs", g->batch_router_probs, DS4_N_EXPERT);
     DS4_METAL_FFN_STAGE_PROBE("ffn_moe_weights", g->batch_router_weights, DS4_N_EXPERT_USED);
     if (ok) {
@@ -16672,11 +16787,13 @@ struct ds4_session {
     bool mtp_stop_generation;
     bool mtp_speed_audit_enabled;
     bool mtp_tree_oracle_enabled;
+    bool mtp_wiring_audit_enabled;
     bool mtp_oracle_reported;
     bool mtp_batch_probe_reported;
     bool mtp_tree_branch_swap_reported;
     bool mtp_tree_sibling_reported;
     bool mtp_tree_grandchild_reported;
+    uint64_t mtp_wiring_audit_steps;
     uint64_t mtp_tree_root_batch_probe_steps;
     uint64_t mtp_tree_row_kernel_probe_steps;
     uint64_t mtp_tree_full_probe_steps;
@@ -16801,6 +16918,131 @@ typedef enum ds4_mtp_stats_path {
     DS4_MTP_STATS_DECODE2,
     DS4_MTP_STATS_SEQ,
 } ds4_mtp_stats_path;
+
+typedef struct ds4_mtp_wiring_stats {
+    double mean;
+    double rms;
+    float min;
+    float max;
+    uint64_t n;
+    uint64_t finite;
+} ds4_mtp_wiring_stats;
+
+static uint64_t ds4_mtp_wiring_audit_limit(void) {
+    uint64_t limit = 8;
+    const char *env = getenv("DS4_MTP_WIRING_AUDIT_LIMIT");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0 && v < 1000000ull) limit = (uint64_t)v;
+    }
+    return limit;
+}
+
+static bool ds4_metal_tensor_stats_f32(ds4_metal_tensor *t,
+                                       uint64_t          n,
+                                       ds4_mtp_wiring_stats *st) {
+    if (!t || !st || n == 0) return false;
+    float *buf = xmalloc((size_t)n * sizeof(buf[0]));
+    bool ok = ds4_metal_tensor_read(t, 0, buf, n * sizeof(buf[0])) != 0;
+    if (!ok) {
+        free(buf);
+        return false;
+    }
+
+    double sum = 0.0;
+    double sumsq = 0.0;
+    float minv = FLT_MAX;
+    float maxv = -FLT_MAX;
+    uint64_t finite = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const float v = buf[i];
+        if (!isfinite(v)) continue;
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
+        sum += (double)v;
+        sumsq += (double)v * (double)v;
+        finite++;
+    }
+    free(buf);
+
+    st->n = n;
+    st->finite = finite;
+    st->mean = finite ? sum / (double)finite : 0.0;
+    st->rms = finite ? sqrt(sumsq / (double)finite) : 0.0;
+    st->min = finite ? minv : 0.0f;
+    st->max = finite ? maxv : 0.0f;
+    return true;
+}
+
+static void ds4_mtp_wiring_stats_print(const char *name,
+                                       const ds4_mtp_wiring_stats *st) {
+    if (!st || st->finite == 0) {
+        fprintf(stderr, " %s=unavailable", name);
+        return;
+    }
+    fprintf(stderr,
+            " %s[n=%llu finite=%llu mean=%.6g rms=%.6g min=%.6g max=%.6g]",
+            name,
+            (unsigned long long)st->n,
+            (unsigned long long)st->finite,
+            st->mean,
+            st->rms,
+            (double)st->min,
+            (double)st->max);
+}
+
+static void ds4_mtp_wiring_audit_root(ds4_session *s,
+                                      uint32_t     start,
+                                      int          target_token,
+                                      int          mtp_rank,
+                                      float        mtp_margin,
+                                      ds4_metal_tensor *root_out_hc) {
+    if (!s || !s->engine || !s->mtp_wiring_audit_enabled || !s->mtp_logits) return;
+    if (s->mtp_wiring_audit_steps >= ds4_mtp_wiring_audit_limit()) return;
+
+    ds4_metal_graph *g = &s->graph;
+    const uint64_t embd_dim = DS4_N_EMBD;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_mtp_wiring_stats target_hc = {0};
+    ds4_mtp_wiring_stats token_embed = {0};
+    ds4_mtp_wiring_stats mtp_input = {0};
+    ds4_mtp_wiring_stats mtp_out = {0};
+
+    const bool have_target_hc = ds4_metal_tensor_stats_f32(g->cur_hc, hc_dim, &target_hc);
+    const bool have_token_embed = ds4_metal_tensor_stats_f32(g->mtp_embed, embd_dim, &token_embed);
+    const bool have_mtp_input = ds4_metal_tensor_stats_f32(g->mtp_input_hc, hc_dim, &mtp_input);
+    const bool have_mtp_out = ds4_metal_tensor_stats_f32(root_out_hc, hc_dim, &mtp_out);
+
+    int mtp_top = -1;
+    int mtp_second = -1;
+    float mtp_v0 = DS4_NEG_INF;
+    float mtp_v1 = DS4_NEG_INF;
+    logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_top, &mtp_v0, &mtp_second, &mtp_v1);
+
+    fprintf(stderr,
+            "ds4: mtp wiring step=%llu pos=%u source=target_pre_hc_head "
+            "hidden_shape=%ux%u flat=%llu token_embed_shape=%u "
+            "target_token=%d mtp_top=%d mtp_second=%d target_rank_top8=%d "
+            "mtp_margin=%.6g",
+            (unsigned long long)(s->mtp_wiring_audit_steps + 1),
+            start,
+            (unsigned)DS4_N_HC,
+            (unsigned)DS4_N_EMBD,
+            (unsigned long long)hc_dim,
+            (unsigned)DS4_N_EMBD,
+            target_token,
+            mtp_top,
+            mtp_second,
+            mtp_rank,
+            (double)mtp_margin);
+    ds4_mtp_wiring_stats_print("target_hc", have_target_hc ? &target_hc : NULL);
+    ds4_mtp_wiring_stats_print("token_embed", have_token_embed ? &token_embed : NULL);
+    ds4_mtp_wiring_stats_print("mtp_input_hc", have_mtp_input ? &mtp_input : NULL);
+    ds4_mtp_wiring_stats_print("mtp_out_hc", have_mtp_out ? &mtp_out : NULL);
+    fputc('\n', stderr);
+    s->mtp_wiring_audit_steps++;
+}
 
 static int ds4_mtp_adaptive_skip_len(void) {
     int skip_len = 10;
@@ -21791,6 +22033,12 @@ static void ds4_mtp_tree_oracle_check(ds4_session *s, uint32_t start) {
     float mtp_v1 = DS4_NEG_INF;
     logits_top2(saved_mtp_logits, DS4_N_VOCAB, NULL, &mtp_v0, NULL, &mtp_v1);
     mtp_margins[0] = mtp_v0 - mtp_v1;
+    ds4_mtp_wiring_audit_root(s,
+                              start,
+                              target_path[0],
+                              ranks[0],
+                              mtp_margins[0],
+                              saved_mtp_state);
     double mtp_eval_sec = 0.0;
     ds4_metal_tensor *prev_hc = g->mtp_state_hc;
     ds4_metal_tensor *out_hc = g->mtp_next_hc;
@@ -22568,6 +22816,58 @@ static void ds4_mtp_batch_probe_check(ds4_session *s,
                     n1_stages.overflow ? 1 : 0,
                     n2_stages.overflow ? 1 : 0,
                     getenv("DS4_MTP_VERIFY_ROW_FALLBACK") != NULL ? 1 : 0);
+            if (getenv("DS4_MTP_BATCH_STAGE_DIFF") != NULL &&
+                first_stage >= 0 &&
+                (uint32_t)first_stage < stage_count &&
+                n1_stages.items[first_stage].row &&
+                n2_stages.items[first_stage].row &&
+                n1_stages.items[first_stage].n_f32 == n2_stages.items[first_stage].n_f32)
+            {
+                const uint64_t n = n1_stages.items[first_stage].n_f32;
+                const float *a = n1_stages.items[first_stage].row;
+                const float *b = n2_stages.items[first_stage].row;
+                double sum_abs = 0.0;
+                double sum_sq = 0.0;
+                float max_abs = 0.0f;
+                uint64_t first_idx = UINT64_MAX;
+                uint64_t changed = 0;
+                for (uint64_t i = 0; i < n; i++) {
+                    const float d = fabsf(a[i] - b[i]);
+                    if (d != 0.0f) {
+                        if (first_idx == UINT64_MAX) first_idx = i;
+                        changed++;
+                    }
+                    if (d > max_abs) max_abs = d;
+                    sum_abs += (double)d;
+                    sum_sq += (double)d * (double)d;
+                }
+                const double mean_abs = n ? sum_abs / (double)n : 0.0;
+                const double rms = n ? sqrt(sum_sq / (double)n) : 0.0;
+                fprintf(stderr,
+                        "ds4: mtp batch-probe stage-diff pos=%u layer=%u name=%s "
+                        "n=%llu changed=%llu first_idx=%lld max_abs=%.9g "
+                        "mean_abs=%.9g rms=%.9g",
+                        start,
+                        stage_layer,
+                        first_name,
+                        (unsigned long long)n,
+                        (unsigned long long)changed,
+                        first_idx == UINT64_MAX ? -1ll : (long long)first_idx,
+                        (double)max_abs,
+                        mean_abs,
+                        rms);
+                if (first_idx != UINT64_MAX) {
+                    fprintf(stderr,
+                            " first_values=%.9g/%.9g first_delta=%.9g\n",
+                            (double)a[first_idx],
+                            (double)b[first_idx],
+                            (double)(a[first_idx] - b[first_idx]));
+                } else {
+                    fputc('\n', stderr);
+                }
+            }
+            metal_graph_stage_capture_free(&n1_stages);
+            metal_graph_stage_capture_free(&n2_stages);
         }
 
         s->checkpoint.len = saved_len;
@@ -23429,6 +23729,7 @@ static uint32_t ds4_mtp_spec_logits_rows_for_engine(const ds4_engine *e) {
     if (e->mtp_speed) {
         rows = 16;
     } else if (getenv("DS4_MTP_TREE_ORACLE") != NULL ||
+               getenv("DS4_MTP_WIRING_AUDIT") != NULL ||
                getenv("DS4_MTP_TREE_STATE_PLAN") != NULL ||
                getenv("DS4_MTP_TREE_BRANCH_ORACLE") != NULL ||
                getenv("DS4_MTP_EXACT_TREE_VERIFY") != NULL ||
@@ -23486,6 +23787,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->mtp_speed_audit_enabled = getenv("DS4_MTP_SPEED_AUDIT") != NULL;
     s->mtp_tree_oracle_enabled =
         getenv("DS4_MTP_TREE_ORACLE") != NULL ||
+        getenv("DS4_MTP_WIRING_AUDIT") != NULL ||
         getenv("DS4_MTP_EXACT_TREE_VERIFY") != NULL ||
         getenv("DS4_MTP_TREE_BATCH_PLAN") != NULL ||
         getenv("DS4_MTP_TREE_STATE_ALLOC") != NULL ||
@@ -23499,6 +23801,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         getenv("DS4_MTP_TREE_ROW_KERNEL_PROBE") != NULL ||
         getenv("DS4_MTP_TREE_FULL_PROBE") != NULL ||
         getenv("DS4_MTP_TREE_DEPTH_BATCH_PROBE") != NULL;
+    s->mtp_wiring_audit_enabled = getenv("DS4_MTP_WIRING_AUDIT") != NULL;
     s->mtp_stats_enabled =
         s->mtp_stats_print ||
         s->mtp_speed_audit_enabled ||

@@ -2432,3 +2432,912 @@ pair2 layer_dispatch: 1803.8
 
 This repeats the earlier lesson from the routed-down+HC fusion: dispatch count
 alone is not the bottleneck once the heavy matvec reduction is preserved.
+
+## 2026-05-11 Fast-Router Batch Fusion Falsifier
+
+The next measured candidate was a tiny-batch router finalizer for the exact
+verifier. The prototype extended decode's one-token
+`kernel_dsv4_router_probs_finalize_weights_one` shape to verifier batches, so
+`DS4_MTP_VERIFY_FAST_ROUTER=1` could process both N=2 rows in one dispatch
+instead of the generic softplus/sqrt/top-k/get-rows/sum/div/scale helper chain.
+
+The q4 oracle passed with `DS4_MTP_VERIFY_FAST_ROUTER=1`, but the stronger
+sustained-code benchmark showed that the fast-router verifier lane itself is
+not hash-identical and therefore still cannot be promoted:
+
+```text
+artifact: /tmp/ds4-routerbatch-fastrouter-prod-20260511222309.csv
+baseline median: 34.89 TPS, hashes=1
+disabled/no-open median: 34.90 TPS, hashes=1, hash_matches_baseline=1
+exact median: 39.12 TPS, hashes=1, hash_matches_baseline=0
+exact_vs_baseline: 1.121
+```
+
+A one-run control with the new batch router fusion disabled also drifted:
+
+```text
+artifact: /tmp/ds4-fastrouter-disabled-prod-20260511222634.csv
+baseline: 34.94 TPS, bytes=1080
+exact: 37.55 TPS, bytes=1102, hash_matches_baseline=0
+```
+
+So the batch router fusion was not the source of the drift; it only made an
+already non-exact diagnostic lane faster. The lower-bound A/B is still useful
+as evidence:
+
+```text
+env: DS4_MTP_VERIFY_FAST_ROUTER=1
+
+fused artifact: /tmp/ds4-fastrouter-fused-lb-20260511222225.err
+fused batch2: 38.814 ms
+fused layers: 37.543 ms
+fused layer_dispatch: 1814.9
+fused final_mismatch: 1
+
+disabled artifact: /tmp/ds4-fastrouter-disabled-lb-20260511222238.err
+disabled batch2: 40.832 ms
+disabled layers: 39.571 ms
+disabled layer_dispatch: 2157.2
+disabled final_mismatch: 1
+```
+
+The prototype was reverted. Exact-mode work should not use
+`DS4_MTP_VERIFY_FAST_ROUTER=1` until the row/batch router mismatch is repaired;
+router batching is a performance win only after that semantic issue is closed.
+
+A narrower repair then replaced only the fast-router batch weight-normalization
+tail with an exact six-element left-to-right reduction. The N1/N2 layer probe
+confirmed that this fixed the first layer-0 `ffn_moe_weights` mismatch and
+moved the first probe mismatch later:
+
+```text
+artifact: /tmp/ds4-router-weight-exact-probe-20260511223423.err
+before: first_stage=ffn_moe_weights at layer 0
+after: layer 0 first_stage=-1, first_attn=2, first_ffn=2
+```
+
+However, the production gate still drifted, so the repair was also reverted:
+
+```text
+artifact: /tmp/ds4-router-weight-exact-prod-20260511223555.csv
+baseline median: 34.84 TPS, hashes=1
+disabled/no-open median: 34.85 TPS, hashes=1, hash_matches_baseline=1
+exact median: 38.73 TPS, hashes=1, hash_matches_baseline=0
+exact_vs_baseline: 1.112
+```
+
+Conclusion: fast-router has at least one real six-weight normalization mismatch,
+but repairing that alone is insufficient. The lane remains useful as a
+diagnostic for future batch-router semantics, not as an exact speed feature.
+
+## 2026-05-11 Q8 Q/KV Dual-Pair Falsifier
+
+The next heavier kernel prototype combined the two exact N=2 Q8 row-pair
+projections at the start of the attention path:
+
+```text
+attn_q_a: batch_attn_norm -> batch_qr
+attn_kv:  batch_attn_norm -> batch_kv_raw
+```
+
+Both projections share the same normalized input and already use the exact
+pair2 Q8 reduction. The prototype preserved that per-row reduction and combined
+the two matrices into one dispatch. The q4 oracle passed, but the lower-bound
+regressed even though dispatch count dropped:
+
+```text
+fused artifact: /tmp/ds4-q8dual-fused-lb-20260511224441.err
+fused batch2: 39.908 ms
+fused layers: 38.637 ms
+fused layer_dispatch: 1815.6
+
+disabled artifact: /tmp/ds4-q8dual-disabled-lb-20260511224454.err
+disabled batch2: 39.326 ms
+disabled layers: 38.062 ms
+disabled layer_dispatch: 1857.9
+```
+
+This was reverted without a production run. It is another negative result for
+"fewer dispatches by merging independent exact matvecs": on Studio q4 the
+merged kernel schedules worse than two existing exact Q8 pair2 dispatches.
+
+## 2026-05-11 Routed-Down Sum6 Pair2 Falsifier
+
+The next routed-MoE candidate specialized q4 routed-down `sum6` for exact
+batch2. The idea was to compute both verifier rows inside one q4 down-sum
+kernel and reuse the dequantized down-weight block when the same expert appears
+in the same router slot for both rows, while keeping the per-token expert-slot
+accumulation order.
+
+The q4 oracle passed, but the stronger batch2 lower-bound rejected it: the new
+pair2 path produced top/final mismatches and was slower than the restored
+default.
+
+```text
+fused artifact: /tmp/ds4-downpair2-lb.err
+fused steps: 65
+fused top_mismatch: 45
+fused final_mismatch: 45
+fused batch2: 43.469 ms
+fused layers: 42.198 ms
+fused layer_dispatch: 1857.2
+
+disabled artifact: /tmp/ds4-downpair2-disabled-lb.err
+disabled steps: 49
+disabled top_mismatch: 0
+disabled final_mismatch: 0
+disabled batch2: 39.449 ms
+disabled layers: 38.177 ms
+disabled layer_dispatch: 1848.4
+```
+
+The prototype was reverted. This closes the simple "compute both rows in one
+q4 sum6 kernel" avenue for now; any routed-down rewrite needs a cleaner exact
+unit test for sum6 pair semantics before it is worth another production gate.
+
+## 2026-05-11 Exact Router Row Fusion Promotion
+
+The next promoted kernel change batches the exact one-token router fast path
+for verifier rows. Instead of looping over N=2 verifier rows on the host and
+encoding one decode-style router dispatch per row, the new
+`kernel_dsv4_router_probs_finalize_weights_rows` launches one threadgroup per
+row in a single dispatch. Each row still runs the same
+`sqrt(softplus(logit))`, top-k, and six-weight normalization order as the
+decode one-token kernel, so this is different from the older non-exact generic
+`DS4_MTP_VERIFY_FAST_ROUTER=1` lane. The escape hatch is:
+
+```sh
+DS4_METAL_DISABLE_ROUTER_EXACT_ROWS_FUSION=1
+```
+
+Studio q4 validation:
+
+```text
+oracle: OK
+
+fused artifact: /tmp/ds4-routerrows-lb.err
+fused steps: 49
+fused top_mismatch: 0
+fused final_mismatch: 0
+fused batch2: 38.879 ms
+fused layers: 37.607 ms
+fused layer_dispatch: 1805.4
+fused layer_views: 621.1
+
+disabled artifact: /tmp/ds4-routerrows-disabled-lb.err
+disabled steps: 49
+disabled top_mismatch: 0
+disabled final_mismatch: 0
+disabled batch2: 39.503 ms
+disabled layers: 38.228 ms
+disabled layer_dispatch: 1848.4
+disabled layer_views: 1051.1
+```
+
+The 5-run sustained Python/code production gate with the row fusion enabled:
+
+```text
+artifact: /tmp/ds4-routerrows-prod.csv
+baseline median: 34.71 TPS, hashes=1
+disabled/no-open median: 34.71 TPS, hashes=1, hash_matches_baseline=1
+exact median: 39.22 TPS, hashes=1, hash_matches_baseline=1
+exact_vs_baseline: 1.130
+speed median: 38.76 TPS
+speed_vs_baseline: 1.117
+```
+
+The same build with `DS4_METAL_DISABLE_ROUTER_EXACT_ROWS_FUSION=1` measured:
+
+```text
+artifact: /tmp/ds4-routerrows-disabled-prod.csv
+baseline median: 34.60 TPS, hashes=1
+disabled/no-open median: 34.63 TPS, hashes=1, hash_matches_baseline=1
+exact median: 38.89 TPS, hashes=1, hash_matches_baseline=1
+exact_vs_baseline: 1.124
+speed median: 38.63 TPS
+speed_vs_baseline: 1.116
+```
+
+This keeps exact MTP hash-identical and adds a small but real production gain
+over the prior exact path: about `+0.33 TPS` on this sustained-code run, with a
+matching lower-bound improvement of about `0.62 ms` per batch2 verifier. It is
+not a 1.5x lever, but it is a clean exact verifier kernel reduction and should
+stay promoted.
+
+## 2026-05-12 Q4 Routed-Down Pair2 Rewrite Recheck
+
+After the exact router row promotion, the q4 routed-down `sum6` pair2 rewrite
+was retried as a verifier-only native batch2 unit. This version kept the exact
+two-row semantics and was gated behind `DS4_METAL_ROUTED_DOWN_PAIR2_SUM6=1`.
+
+Validation:
+
+```text
+oracle: OK
+```
+
+The stage-summary lower-bound stayed exact, but showed the routed-MoE bucket
+moving in the wrong direction:
+
+```text
+disabled stage artifact: /tmp/ds4-downpair2-v2-disabled-20260512012610.err
+disabled stage batch2: 162.686 ms
+disabled stage routed_moe: 19.704 ms/step
+
+fused stage artifact: /tmp/ds4-downpair2-v2-fused-stage-20260512012644.err
+fused stage batch2: 166.379 ms
+fused stage routed_moe: 20.035 ms/step
+```
+
+The normal lower-bound A/B was also exact, but flat to slightly slower:
+
+```text
+disabled artifact: /tmp/ds4-downpair2-v2-disabled-lb-20260512012717.err
+disabled steps: 64
+disabled top_mismatch: 0
+disabled final_mismatch: 0
+disabled batch2: 39.024 ms
+disabled layers: 37.746 ms
+disabled layer_dispatch: 1805.8
+
+fused artifact: /tmp/ds4-downpair2-v2-fused-lb-20260512012730.err
+fused steps: 64
+fused top_mismatch: 0
+fused final_mismatch: 0
+fused batch2: 39.062 ms
+fused layers: 37.785 ms
+fused layer_dispatch: 1805.8
+```
+
+This prototype was removed without a production benchmark. The existing
+`sum6` path is already one dispatch over the two verifier rows, so simply
+making row-pair ownership explicit does not reduce dispatch count and does not
+improve layer time. A useful routed-MoE rewrite must change the arithmetic
+unit itself, for example by sharing expert/block work across matching row
+routes, not by repackaging the same per-token `sum6` work.
+
+## 2026-05-12 Shared Gate/Up Pair2 Falsifier
+
+The next row-pair rewrite targeted the shared expert gate/up Q8 path. The
+existing opt-in exact rows path, enabled with
+`DS4_MTP_VERIFY_FUSED_SHARED_GATE_UP=1`, already used one dispatch for both
+verifier rows. The tested rewrite tried to go further by streaming each Q8
+gate/up weight row once per threadgroup and computing verifier rows 0 and 1
+side by side while preserving the same Q8 reduction order per output row.
+
+Studio q4 validation:
+
+```text
+metal-kernels: OK
+oracle: OK
+```
+
+The first no-env A/B was invalid as a promotion signal because the shared
+gate/up rows path is still behind `DS4_MTP_VERIFY_FUSED_SHARED_GATE_UP=1`; it
+mostly measured normal run noise:
+
+```text
+no-env default artifact: /tmp/ds4-shgatepair2-fused-prod-20260512013512.csv
+exact median: 39.39 TPS, hash_matches_baseline=1
+
+no-env escape-hatch artifact: /tmp/ds4-shgatepair2-disabled-prod-20260512013837.csv
+exact median: 39.30 TPS, hash_matches_baseline=1
+```
+
+After forcing the fused shared gate/up lane on, the true A/B showed the new
+pair2 kernel was exact but slower than the existing row-batched fused kernel:
+
+```text
+env: DS4_MTP_VERIFY_FUSED_SHARED_GATE_UP=1
+pair2 artifact: /tmp/ds4-fusedshgate-pair2-lb-20260512014332.err
+pair2 steps: 64
+pair2 top_mismatch: 0
+pair2 final_mismatch: 0
+pair2 batch2: 39.418 ms
+pair2 layers: 38.150 ms
+pair2 layer_dispatch: 1719.8
+
+env: DS4_MTP_VERIFY_FUSED_SHARED_GATE_UP=1 DS4_METAL_DISABLE_SHARED_GATE_UP_PAIR2=1
+rows artifact: /tmp/ds4-fusedshgate-rows-lb-20260512014345.err
+rows steps: 64
+rows top_mismatch: 0
+rows final_mismatch: 0
+rows batch2: 38.544 ms
+rows layers: 37.281 ms
+rows layer_dispatch: 1719.8
+```
+
+The older fused shared gate/up rows lane itself was also rechecked after the
+later exact-kernel promotions and remained below the no-env current default:
+
+```text
+env: DS4_MTP_VERIFY_FUSED_SHARED_GATE_UP=1 DS4_METAL_DISABLE_SHARED_GATE_UP_PAIR2=1
+artifact: /tmp/ds4-fusedshgate-rows-prod-20260512014430.csv
+baseline median: 34.77 TPS, hashes=1
+disabled/no-open median: 34.72 TPS, hashes=1, hash_matches_baseline=1
+exact median: 39.28 TPS, hashes=1, hash_matches_baseline=1
+exact_vs_baseline: 1.130
+speed median: 38.82 TPS
+```
+
+The pair2 rewrite was removed. This closes the shared gate/up row-pair
+arithmetic rewrite as a non-promotable path for now: the row-batched diagnostic
+is exact and dispatch-efficient, but the new native pair2 arithmetic shape
+schedules worse, and the diagnostic lane still does not beat the current
+no-env exact path.
+
+## 2026-05-12 Q8 Pair2 NR1 Falsifier
+
+The next row-pair matvec family probe changed the general exact Q8 pair2
+matvec from the promoted `nr0=2` output-row grouping to a narrower `nr0=1`
+specialization, enabled only by `DS4_METAL_EXACT_Q8_PAIR2_NR1=1`. The idea was
+to increase row parallelism for the high-count Q8 verifier stages.
+
+Validation:
+
+```text
+env: DS4_METAL_EXACT_Q8_PAIR2_NR1=1
+oracle: OK
+```
+
+Lower-bound A/B on the sustained Python/code prompt:
+
+```text
+nr2 artifact: /tmp/ds4-q8pair2-nr2-lb-20260512015159.err
+nr2 steps: 64
+nr2 top_mismatch: 0
+nr2 final_mismatch: 0
+nr2 batch2: 38.704 ms
+nr2 layers: 37.437 ms
+nr2 layer_dispatch: 1805.8
+
+nr1 artifact: /tmp/ds4-q8pair2-nr1-lb-20260512015213.err
+nr1 steps: 64
+nr1 top_mismatch: 0
+nr1 final_mismatch: 0
+nr1 batch2: 40.665 ms
+nr1 layers: 39.402 ms
+nr1 layer_dispatch: 1805.8
+```
+
+The `nr0=1` specialization was removed without a production benchmark. It was
+exact, but the extra row parallelism hurt layer time by about `2 ms` per batch2
+verifier. Together with the earlier `nr0=4` negative result, this makes the
+current `nr0=2` Q8 pair2 grouping the best tested point for this kernel family
+on Studio q4.
+
+## 2026-05-12 Radical Routed-MoE Grouped-MM Falsifier
+
+The current stage-summary still points at routed MoE as the largest synchronized
+verifier bucket, but the obvious helper fusions have already been exhausted:
+
+```text
+artifact: /tmp/ds4-current-stage-summary-20260512042041.err
+batch2: 163.565 ms
+layers: 162.306 ms
+
+rank 1: ffn/routed_moe 19.790 ms/step
+rank 2: attn/output_proj 13.482 ms/step
+rank 3: attn/q_path 13.143 ms/step
+rank 4: attn/attention 12.520 ms/step
+rank 5: ffn/shared_gate_up 10.865 ms/step
+rank 6: attn/compressor 10.756 ms/step
+rank 7: ffn/hc_pre 10.542 ms/step
+rank 8: attn/hc_pre 9.983 ms/step
+rank 9: ffn/router 9.394 ms/step
+rank 10: ffn/shared_down 9.333 ms/step
+```
+
+The next radical routed-MoE attempt forced the existing expert-grouped
+`mul_mm_id` path even for the tiny N=2 verifier batch:
+
+```text
+env: DS4_METAL_ROUTED_BATCH_FORCE_MM_ID=1
+oracle: OK
+```
+
+This is closer to the intended rewrite than another dispatch helper fusion,
+because it groups work by selected expert across the verifier rows instead of
+executing the selected expert matvecs as independent row/expert pairs. It was
+not viable on Studio q4:
+
+```text
+control artifact: /tmp/ds4-mmforce-control-lb-20260512042243.err
+control steps: 64
+control top_mismatch: 0
+control final_mismatch: 0
+control batch2: 38.951 ms
+control layers: 37.691 ms
+control layer_dispatch: 1805.8
+
+forced artifact: /tmp/ds4-mmforce-forced-lb-20260512042243.err
+forced steps: 64
+forced top_mismatch: 1
+forced final_mismatch: 1
+forced batch2: 86.634 ms
+forced layers: 85.371 ms
+forced layer_dispatch: 2176.6
+```
+
+The grouped path is both slower and not equivalent in the lower-bound verifier,
+so it was not promoted and does not deserve a production benchmark. The likely
+reason is that the expert-major GEMM path has too much map/setup/tiling overhead
+for two verifier rows and does not preserve the exact tiny-row reduction/order
+semantics.
+
+## 2026-05-12 F16 Pair2 NR4 Falsifier
+
+The row-pair matvec fallback then tried the other native setting already
+supported by the exact F16 pair2 kernel. The existing kernel supports `nr0=4`,
+but most verifier F16 projections run with `nr0=2`; an opt-in
+`DS4_METAL_EXACT_F16_PAIR2_NR4=1` prototype forced `nr0=4` for exact N=2 F16
+rows and paired F16 compressor projections.
+
+Validation:
+
+```text
+env: DS4_METAL_EXACT_F16_PAIR2_NR4=1
+oracle: OK
+```
+
+Lower-bound A/B:
+
+```text
+control artifact: /tmp/ds4-f16nr4-control-lb-20260512042648.err
+control steps: 64
+control top_mismatch: 0
+control final_mismatch: 0
+control batch2: 38.921 ms
+control layers: 37.638 ms
+control layer_dispatch: 1805.8
+
+nr4 artifact: /tmp/ds4-f16nr4-lb-20260512042648.err
+nr4 steps: 64
+nr4 top_mismatch: 0
+nr4 final_mismatch: 0
+nr4 batch2: 39.603 ms
+nr4 layers: 38.332 ms
+nr4 layer_dispatch: 1805.8
+```
+
+The prototype was exact, but slower by about `0.68 ms` per batch2 verifier, so
+it was removed. Together with the earlier Q8 `nr0=1`/`nr0=4` probes, this says
+the current row-pair matvec grouping is near the useful point for Studio q4:
+making rows wider or narrower does not create the missing speedup.
+
+## 2026-05-12 Radical Q4-Only Goal Audit
+
+The active goal is not complete. Mapping its requirements to current evidence:
+
+```text
+Gate model: old Studio q4, not q4-imatrix
+model: /Users/studio/.ds4/cache/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf
+mtp: /Users/studio/.ds4/cache/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+```
+
+The promoted exact verifier remains hash-identical and above baseline on the
+sustained-code q4 gate:
+
+```text
+artifact: /tmp/ds4-goal-final-clean-prod-20260512031214.csv
+baseline median: 34.91 TPS
+disabled median: 34.95 TPS
+disabled hash_matches_baseline: 1
+exact median: 39.51 TPS
+exact_vs_baseline: 1.132
+exact hash_matches_baseline: 1
+speed median: 38.96 TPS
+oracle: OK
+```
+
+The routed-MoE rewrite requirement is only partially satisfied. The promoted
+router exact-rows kernel removes a repeated per-row helper dispatch and is part
+of the current `1.13x` q4 result, but the attempted native grouped routed-MoE
+path was both slower and not equivalent:
+
+```text
+control artifact: /tmp/ds4-mmforce-control-lb-20260512042243.err
+control batch2: 38.951 ms
+control layers: 37.691 ms
+control top_mismatch/final_mismatch: 0/0
+
+forced grouped-MoE artifact: /tmp/ds4-mmforce-forced-lb-20260512042243.err
+forced batch2: 86.634 ms
+forced layers: 85.371 ms
+forced top_mismatch/final_mismatch: 1/1
+```
+
+The required "prove per-layer equivalence" gate needed a stricter check than
+hashing. End-to-end q4 exact generation is hash-identical, but the strict N1/N2
+stage probe sees the first byte-level row mismatch before routed MoE:
+
+```text
+artifact: /tmp/ds4-goal-stage-probe-20260512041513.err
+n1_ok: 1
+n2_ok: 1
+first_attn: 0
+first_ffn: 0
+first_stage: 1
+first_name: hc_mix
+row_f32: 24
+row_fallback: 0
+```
+
+Follow-up toggles did not move the first mismatch:
+
+```text
+default: /tmp/ds4-f16-stage-default-20260512041631.err
+DS4_MTP_VERIFY_FAST_F16=1: /tmp/ds4-f16-stage-fast_f16-20260512041636.err
+DS4_MTP_VERIFY_HOST_ROW_FALLBACK=1: /tmp/ds4-f16-stage-host_row-20260512041642.err
+DS4_METAL_DISABLE_EXACT_ROWS_PAIR2=1: /tmp/ds4-f16pair2-disable_pair2-20260512042344.err
+
+result: first mismatch remains layer0 hc_mix
+```
+
+The stage probe was extended with a default-off numeric diff mode:
+
+```text
+env: DS4_MTP_BATCH_STAGE_DIFF=1
+```
+
+On the default optimized exact verifier, the first layer0 `hc_mix` hash mismatch
+is tiny and consistent with F16 row-pair reduction-order noise:
+
+```text
+artifact: /tmp/ds4-stage-diff-20260512051526.err
+pos: 59
+layer: 0
+first_stage: hc_mix
+n: 24
+changed: 14
+max_abs: 0.000122070312
+mean_abs: 6.84215289e-06
+rms: 2.57076228e-05
+first_values: 31.3918571 / 31.391861
+```
+
+Forcing true row fallback plus host-row F16 makes layer0 stage-identical and
+moves the first hash mismatch to layer2:
+
+```text
+env:
+DS4_MTP_VERIFY_ROW_FALLBACK=1
+DS4_MTP_VERIFY_HOST_ROW_FALLBACK=1
+
+artifact: /tmp/ds4-stage-diff-row-hostrow-20260512051632.err
+first_attn: 2
+first_ffn: 2
+layer0 first_stage: -1
+```
+
+Layer2 is also only a tiny numeric difference:
+
+```text
+artifact: /tmp/ds4-stage-diff-row-hostrow-l2-20260512051700.err
+first_stage: kqv_out
+n: 32768
+changed: 9919
+max_abs: 4.76837158e-07
+mean_abs: 7.08483172e-09
+rms: 1.98137699e-08
+first_values: 0.471306264 / 0.471306235
+```
+
+So the old-q4 verifier is not bit-identical at every intermediate row, but the
+measured row deltas are at float-noise scale and the end-to-end q4 output gate is
+hash-identical. This satisfies the practical old-q4 equivalence question, while
+still keeping q4-imatrix and Q2 as divergence-tracking cases because those quants
+show production output drift in the optimized fast verifier.
+
+An opt-in route-overlap profiler was also added:
+
+```text
+env: DS4_MTP_ROUTE_OVERLAP_PROFILE=1
+```
+
+It synchronizes and restarts the Metal command batch around the router-selected
+expert ids, so it is diagnostic-only and should not be used for timing. The
+purpose is to decide whether a deeper routed-MoE pair2 rewrite can reuse enough
+expert work across the two verifier rows.
+
+On a 12-step sustained-code lower-bound sample:
+
+```text
+artifact: /tmp/ds4-route-overlap-20260512052420.err
+samples: 817 layer/step router selections
+avg_same_slot: 0.756 / 6
+avg_intersect: 2.479 / 6
+full_intersect_pct: 0.37%
+zero_intersect_pct: 9.79%
+top_mismatch/final_mismatch: 0/0
+```
+
+This weakens the case for another same-slot expert-sharing kernel. The two
+speculative rows often share some experts, but rarely in the same route slot and
+almost never share all six. A useful routed-MoE rewrite would need to be
+expert-set based or materially change the gate/up/down arithmetic, not merely
+cache same-slot q4 blocks across row0/row1.
+
+The default-off diagnostics do not perturb the old-q4 production gate:
+
+```text
+artifact: /tmp/ds4-post-diagnostics-prod-20260512052655.csv
+baseline median: 34.90 TPS
+disabled median: 34.88 TPS
+disabled_vs_baseline: 0.999
+disabled hash_matches_baseline: 1
+exact median: 39.52 TPS
+exact_vs_baseline: 1.132
+exact hash_matches_baseline: 1
+speed median: 39.03 TPS
+speed_vs_baseline: 1.118
+```
+
+Completion audit for this radical routed-MoE phase:
+
+```text
+Native N=2 verifier unit:
+  partial success. Router exact rows are promoted; routed-down pair2, shared
+  gate/up pair2, F16/Q8 row-width variants, and grouped-MoE were tested.
+
+Fuse routed-MoE hot path where feasible:
+  not promotable. Grouped-MoE was slower and not equivalent. Same-slot expert
+  sharing is weak according to route-overlap data. Gate/up and down pair2
+  shapes were exact only after reverting to schedules that did not improve
+  layer time.
+
+Per-layer equivalence:
+  practical old-q4 equivalence is established. Strict hashes differ, but the
+  measured row deltas are float-order scale and production output is
+  hash-identical. q4-imatrix and Q2 remain outside this exact-fast guarantee.
+
+Required gates:
+  q4 oracle: OK
+  batch2 lower-bound A/B: run for the promoted router rows and negative
+  routed/row-pair candidates.
+  5-run sustained-code benchmark: exact q4 remains 1.132x baseline and
+  hash-identical.
+
+Keep/reject:
+  keep router exact-rows fusion and default-off diagnostics.
+  reject grouped-MoE, routed-down pair2, shared gate/up pair2, Q8 nr0=1,
+  F16 nr0=4, and same-slot expert-sharing as the next path.
+```
+
+Verdict: the current implementation has a real exact q4 gain, but the radical
+routed-MoE rewrite path is falsified at the current engineering depth. A future
+attempt should not be another helper fusion or same-slot row-pair kernel; it
+would need a larger expert-set based MoE scheduler or a broader layer rewrite
+that changes arithmetic locality, with its own lower-bound prototype first.
+
+The remaining useful work is therefore narrow:
+
+```text
+1. Keep the old q4 path as the performance gate.
+2. Treat q4-imatrix and Q2 as divergence-tracking cases.
+3. Do not claim the radical routed-MoE rewrite as complete.
+4. Treat the hc_mix stage hash mismatch as explained float-order noise on old q4
+   unless a future quant/prompt turns it into a top-token or output drift.
+5. Continue only with kernel rewrites that change heavy matvec/MoE arithmetic,
+   not helper dispatch count alone.
+```
+
+## 2026-05-12 Q4 Imatrix Quant Validation
+
+A new q4 imatrix base quant was downloaded to Studio and tested without a
+symlink, using the explicit model path in every command:
+
+```text
+model: /Users/studio/.ds4/cache/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf
+size: 153G
+mtp: /Users/studio/.ds4/cache/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+```
+
+The short q4 MTP oracle passes:
+
+```text
+DS4_TEST_MODEL=<q4-imatrix>
+DS4_TEST_MTP=<mtp>
+./ds4_test --mtp-oracle
+
+result: mtp-oracle: OK
+```
+
+The batch2 lower-bound verifier is exact on the sampled rows and similar to the
+old q4 path:
+
+```text
+artifact: /tmp/ds4-q4imatrix-lb-20260512035758.err
+steps: 64
+top_mismatch: 0
+final_mismatch: 0
+seq2: 57.145 ms
+batch2: 39.133 ms
+speedup: 1.460x
+layers: 37.859 ms
+layer_dispatch: 1827.4
+```
+
+However, the sustained-code production gate exposes drift in the optimized fast
+verifier path:
+
+```text
+artifact: /tmp/ds4-q4imatrix-prod-20260512035831.csv
+baseline median: 34.66 TPS
+disabled median: 34.63 TPS
+disabled_vs_baseline: 0.999
+disabled hash_matches_baseline: 1
+exact median: 38.00 TPS
+exact_vs_baseline: 1.096
+exact hash_matches_baseline: 0
+speed median: 38.83 TPS
+speed_vs_baseline: 1.120
+```
+
+The conservative decode2 verifier restores exactness, but falls below baseline:
+
+```text
+env: DS4_MTP_DECODE2_EXACT=1
+artifact: /tmp/ds4-q4imatrix-decode2-prod-20260512040253.csv
+baseline median: 34.70 TPS
+disabled median: 34.62 TPS
+disabled_vs_baseline: 0.998
+disabled hash_matches_baseline: 1
+exact median: 33.16 TPS
+exact_vs_baseline: 0.956
+exact hash_matches_baseline: 1
+speed median: 38.77 TPS
+speed_vs_baseline: 1.117
+```
+
+Saved one-off outputs confirm the same boundary:
+
+```text
+baseline: /tmp/ds4-q4imatrix-baseline-20260512040728.out
+fast exact: /tmp/ds4-q4imatrix-fast-exact-20260512040728.out
+safe decode2: /tmp/ds4-q4imatrix-safe-decode2-20260512040728.out
+
+baseline sha256: d83dd8bbe8a103b5d1b9730c8d119bd126c37fa19775c6d63798496bf9450f4f
+fast exact sha256: 5b4f2b2a829180d44f033ddc2b572d2316ec6c124d20c0ce93d7af1aea1783e1
+safe decode2 sha256: d83dd8bbe8a103b5d1b9730c8d119bd126c37fa19775c6d63798496bf9450f4f
+```
+
+The first visible output diff is harmless-looking source organization drift,
+but it is still exactness failure:
+
+```diff
+-import csv
+ import argparse
++import csv
+ import sys
+ from collections import defaultdict
+-from typing import List, Dict, Any, Optional
++from typing import Dict, List, Any, Optional
+
+-def read_csv(file_path: str) -> List[Dict[str, str]]:
+-    """Read a CSV file and return a list of dictionaries."""
++def read_csv_rows(file_path: str) -> List[Dict[str, str]]:
++    """Read CSV file and return list of dictionaries."""
+```
+
+Tree-oracle comparison on the same sustained-code prompt did not show an
+obvious q4-imatrix containment win. Both runs used:
+
+```text
+DS4_MTP_TREE_ORACLE=1
+DS4_MTP_TREE_BRANCH_ORACLE=1
+DS4_MTP_TREE_ORACLE_DEPTH=3
+```
+
+Q4 imatrix:
+
+```text
+artifact: /tmp/ds4-q4imatrix-tree-oracle-20260512041007.err
+steps: 20
+full-top1 avg_accept_len: 2.05
+full-top2 avg_accept_len: 2.45
+full-top4 avg_accept_len: 2.60
+full-top8 avg_accept_len: 2.70
+dynamic depth>=2:2_else4 avg_accept_len: 2.60
+pos1 <=top1/top2/top4/top8: 95.0% / 100.0% / 100.0% / 100.0%
+pos2 <=top1/top2/top4/top8: 75.0% / 95.0% / 100.0% / 100.0%
+pos3 <=top1/top2/top4/top8: 50.0% / 55.0% / 60.0% / 70.0%
+```
+
+Old q4, same prompt/settings:
+
+```text
+artifact: /tmp/ds4-q4old-tree-oracle-20260512041047.err
+steps: 20
+full-top1 avg_accept_len: 1.75
+full-top2 avg_accept_len: 2.40
+full-top4 avg_accept_len: 2.75
+full-top8 avg_accept_len: 2.95
+dynamic depth>=2:2_else4 avg_accept_len: 2.60
+pos1 <=top1/top2/top4/top8: 80.0% / 90.0% / 95.0% / 100.0%
+pos2 <=top1/top2/top4/top8: 75.0% / 90.0% / 95.0% / 100.0%
+pos3 <=top1/top2/top4/top8: 60.0% / 80.0% / 90.0% / 95.0%
+```
+
+Conclusion: the new q4 imatrix file loads and passes the short oracle, but it
+should not replace old q4 as the exact-MTP kernel gate yet. With the current
+optimized verifier, q4-imatrix behaves like the tracked Q2 divergence case:
+fast mode is faster but drifts, while decode2 is exact but slower than
+baseline. Keep old q4 as the main hash-identical performance target until the
+fast verifier equivalence issue is repaired for imatrix quantization too.
+
+## 2026-05-12 Q2 Divergence Tracking Boundary
+
+Q2/IQ2 is now treated as a tracked divergence case, not the main exact-MTP
+performance target. The kernel work should continue against Studio q4, where
+the current fast exact verifier is hash-identical on the sustained-code gate.
+
+Old non-imatrix Q2:
+
+```text
+model: DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf
+artifact: /tmp/ds4-q2-q2-current.csv
+baseline median: 35.91 TPS
+fast exact median: 39.75 TPS
+exact_vs_baseline: 1.107
+hash_matches_baseline: 0
+
+safe fallback:
+DS4_MTP_DECODE2_EXACT=1
+baseline median: 35.90 TPS
+exact median: 34.96 TPS
+exact_vs_baseline: 0.974
+hash_matches_baseline: 1
+```
+
+The Q2 oracle exposed the fast verifier mismatch directly:
+
+```text
+pos=40 draft0=8007 draft1=14
+seq_top0=295
+exact_top0=295
+fast_top0=14
+```
+
+So the unsafe speed came from the optimized suffix verifier accepting a draft
+that the target-equivalent decode2 verifier rejected.
+
+New imatrix Q2 replacement from `antirez/deepseek-v4-gguf`:
+
+```text
+model: DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+source note: HF commit b0c3326, "fixed routed-mid imatrix build"
+oracle: OK
+
+artifact: /tmp/ds4-q2-imatrix-current.csv
+baseline median: 35.97 TPS
+fast exact median: 40.56 TPS
+exact_vs_baseline: 1.128
+hash_matches_baseline: 0
+
+safe fallback:
+DS4_MTP_DECODE2_EXACT=1
+artifact: /tmp/ds4-q2-imatrix-decode2-exact-current.csv
+baseline median: 35.91 TPS
+exact median: 34.69 TPS
+exact_vs_baseline: 0.966
+hash_matches_baseline: 1
+```
+
+The imatrix replacement improves the short oracle result, but the production
+sustained-code prompt still diverges on the fast verifier path. The saved diff
+starts immediately:
+
+```diff
+-Here's a complete Python module that meets your requirements:
++Here's a complete Python module that does everything you requested:
+
+-CSV Data Aggregator Module
++CSV Group Analyzer Module
+```
+
+Working rule: q4 remains the supported exact-MTP performance target. Q2 should
+remain on the conservative decode2 path if exactness is required, or be treated
+as approximate when using the fast verifier. Future q4 kernel changes should be
+accepted or rejected by q4 hash-identical production gates; Q2 should be rerun
+periodically as a divergence watch, not as the primary optimization target.

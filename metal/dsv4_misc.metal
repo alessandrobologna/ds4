@@ -376,6 +376,94 @@ kernel void kernel_dsv4_router_probs_finalize_weights_one(
     }
 }
 
+// Exact verifier row-batched sibling of kernel_dsv4_router_probs_finalize_weights_one.
+// Each threadgroup owns one token row and runs the same per-row selection and
+// six-weight normalization order as decode, while the host encodes all rows in
+// a single dispatch.
+kernel void kernel_dsv4_router_probs_finalize_weights_rows(
+        constant ds4_metal_args_dsv4_router_select_one & args,
+        device const float *logits,
+        device const float *bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device float *probs,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (tid >= 256) return;
+
+    device const float *row_logits = logits + (uint64_t)row * 256u;
+    device float *row_probs = probs + (uint64_t)row * 256u;
+    device int32_t *row_selected = selected + (uint64_t)row * 6u;
+    device float *row_weights = weights + (uint64_t)row * 6u;
+
+    threadgroup float *prob_vals = scratch;
+    threadgroup float *sel_scores = scratch + 256;
+    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 512);
+
+    if (tid < 64) {
+        device const float4 *src = (device const float4 *)row_logits;
+        device float4 *dst = (device float4 *)row_probs;
+        threadgroup float4 *prob4 = (threadgroup float4 *)prob_vals;
+        const float4 x = src[tid];
+        const float4 sp = select(log(1.0f + exp(x)), x, x > 20.0f);
+        const float4 p = sqrt(sp);
+        prob4[tid] = p;
+        dst[tid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float p = prob_vals[tid];
+    sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    idx[tid] = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (args.hash_mode) {
+        const uint token = (uint)tokens[row];
+        const uint hash_row = min(token, args.hash_rows - 1u);
+        if (tid < 6) {
+            idx[tid] = hash[hash_row * 6u + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint k = 2; k <= 256; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                const uint other = tid ^ j;
+                if (other > tid) {
+                    if ((tid & k) == 0) {
+                        if (sel_scores[(uint)idx[tid]] < sel_scores[(uint)idx[other]]) {
+                            const int32_t tmp = idx[tid];
+                            idx[tid] = idx[other];
+                            idx[other] = tmp;
+                        }
+                    } else {
+                        if (sel_scores[(uint)idx[tid]] > sel_scores[(uint)idx[other]]) {
+                            const int32_t tmp = idx[tid];
+                            idx[tid] = idx[other];
+                            idx[other] = tmp;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 6) {
+        const int32_t expert = idx[tid];
+        float sum = 0.0f;
+        for (uint i = 0; i < 6; i++) {
+            sum += prob_vals[idx[i]];
+        }
+        sum = max(sum, 6.103515625e-5f);
+        row_selected[tid] = expert;
+        row_weights[tid] = prob_vals[expert] / sum * 1.5f;
+    }
+}
+
 // Fills the dense compressed-attention mask with -inf. The selected top-k rows
 // are enabled by kernel_dsv4_topk_mask_scatter in a second ordered dispatch.
 kernel void kernel_dsv4_topk_mask(

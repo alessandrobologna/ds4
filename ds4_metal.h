@@ -732,6 +732,23 @@ int ds4_metal_router_select_batch_tensor(
         const ds4_metal_tensor *tokens,
         uint32_t                n_tokens);
 
+int ds4_metal_router_select_exact_rows_tensor(
+        ds4_metal_tensor       *selected,
+        ds4_metal_tensor       *weights,
+        ds4_metal_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        uint32_t                n_expert_groups,
+        uint32_t                n_group_used,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const ds4_metal_tensor *logits,
+        const ds4_metal_tensor *tokens,
+        uint32_t                n_tokens);
+
 int ds4_metal_routed_moe_one_tensor(
         ds4_metal_tensor       *out,
         ds4_metal_tensor       *gate,

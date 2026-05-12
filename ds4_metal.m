@@ -108,6 +108,7 @@ static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_probs_finalize_weights_one_pipeline;
+static id<MTLComputePipelineState> g_dsv4_router_probs_finalize_weights_rows_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
@@ -4039,6 +4040,8 @@ int ds4_metal_init(void) {
             ds4_metal_get_pipeline("kernel_dsv4_router_finalize_weights_one");
         g_dsv4_router_probs_finalize_weights_one_pipeline =
             ds4_metal_get_pipeline("kernel_dsv4_router_probs_finalize_weights_one");
+        g_dsv4_router_probs_finalize_weights_rows_pipeline =
+            ds4_metal_get_pipeline("kernel_dsv4_router_probs_finalize_weights_rows");
         g_dsv4_hc_expand4_pipeline =
             ds4_metal_get_pipeline("kernel_dsv4_hc_expand4");
         if (!g_dsv4_indexer_score_one_direct_pipeline ||
@@ -4053,6 +4056,7 @@ int ds4_metal_init(void) {
             !g_dsv4_router_weights_one_pipeline ||
             !g_dsv4_router_finalize_weights_one_pipeline ||
             !g_dsv4_router_probs_finalize_weights_one_pipeline ||
+            !g_dsv4_router_probs_finalize_weights_rows_pipeline ||
             !g_dsv4_hc_expand4_pipeline) {
             g_queue = nil;
             g_device = nil;
@@ -4383,6 +4387,7 @@ void ds4_metal_cleanup(void) {
         g_dsv4_router_weights_one_pipeline = nil;
         g_dsv4_router_finalize_weights_one_pipeline = nil;
         g_dsv4_router_probs_finalize_weights_one_pipeline = nil;
+        g_dsv4_router_probs_finalize_weights_rows_pipeline = nil;
         g_dsv4_hc_expand4_pipeline = nil;
         g_flash_attn_mask_buffer = nil;
         g_flash_attn_pad_buffer = nil;
@@ -13860,6 +13865,58 @@ static int ds4_metal_encode_router_select(
     return 1;
 }
 
+static int ds4_metal_encode_router_select_exact_rows(
+        id<MTLCommandBuffer> cb,
+        ds4_metal_tensor    *selected,
+        ds4_metal_tensor    *weights,
+        ds4_metal_tensor    *probs,
+        id<MTLBuffer>        logitsbuf,
+        NSUInteger           logits_off,
+        id<MTLBuffer>        biasbuf,
+        NSUInteger           bias_off,
+        id<MTLBuffer>        hashbuf,
+        NSUInteger           hash_off,
+        id<MTLBuffer>        tokensbuf,
+        NSUInteger           tokens_off,
+        uint32_t             hash_rows,
+        uint32_t             n_tokens,
+        bool                 has_bias,
+        bool                 hash_mode) {
+    id<MTLBuffer> selectedbuf = ds4_metal_tensor_buffer(selected);
+    id<MTLBuffer> weightsbuf = ds4_metal_tensor_buffer(weights);
+    id<MTLBuffer> probsbuf = ds4_metal_tensor_buffer(probs);
+    if (!cb || !selectedbuf || !weightsbuf || !probsbuf || !logitsbuf ||
+        !g_dsv4_router_probs_finalize_weights_rows_pipeline ||
+        n_tokens == 0 || (hash_mode && !tokensbuf)) {
+        return 0;
+    }
+
+    ds4_metal_dsv4_router_select_one_args args = {
+        .has_bias = has_bias ? 1u : 0u,
+        .hash_mode = hash_mode ? 1u : 0u,
+        .use_token_buffer = 1u,
+        .token = 0u,
+        .hash_rows = hash_rows,
+    };
+
+    id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+    [enc setComputePipelineState:g_dsv4_router_probs_finalize_weights_rows_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:logitsbuf offset:logits_off atIndex:1];
+    [enc setBuffer:biasbuf offset:bias_off atIndex:2];
+    [enc setBuffer:hashbuf offset:hash_off atIndex:3];
+    [enc setBuffer:tokensbuf offset:tokens_off atIndex:4];
+    [enc setBuffer:probsbuf offset:ds4_metal_tensor_offset(probs) atIndex:5];
+    [enc setBuffer:selectedbuf offset:ds4_metal_tensor_offset(selected) atIndex:6];
+    [enc setBuffer:weightsbuf offset:ds4_metal_tensor_offset(weights) atIndex:7];
+    [enc setThreadgroupMemoryLength:512u * sizeof(float) + 256u * sizeof(int32_t) atIndex:0];
+    DS4_METAL_NOTE_DISPATCH();
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ds4_metal_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 int ds4_metal_router_select_tensor(
         ds4_metal_tensor       *selected,
         ds4_metal_tensor       *weights,
@@ -14028,6 +14085,94 @@ int ds4_metal_router_select_batch_tensor(
                                                       n_tokens,
                                                       has_bias && !hash_mode,
                                                       hash_mode);
+        if (!had_batch) {
+            ok = ds4_metal_end_commands() != 0 && ok;
+        }
+        if (!ok) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_metal_router_select_exact_rows_tensor(
+        ds4_metal_tensor       *selected,
+        ds4_metal_tensor       *weights,
+        ds4_metal_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        uint32_t                n_expert_groups,
+        uint32_t                n_group_used,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const ds4_metal_tensor *logits,
+        const ds4_metal_tensor *tokens,
+        uint32_t                n_tokens) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0) return 0;
+    if (n_expert_groups > 1u || n_group_used > 0u) {
+        fprintf(stderr, "ds4: Metal router group gating is not part of this DeepSeek V4 Flash path\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> logitsbuf = ds4_metal_tensor_buffer(logits);
+        id<MTLBuffer> selectedbuf = ds4_metal_tensor_buffer(selected);
+        id<MTLBuffer> weightsbuf = ds4_metal_tensor_buffer(weights);
+        id<MTLBuffer> probsbuf = ds4_metal_tensor_buffer(probs);
+        id<MTLBuffer> tokensbuf = ds4_metal_tensor_buffer(tokens);
+        if (!logitsbuf || !selectedbuf || !weightsbuf || !probsbuf || !tokensbuf ||
+            ds4_metal_tensor_bytes(logits) < (uint64_t)n_tokens * 256u * sizeof(float) ||
+            ds4_metal_tensor_bytes(selected) < (uint64_t)n_tokens * 6u * sizeof(int) ||
+            ds4_metal_tensor_bytes(weights) < (uint64_t)n_tokens * 6u * sizeof(float) ||
+            ds4_metal_tensor_bytes(probs) < (uint64_t)n_tokens * 256u * sizeof(float) ||
+            ds4_metal_tensor_bytes(tokens) < (uint64_t)n_tokens * sizeof(int32_t)) {
+            fprintf(stderr, "ds4: Metal router exact rows received undersized buffers\n");
+            return 0;
+        }
+
+        uint64_t bias_inner = 0;
+        uint64_t hash_inner = 0;
+        id<MTLBuffer> biasbuf = nil;
+        id<MTLBuffer> hashbuf = nil;
+        NSUInteger bias_set_offset = 0;
+        NSUInteger hash_set_offset = 0;
+        if (has_bias && !hash_mode) {
+            const uint64_t bias_bytes = 256u * sizeof(float);
+            biasbuf = ds4_metal_wrap_model_range(model_map, model_size, bias_offset, bias_bytes, &bias_inner);
+            if (!biasbuf) return 0;
+            bias_set_offset = (NSUInteger)bias_inner;
+        }
+        if (hash_mode) {
+            const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+            hashbuf = ds4_metal_wrap_model_range(model_map, model_size, hash_offset, hash_bytes, &hash_inner);
+            if (!hashbuf) return 0;
+            hash_set_offset = (NSUInteger)hash_inner;
+        }
+
+        const bool had_batch = g_batch_cb != nil;
+        if (!had_batch && ds4_metal_begin_commands() == 0) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        int ok = cb &&
+                 ds4_metal_encode_router_select_exact_rows(cb,
+                                                           selected,
+                                                           weights,
+                                                           probs,
+                                                           logitsbuf,
+                                                           ds4_metal_tensor_offset(logits),
+                                                           biasbuf,
+                                                           bias_set_offset,
+                                                           hashbuf,
+                                                           hash_set_offset,
+                                                           tokensbuf,
+                                                           ds4_metal_tensor_offset(tokens),
+                                                           hash_rows,
+                                                           n_tokens,
+                                                           has_bias && !hash_mode,
+                                                           hash_mode);
         if (!had_batch) {
             ok = ds4_metal_end_commands() != 0 && ok;
         }

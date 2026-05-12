@@ -2327,3 +2327,108 @@ does not change the larger conclusion about `1.5x`: exact N=2 is now clearly
 above baseline on sustained code generation, but the remaining gap to a 50%
 gain still needs a bigger verifier architecture change or much deeper layer
 fusion.
+
+## 2026-05-11 Net-Aware Adaptive Cooldown
+
+After the exact batch-attention promotion, the old per-attempt adaptive
+cooldown became too conservative on sustained code generation. A stats sample
+with the default cooldown showed the verifier was already profitable overall:
+
+```text
+generation: 37.99 TPS
+steps: 59
+full accepts: 52
+partial accepts: 7
+adaptive_skip: 62
+verify: 2379.548 ms
+est_net: 610.882 ms
+```
+
+Disabling adaptive cooldown entirely was faster on the same prompt:
+
+```text
+generation: 39.06 TPS
+steps: 74
+full accepts: 66
+partial accepts: 8
+adaptive_skip: 0
+verify: 2954.787 ms
+est_net: 793.824 ms
+```
+
+The default adaptive policy now keeps the existing per-attempt stop rule only
+when the cumulative speculative stream is not yet profitable. Once cumulative
+estimated savings exceed probe+verifier overhead, a single local partial
+accept no longer triggers a 10-token cooldown. `DS4_MTP_ADAPTIVE_STEP_ONLY=1`
+restores the old immediate per-step behavior for diagnostics.
+
+Studio q4 validation:
+
+```text
+oracle: OK
+artifact: /tmp/ds4-netadaptive-n2-prod-20260511-213456.csv
+baseline median: 34.67 TPS, hashes=1
+disabled/no-open median: 34.68 TPS, hashes=1, hash_matches_baseline=1
+exact median: 38.95 TPS, hashes=1, hash_matches_baseline=1
+exact_vs_baseline: 1.123
+speed median: 38.66 TPS
+speed_vs_baseline: 1.115
+```
+
+The matching stats run showed the intended behavior:
+
+```text
+generation: 38.88 TPS
+steps: 74
+full accepts: 66
+partial accepts: 8
+adaptive_skip: 0
+verify: 2969.699 ms
+est_net: 795.490 ms
+```
+
+The same post-batch-attention verifier-scale pass also explains why linear
+depth alone was not promoted:
+
+```text
+n=2 verify_top: 40.136 ms, ceiling: 1.400x
+n=3 verify_top: 55.718 ms, ceiling: 1.482x
+n=4 verify_top: 66.648 ms, ceiling: 1.633x
+```
+
+Despite that lower-bound ceiling, production depth 3 with
+`DS4_MTP_EXACT_DEEP=1 DS4_MTP_EXACT_PREFIX2=1 --mtp-draft 3` regressed:
+
+```text
+artifact: /tmp/ds4-n3-after-batchattn-prod-20260511-212230.csv
+baseline median: 34.75 TPS
+disabled/no-open median: 34.74 TPS
+exact median: 31.51 TPS
+exact_vs_baseline: 0.907
+hash_matches_baseline: 1
+```
+
+Depth 4 was stopped after the first exact sample measured `28.51 TPS` against
+`34.71 TPS` baseline. The current practical path remains exact N=2 plus heavy
+verifier-kernel reductions; linear N=3/N=4 still do not convert the diagnostic
+ceiling into production throughput.
+
+One heavier shared-expert tail prototype was also falsified and reverted. The
+prototype added an exact pair2 shared-down+HC kernel for verifier rows 0 and 1.
+It passed the q4 oracle and saved about `43` dispatches per batch2 verifier,
+but the lower-bound did not improve:
+
+```text
+artifact: /tmp/ds4-pair2-shdown-control2-lb.err
+control batch2: 39.539 ms
+control layers: 38.268 ms
+control layer_dispatch: 1846.8
+
+artifact: /tmp/ds4-pair2-shdown2-lb.err
+pair2 batch2: 39.620 ms
+pair2 layers: 38.344 ms
+pair2 layer_dispatch: 1803.8
+```
+
+This repeats the earlier lesson from the routed-down+HC fusion: dispatch count
+alone is not the bottleneck once the heavy matvec reduction is preserved.

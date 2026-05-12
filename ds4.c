@@ -16823,7 +16823,10 @@ static void ds4_mtp_stats_record_step(ds4_session *s,
                                       double replay_sec,
                                       double total_sec) {
     if (!s) return;
-    if (s->mtp_stats_enabled) {
+    const bool collect_core_stats =
+        s->mtp_stats_enabled ||
+        (s->mtp_adaptive_enabled && !s->mtp_adaptive_cheap);
+    if (collect_core_stats) {
         s->mtp_stats.mtp_spec_steps++;
         if (drafted > 0) s->mtp_stats.mtp_suffix_drafted += (uint64_t)drafted;
         if (committed > 0) s->mtp_stats.mtp_suffix_committed += (uint64_t)committed;
@@ -16844,12 +16847,14 @@ static void ds4_mtp_stats_record_step(ds4_session *s,
         s->mtp_stats.mtp_prefix_sec += prefix_sec;
         s->mtp_stats.mtp_replay_sec += replay_sec;
         s->mtp_stats.mtp_total_sec += total_sec;
-        switch (path) {
-        case DS4_MTP_STATS_FIRST_MISS:  s->mtp_stats.mtp_first_miss++; break;
-        case DS4_MTP_STATS_MARGIN_SKIP: s->mtp_stats.mtp_margin_skip++; break;
-        case DS4_MTP_STATS_MICRO:       s->mtp_stats.mtp_micro++; break;
-        case DS4_MTP_STATS_DECODE2:     s->mtp_stats.mtp_decode2++; break;
-        case DS4_MTP_STATS_SEQ:         s->mtp_stats.mtp_seq++; break;
+        if (s->mtp_stats_enabled) {
+            switch (path) {
+            case DS4_MTP_STATS_FIRST_MISS:  s->mtp_stats.mtp_first_miss++; break;
+            case DS4_MTP_STATS_MARGIN_SKIP: s->mtp_stats.mtp_margin_skip++; break;
+            case DS4_MTP_STATS_MICRO:       s->mtp_stats.mtp_micro++; break;
+            case DS4_MTP_STATS_DECODE2:     s->mtp_stats.mtp_decode2++; break;
+            case DS4_MTP_STATS_SEQ:         s->mtp_stats.mtp_seq++; break;
+            }
         }
     }
     bool adaptive_stop = false;
@@ -16868,8 +16873,19 @@ static void ds4_mtp_stats_record_step(ds4_session *s,
             s->mtp_stats.mtp_probe_sec / (double)s->mtp_stats.mtp_probe_count : 0.0;
         const double saved = (double)committed * target_avg;
         const double extra = total_sec + probe_avg;
+        const double cumulative_saved =
+            (double)s->mtp_stats.mtp_suffix_committed * target_avg;
+        const double cumulative_extra =
+            s->mtp_stats.mtp_probe_sec + s->mtp_stats.mtp_total_sec;
+        const bool cumulative_profitable =
+            cumulative_saved > cumulative_extra;
+        const bool step_only =
+            getenv("DS4_MTP_ADAPTIVE_STEP_ONLY") != NULL;
         const int skip_len = ds4_mtp_adaptive_skip_len();
-        adaptive_stop = committed <= 0 || committed < drafted || saved <= extra;
+        adaptive_stop =
+            committed <= 0 ||
+            ((committed < drafted || saved <= extra) &&
+             (step_only || !cumulative_profitable));
         if (adaptive_stop) {
             if (s->mtp_probe_skip < skip_len) s->mtp_probe_skip = skip_len;
         }

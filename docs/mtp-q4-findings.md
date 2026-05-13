@@ -4181,3 +4181,88 @@ DS4_METAL_ENABLE_ATTN_OUT_LOW_MM_PAIR2=1:
 
 This closes the current attention-output fusion avenue. The retained direct
 low-output path is better than the grouped-ID replacement for exact N=2.
+
+## 2026-05-12 EvalPlus Approximate-MTP Quality Gate
+
+EvalPlus was installed on Studio in a throwaway venv and wired to DS4 through a
+small OpenAI-compatible generator wrapper:
+
+```text
+/tmp/ds4-evalplus-venv
+tools/evalplus_ds4.py
+```
+
+The wrapper loads EvalPlus datasets, calls `ds4-server`, writes JSONL samples
+with `task_id` and `solution`, and records per-task request metadata. On macOS
+the EvalPlus memory guard needs to be disabled for local execution:
+
+```text
+EVALPLUS_MAX_MEMORY_BYTES=-1 evalplus.evaluate humaneval --samples samples.jsonl --mini
+```
+
+The first complete gate used q4-imatrix baseline generation through
+`/v1/chat/completions` on all 164 HumanEval tasks, then ran HumanEval+ mini
+tests:
+
+```text
+artifact: /tmp/ds4-evalplus-baseline-full-20260512225518
+server: ./ds4-server -m q4-imatrix --ctx 32768 --port 8120 -n 1024
+generator: tools/evalplus_ds4.py --dataset humaneval --api chat --limit 164 --max-tokens 1024
+generation time: 540.10s
+
+humaneval base pass@1:  0.787
+humaneval+ pass@1:     0.756
+```
+
+A matching five-task completions smoke showed the non-MTP baseline wrapper
+generates syntactically valid code for the first HumanEval tasks:
+
+```text
+artifact: /tmp/ds4-evalplus-baseline-completions-smoke-20260512231636
+syntax_ok: 5/5
+```
+
+By contrast, raw approximate speed mode is not code-eval safe in its current
+form. `--mtp-speed --mtp-draft 6` through `/v1/completions` produced invalid
+UTF-8 in the first attempted full run, and a five-task completions smoke
+degenerated into repeated text, non-code explanations, and invalid Python:
+
+```text
+artifact: /tmp/ds4-evalplus-speed-completions-smoke-20260512231347
+server: --mtp current-MTP --mtp-draft 6 --mtp-margin 0 --mtp-speed
+syntax_ok: 0/5
+```
+
+The repeat guard did not rescue it:
+
+```text
+artifact: /tmp/ds4-evalplus-speed-guard-smoke-20260512231448
+env: DS4_MTP_SPEED_REPEAT_GUARD=3 DS4_MTP_SPEED_REPEAT_WINDOW=64
+syntax_ok: 0/5
+```
+
+Reducing approximate speed mode to draft 2 improved the chat endpoint slightly,
+but still failed the quality bar:
+
+```text
+artifact: /tmp/ds4-evalplus-speed-d2-smoke-20260512231812
+api: /v1/completions
+syntax_ok: 1/5
+
+artifact: /tmp/ds4-evalplus-speed-d2-chat-smoke-20260512231856
+api: /v1/chat/completions
+syntax_ok: 3/5
+```
+
+Decision: use EvalPlus as the first approximate-MTP quality gate. The current
+raw `--mtp-speed` path should not be considered acceptable for code generation
+even if non-byte-identical output is allowed. Future approximate experiments
+need to clear a small syntax/pass@1 smoke before any long TPS benchmark:
+
+```text
+1. baseline q4-imatrix HumanEval+ mini
+2. candidate approximate mode, first 5 HumanEval tasks: syntax_ok must be 5/5
+3. candidate approximate mode, full HumanEval+ mini: pass@1 must stay within a
+   small configured delta of baseline
+4. only then run larger MBPP+/LiveCodeBench gates
+```

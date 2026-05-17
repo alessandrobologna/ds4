@@ -14471,6 +14471,7 @@ typedef struct {
     uint32_t pos;
     uint32_t depth;
     int token;
+    int tokens[DS4_MTP_SCHED2_MAX_BRANCH_K];
     double start_ms;
     double wait_target_ms;
     double wait_mtp_ms;
@@ -14482,6 +14483,9 @@ static ds4_mtp_native_target_first_probe g_mtp_native_target_first_probe;
 static void ds4_mtp_native_target_first_probe_clear(void) {
     memset(&g_mtp_native_target_first_probe, 0, sizeof(g_mtp_native_target_first_probe));
     g_mtp_native_target_first_probe.token = -1;
+    for (int i = 0; i < DS4_MTP_SCHED2_MAX_BRANCH_K; i++) {
+        g_mtp_native_target_first_probe.tokens[i] = -1;
+    }
 }
 
 static void ds4_mtp_native_target_first_probe_arm(
@@ -14541,10 +14545,8 @@ static bool ds4_mtp_native_target_first_probe_submit_and_wait(void) {
     ok = ok && target_ok;
 
     if (p->started) {
-        int cont_tokens[DS4_MTP_SCHED2_MAX_BRANCH_K];
-        for (int i = 0; i < DS4_MTP_SCHED2_MAX_BRANCH_K; i++) cont_tokens[i] = -1;
         p->finished = metal_graph_finish_mtp_native_target_hc_chain_timed(p->g,
-                                                                          cont_tokens,
+                                                                          p->tokens,
                                                                           p->depth,
                                                                           &p->wait_mtp_ms,
                                                                           &p->read_ms);
@@ -20094,7 +20096,9 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool mtp_runahead_promoted;
+    bool mtp_runahead_native_async;
     uint32_t mtp_runahead_base_n_raw;
+    uint32_t mtp_runahead_base_pos;
     bool mtp_lagged_pending_valid;
     int mtp_lagged_pending_token;
     int mtp_native_capture_cooldown;
@@ -20137,7 +20141,9 @@ static void ds4_session_reset_mtp_governor(ds4_session *s) {
     s->mtp_governor_disabled = false;
     s->mtp_governor_reported = false;
     s->mtp_runahead_promoted = false;
+    s->mtp_runahead_native_async = false;
     s->mtp_runahead_base_n_raw = 0;
+    s->mtp_runahead_base_pos = 0;
     s->mtp_runahead_depth = 0;
     s->mtp_runahead_cycles = 0;
     s->mtp_runahead_accepted_depth = 0;
@@ -20160,6 +20166,9 @@ static void ds4_session_clear_mtp_lagged_pending(ds4_session *s) {
 static void ds4_session_clear_mtp_runahead(ds4_session *s) {
     if (!s) return;
     s->mtp_runahead_promoted = false;
+    s->mtp_runahead_native_async = false;
+    s->mtp_runahead_base_n_raw = 0;
+    s->mtp_runahead_base_pos = 0;
     s->mtp_runahead_depth = 0;
     s->mtp_draft_valid = false;
     s->mtp_top_k = 0;
@@ -20194,6 +20203,7 @@ static void ds4_session_consume_mtp_runahead(ds4_session *s, int n_tokens) {
         if (base > s->graph.raw_cap) base = s->graph.raw_cap;
         s->mtp_runahead_base_n_raw = base;
     }
+    s->mtp_runahead_base_pos += (uint32_t)n_tokens;
     s->mtp_draft_token = s->mtp_runahead_tokens[0];
     s->mtp_draft_valid = true;
     s->mtp_top_ids[0] = s->mtp_draft_token;
@@ -24259,6 +24269,9 @@ void ds4_session_set_greedy_top_id_frontier(ds4_session *s, bool enabled) {
         s->checkpoint_valid = false;
         s->mtp_draft_valid = false;
         s->mtp_top_k = 0;
+#ifndef DS4_NO_GPU
+        ds4_session_clear_mtp_runahead(s);
+#endif
         s->mtp_lagged_pending_valid = false;
         s->mtp_lagged_pending_token = -1;
         s->logits_top_id = -1;
@@ -24855,6 +24868,35 @@ static bool ds4_mtp_native_commit_ledger(ds4_gpu_graph *g,
     return true;
 }
 
+static bool ds4_mtp_native_commit_async_runahead(ds4_session *s,
+                                                 ds4_mtp_native_ledger *l,
+                                                 int committed_tokens) {
+    if (!s || !l || committed_tokens <= 0) return false;
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->mtp_async ||
+        !g->mtp_async->raw_cache ||
+        committed_tokens > s->mtp_runahead_depth ||
+        committed_tokens > DS4_MTP_SCHED2_MAX_BRANCH_K) {
+        return false;
+    }
+    const uint32_t slot = (uint32_t)committed_tokens - 1u;
+    if (!g->mtp_async->branch_state_hc[slot]) return false;
+
+    ds4_gpu_tensor_ptr_swap(&g->mtp_raw_cache, &g->mtp_async->raw_cache);
+    ds4_gpu_tensor_ptr_swap(&g->mtp_state_hc, &g->mtp_async->branch_state_hc[slot]);
+    l->committed_tokens = committed_tokens;
+    l->committed_mtp_rows = (uint32_t)committed_tokens;
+    l->discarded_mtp_rows =
+        s->mtp_runahead_depth > committed_tokens
+            ? (uint32_t)(s->mtp_runahead_depth - committed_tokens)
+            : 0u;
+    g->mtp_n_raw = ds4_mtp_native_clamp_raw(s->mtp_runahead_base_n_raw +
+                                            (uint32_t)committed_tokens,
+                                            g->raw_window,
+                                            g->raw_cap);
+    return true;
+}
+
 static bool ds4_mtp_native_process_token(ds4_session *s,
                                          const ds4_mtp_native_ledger *l,
                                          const int *drafts,
@@ -25020,12 +25062,18 @@ int ds4_mtp_cache_contract_selftest(void) {
     s.checkpoint_valid = true;
     s.mtp_draft_valid = true;
     s.mtp_top_k = 1;
+    s.mtp_runahead_native_async = true;
+    s.mtp_runahead_base_n_raw = 12;
+    s.mtp_runahead_base_pos = 34;
     s.mtp_lagged_pending_valid = true;
     s.mtp_lagged_pending_token = 99;
     ds4_session_set_greedy_top_id_frontier(&s, false);
     if (s.checkpoint_valid ||
         s.mtp_draft_valid ||
         s.mtp_top_k != 0 ||
+        s.mtp_runahead_native_async ||
+        s.mtp_runahead_base_n_raw != 0 ||
+        s.mtp_runahead_base_pos != 0 ||
         s.mtp_lagged_pending_valid ||
         s.mtp_lagged_pending_token != -1 ||
         s.logits_top_id_valid ||
@@ -25167,8 +25215,16 @@ static int ds4_session_eval_mtp_native(
     bool chain_draft = false;
     bool sched2_cont_started = false;
     bool sched2_cont_finished = false;
+    bool native_cont_queue_used = false;
+    bool native_cont_queue_stored = false;
+    bool native_cont_queue_dropped = false;
     uint32_t chain_processed_rows = 0;
     uint32_t sched2_cont_depth = 0;
+    int native_cont_queue_depth = 0;
+    int native_cont_queue_tokens[DS4_MTP_SCHED2_MAX_BRANCH_K + 1];
+    for (int i = 0; i <= DS4_MTP_SCHED2_MAX_BRANCH_K; i++) {
+        native_cont_queue_tokens[i] = -1;
+    }
     const bool pretarget_possible =
         pretarget_requested &&
         !validate &&
@@ -25177,7 +25233,23 @@ static int ds4_session_eval_mtp_native(
         s->mtp_draft_valid &&
         s->mtp_draft_token == first_token;
 
-    ds4_session_trim_mtp_runahead(s, 0);
+    bool native_cont_queue_available =
+        target_first_cont_requested &&
+        !root_inclusive_requested &&
+        cache_mode == DS4_MTP_NATIVE_CACHE_OWNED &&
+        s->mtp_runahead_native_async &&
+        s->mtp_runahead_depth > 0;
+    if (native_cont_queue_available &&
+        (s->mtp_runahead_tokens[0] != first_token ||
+         s->mtp_runahead_base_pos != (uint32_t)start)) {
+        native_cont_queue_dropped = true;
+        ds4_session_trim_mtp_runahead(s, 0);
+        native_cont_queue_available = false;
+    }
+    if (!native_cont_queue_available) {
+        if (s->mtp_runahead_depth > 0) native_cont_queue_dropped = true;
+        ds4_session_trim_mtp_runahead(s, 0);
+    }
     ds4_session_clear_mtp_lagged_pending(s);
     s->mtp_draft_valid = false;
     s->mtp_top_k = 0;
@@ -25189,7 +25261,33 @@ static int ds4_session_eval_mtp_native(
                                 (uint32_t)start,
                                 depth_cap);
 
-    if (root_inclusive_requested &&
+    if (native_cont_queue_available &&
+        cache_mode == DS4_MTP_NATIVE_CACHE_OWNED &&
+        depth_cap > 1) {
+        native_cont_queue_used = true;
+        native_cont_queue_depth = s->mtp_runahead_depth;
+        if (native_cont_queue_depth > depth_cap) native_cont_queue_depth = depth_cap;
+        if (native_cont_queue_depth > DS4_MTP_NATIVE_MAX_K) {
+            native_cont_queue_depth = DS4_MTP_NATIVE_MAX_K;
+        }
+        for (int i = 0; i < native_cont_queue_depth; i++) {
+            drafts[i] = s->mtp_runahead_tokens[i];
+        }
+        draft_n = native_cont_queue_depth;
+        mtp_processed = draft_n;
+        if (s->mtp_runahead_depth > draft_n) {
+            preview = s->mtp_runahead_tokens[draft_n];
+            preview_valid = preview >= 0;
+        }
+        ds4_mtp_native_ledger_record_draft(&ledger,
+                                           draft_n,
+                                           (uint32_t)s->mtp_runahead_depth,
+                                           preview,
+                                           preview_valid);
+    }
+
+    if (!native_cont_queue_used &&
+        root_inclusive_requested &&
         cache_mode == DS4_MTP_NATIVE_CACHE_OWNED &&
         depth_cap > 1 &&
         first_token != eos_token) {
@@ -25515,7 +25613,8 @@ static int ds4_session_eval_mtp_native(
         return n_accept;
     }
 
-    if (pretarget_possible && first_token != eos_token && depth_cap > 1) {
+    if (!native_cont_queue_used &&
+        pretarget_possible && first_token != eos_token && depth_cap > 1) {
         const double draft_t0 = timing ? now_sec() : 0.0;
         const uint32_t rollback_raw = g->mtp_n_raw;
         const bool rollback_ok =
@@ -25580,7 +25679,8 @@ static int ds4_session_eval_mtp_native(
         return n_accept;
     }
 
-    if (!pretarget_draft && chain_draft_requested &&
+    if (!native_cont_queue_used &&
+        !pretarget_draft && chain_draft_requested &&
         cache_mode == DS4_MTP_NATIVE_CACHE_OWNED &&
         depth_cap > 1 &&
         !ds4_gpu_mtp_async_pending()) {
@@ -25647,7 +25747,7 @@ static int ds4_session_eval_mtp_native(
         }
     }
 
-    if (!pretarget_draft && !chain_draft) {
+    if (!native_cont_queue_used && !pretarget_draft && !chain_draft) {
         const double draft_t0 = timing ? now_sec() : 0.0;
         while (draft_n < depth_cap) {
             int mtp_top = -1;
@@ -25842,6 +25942,7 @@ static int ds4_session_eval_mtp_native(
             bool target_first_armed = false;
             ds4_mtp_native_target_first_probe_clear();
             if (target_first_cont_requested &&
+                !native_cont_queue_used &&
                 native_single_command_default &&
                 native_top_only &&
                 native_approx_topk == 1 &&
@@ -25898,6 +25999,12 @@ static int ds4_session_eval_mtp_native(
                 sched2_cont_wait_target_ms = g_mtp_native_target_first_probe.wait_target_ms;
                 sched2_cont_wait_ms = g_mtp_native_target_first_probe.wait_mtp_ms;
                 sched2_cont_read_ms = g_mtp_native_target_first_probe.read_ms;
+                if (sched2_cont_finished) {
+                    for (int i = 0; i < DS4_MTP_SCHED2_MAX_BRANCH_K; i++) {
+                        native_cont_queue_tokens[i + 1] =
+                            g_mtp_native_target_first_probe.tokens[i];
+                    }
+                }
                 ds4_gpu_command_span mtp_span = {0};
                 (void)ds4_gpu_command_spans_read(NULL, &mtp_span);
                 if (profile.gpu_end > profile.gpu_start) {
@@ -26006,7 +26113,7 @@ static int ds4_session_eval_mtp_native(
         }
     }
 
-    if (sched2_cont_started) {
+    if (sched2_cont_started && !sched2_cont_finished) {
         int cont_tokens[DS4_MTP_SCHED2_MAX_BRANCH_K];
         for (int i = 0; i < DS4_MTP_SCHED2_MAX_BRANCH_K; i++) cont_tokens[i] = -1;
         sched2_cont_finished =
@@ -26258,7 +26365,18 @@ static int ds4_session_eval_mtp_native(
 
     const double mtp_commit_t0 = timing ? now_sec() : 0.0;
     bool mtp_ledger_committed = false;
-    if (chain_draft) {
+    if (native_cont_queue_used) {
+        if (!ds4_mtp_native_commit_async_runahead(s, &ledger, commit_drafts)) {
+            free(committed_logits);
+            free(suffix_logits);
+            spec_frontier_free(&frontier);
+            snprintf(err, errlen, "MTP native continuation prefix commit failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        mtp_ledger_committed = true;
+        ds4_session_trim_mtp_runahead(s, 0);
+    } else if (chain_draft) {
         const uint32_t keep_rows = (uint32_t)commit_drafts < chain_processed_rows
             ? (uint32_t)commit_drafts
             : chain_processed_rows;
@@ -26308,6 +26426,66 @@ static int ds4_session_eval_mtp_native(
         s->mtp_top_k = 0;
     }
 
+    int native_cont_next_target = -1;
+    bool native_cont_next_target_valid = false;
+    if (commit_drafts == draft_n) {
+        if (committed_top_only) {
+            native_cont_next_target = committed_top_id;
+            native_cont_next_target_valid = committed_top_id >= 0;
+        } else if (committed_logits) {
+            native_cont_next_target = sample_argmax(committed_logits, DS4_N_VOCAB);
+            native_cont_next_target_valid = native_cont_next_target >= 0;
+        } else if (suffix_logits && draft_n > 1) {
+            native_cont_next_target =
+                sample_argmax(suffix_logits + (size_t)(suffix_n - 1) * DS4_N_VOCAB,
+                              DS4_N_VOCAB);
+            native_cont_next_target_valid = native_cont_next_target >= 0;
+        }
+    }
+
+    if (!native_cont_queue_used &&
+        target_first_cont_requested &&
+        sched2_cont_finished &&
+        commit_drafts == draft_n &&
+        preview >= 0 &&
+        preview != eos_token &&
+        native_cont_next_target_valid &&
+        native_cont_next_target == preview) {
+        int queue_depth = 1;
+        s->mtp_runahead_tokens[0] = preview;
+        for (uint32_t i = 0; i + 1u < sched2_cont_depth &&
+             queue_depth < (int)(sizeof(s->mtp_runahead_tokens) / sizeof(s->mtp_runahead_tokens[0]));
+             i++) {
+            const int tok = native_cont_queue_tokens[i + 1];
+            if (tok < 0) break;
+            s->mtp_runahead_tokens[queue_depth++] = tok;
+            if (tok == eos_token) break;
+        }
+        if (queue_depth > 1) {
+            native_cont_queue_stored = true;
+            s->mtp_runahead_depth = queue_depth;
+            s->mtp_runahead_native_async = true;
+            s->mtp_runahead_promoted = false;
+            s->mtp_runahead_base_n_raw = ds4_mtp_native_clamp_raw(
+                ledger.begin_mtp_raw + (uint32_t)draft_n,
+                g->raw_window,
+                g->raw_cap);
+            s->mtp_runahead_base_pos = (uint32_t)(start + draft_n);
+            s->mtp_draft_token = s->mtp_runahead_tokens[0];
+            s->mtp_draft_valid = true;
+            s->mtp_top_ids[0] = s->mtp_draft_token;
+            s->mtp_top_k = 1;
+        }
+    } else if (sched2_cont_started && !sched2_cont_finished) {
+        native_cont_queue_dropped = true;
+    } else if (sched2_cont_finished && commit_drafts < draft_n) {
+        native_cont_queue_dropped = true;
+    } else if (sched2_cont_finished && preview >= 0 &&
+               native_cont_next_target_valid &&
+               native_cont_next_target != preview) {
+        native_cont_queue_dropped = true;
+    }
+
     const int discarded = draft_n - commit_drafts;
     s->mtp_runahead_cycles++;
     s->mtp_runahead_accepted_depth += (uint64_t)n_accept;
@@ -26335,7 +26513,7 @@ static int ds4_session_eval_mtp_native(
     }
     if (timing) {
         fprintf(stderr,
-                "ds4: mtp native cycle mode=%s verify_opt=%s commit_opt=%s effective_commit=%s approx_topk=%d approx_rows=%d top_only=%d topid_frontier=%d single_command=%d output_fused_top1=%d output_top1_only=%d logits_row=%d remat_row=%d snapshot_elided=%d slot_commit=%d capture_compute_copy=%d pretarget_requested=%d pretarget_possible=%d pretarget=%d chain_draft=%d chain_rows=%u sched2_cont_requested=%d target_first_cont_requested=%d sched2_cont_started=%d sched2_cont_finished=%d sched2_cont_m=%d sched2_cont_depth=%u capture_rows=%d kept_verifier_state=%d capture_cooldown=%d adaptive_full_streak=%d adaptive_partial_streak=%d adaptive_threshold=%d depth=%d drafted=%d processed=%d "
+                "ds4: mtp native cycle mode=%s verify_opt=%s commit_opt=%s effective_commit=%s approx_topk=%d approx_rows=%d top_only=%d topid_frontier=%d single_command=%d output_fused_top1=%d output_top1_only=%d logits_row=%d remat_row=%d snapshot_elided=%d slot_commit=%d capture_compute_copy=%d pretarget_requested=%d pretarget_possible=%d pretarget=%d chain_draft=%d chain_rows=%u sched2_cont_requested=%d target_first_cont_requested=%d native_cont_used=%d native_cont_stored=%d native_cont_dropped=%d native_cont_depth=%d native_cont_next=%d sched2_cont_started=%d sched2_cont_finished=%d sched2_cont_m=%d sched2_cont_depth=%u capture_rows=%d kept_verifier_state=%d capture_cooldown=%d adaptive_full_streak=%d adaptive_partial_streak=%d adaptive_threshold=%d depth=%d drafted=%d processed=%d "
                 "committed=%d accepted=%d first_suffix_top=%d first_suffix_draft=%d "
                 "first_suffix_rank=%d preview=%d preview_valid=%d discarded=%d "
                 "target=%.3f ms draft=%.3f ms snapshot=%.3f ms verify=%.3f ms "
@@ -26369,6 +26547,11 @@ static int ds4_session_eval_mtp_native(
                 chain_processed_rows,
                 sched2_cont_requested ? 1 : 0,
                 target_first_cont_requested ? 1 : 0,
+                native_cont_queue_used ? 1 : 0,
+                native_cont_queue_stored ? 1 : 0,
+                native_cont_queue_dropped ? 1 : 0,
+                s->mtp_runahead_native_async ? s->mtp_runahead_depth : native_cont_queue_depth,
+                native_cont_next_target_valid ? native_cont_next_target : -1,
                 sched2_cont_started ? 1 : 0,
                 sched2_cont_finished ? 1 : 0,
                 sched2_cont_m,
@@ -27127,7 +27310,9 @@ static int ds4_session_eval_mtp_block_verify(
                 if (append_n > 0) {
                     appended_total = append_n;
                     s->mtp_runahead_promoted = true;
+                    s->mtp_runahead_native_async = false;
                     s->mtp_runahead_base_n_raw = async_suffix_base_raw;
+                    s->mtp_runahead_base_pos = (uint32_t)(start + draft_n);
                     s->mtp_draft_token = s->mtp_runahead_tokens[0];
                     s->mtp_draft_valid = true;
                     s->mtp_top_ids[0] = s->mtp_draft_token;
@@ -27396,7 +27581,9 @@ static int ds4_session_eval_mtp_sched2(
         s->mtp_runahead_tokens[0] = first_token;
         s->mtp_runahead_depth = 1;
         s->mtp_runahead_base_n_raw = s->graph.mtp_n_raw;
+        s->mtp_runahead_base_pos = (uint32_t)s->checkpoint.len;
         s->mtp_runahead_promoted = true;
+        s->mtp_runahead_native_async = false;
     } else if (s->mtp_runahead_tokens[0] != first_token) {
         ds4_session_trim_mtp_runahead(s, 0);
         return 0;
@@ -27928,7 +28115,10 @@ static int ds4_session_eval_mtp_sched2(
 	                        appended_total += append_n;
 	                        if (append_n > 0) {
 	                            s->mtp_runahead_promoted = true;
+	                            s->mtp_runahead_native_async = false;
 	                            s->mtp_runahead_base_n_raw = async_suffix_base_raw;
+	                            s->mtp_runahead_base_pos =
+	                                (uint32_t)(s->checkpoint.len + s->mtp_runahead_depth - append_n);
 	                            s->mtp_draft_token = s->mtp_runahead_tokens[0];
 	                            s->mtp_draft_valid = true;
 	                            s->mtp_top_ids[0] = s->mtp_draft_token;
@@ -27955,7 +28145,10 @@ static int ds4_session_eval_mtp_sched2(
 	                        appended_total += append_n;
 	                        if (append_n > 0) {
 	                            s->mtp_runahead_promoted = true;
+	                            s->mtp_runahead_native_async = false;
 	                            s->mtp_runahead_base_n_raw = async_suffix_base_raw;
+	                            s->mtp_runahead_base_pos =
+	                                (uint32_t)(s->checkpoint.len + s->mtp_runahead_depth - append_n);
 	                            s->mtp_draft_token = s->mtp_runahead_tokens[0];
 	                            s->mtp_draft_valid = true;
 	                            s->mtp_top_ids[0] = s->mtp_draft_token;

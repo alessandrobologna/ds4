@@ -5681,3 +5681,79 @@ Interpretation:
   transactionally, then measure whether avoiding the next-cycle draft work
   offsets the contention. That is a state-contract problem, not another Metal
   scheduling proof.
+
+### 2026-05-17 Transactional Target-First Continuation Reuse
+
+Implementation:
+
+- Extended `DS4_MTP_NATIVE_TARGET_FIRST_CONT=1` from an overlap-only probe into
+  a transactional queue:
+  - target verifier still runs first and MTP continuation runs concurrently;
+  - continuation output is stored as `preview + continuation` only if the
+    verifier fully accepts the current block and the target post-block top id
+    equals the MTP preview;
+  - the next native cycle can draft from that queue without rerunning the MTP
+    chain;
+  - accepted queued prefixes commit from the async MTP raw/cache transaction;
+  - mismatched previews, partial accepts, stale positions, and failed async
+    work discard the queued continuation.
+- The queue stores only tokens with materialized async MTP state. The final MTP
+  output from a continuation chain is treated as a preview, not a committable
+  queued token.
+- Added timing fields:
+  - `native_cont_used`
+  - `native_cont_stored`
+  - `native_cont_dropped`
+  - `native_cont_depth`
+  - `native_cont_next`
+- Kept the path narrow: Apple/Metal native small-M, top-id-only verifier only.
+
+Correctness checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-mtp-cache-contract`,
+  `git diff --check`.
+- Studio: build and `./ds4_test --metal-mtp-cache-contract`.
+- Studio three-prompt smoke with `K=4`, `-n 64`, temp-0 stdout matched serial
+  for all rows below.
+
+Studio comparison:
+
+- Artifact: `/tmp/ds4-native-contreuse-compare-20260517_044913`
+- Settings:
+  - baseline native: `DS4_MTP_NATIVE=1 DS4_MTP_NATIVE_TIMING=1
+    DS4_MTP_NATIVE_VERIFY_OPT=smallm DS4_MTP_NATIVE_CACHE_MODE=owned`
+  - target-first M1/M2/M4 add `DS4_MTP_NATIVE_TARGET_FIRST_CONT=1` and
+    `DS4_MTP_NATIVE_SCHED2_CONT_M=1|2|4`
+  - `--mtp-draft 4`, `--ctx 1024 --nothink -sys "" --temp 0 -n 64`
+
+| Prompt | Mode | stdout | t/s | continuation used | stored | dropped |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| count | native | match | 44.80 | 0 | 0 | 0 |
+| count | target-first M1 | match | 44.05 | 0 | 0 | 16 |
+| count | target-first M2 | match | 43.72 | 0 | 0 | 16 |
+| count | target-first M4 | match | 41.98 | 0 | 0 | 16 |
+| explain | native | match | 32.35 | 0 | 0 | 0 |
+| explain | target-first M1 | match | 31.68 | 0 | 0 | 18 |
+| explain | target-first M2 | match | 31.63 | 5 | 5 | 15 |
+| explain | target-first M4 | match | 30.15 | 5 | 5 | 15 |
+| code | native | match | 33.32 | 0 | 0 | 0 |
+| code | target-first M1 | match | 33.36 | 0 | 0 | 0 |
+| code | target-first M2 | match | 37.59 | 4 | 4 | 11 |
+| code | target-first M4 | match | 34.75 | 8 | 9 | 7 |
+
+Interpretation:
+
+- The queue contract is now real: it stores only exact target-aligned previews
+  and commits accepted prefixes from the async MTP transaction.
+- Prompt behavior is highly acceptance-pattern dependent:
+  - `count` discards every continuation because MTP preview is consistently one
+    step behind the target post-block top id;
+  - `explain` reuses some queued work but the overlap contention outweighs the
+    saved draft work in this short smoke;
+  - `code` benefits from materialized shallow continuation (`M2`), improving the
+    same-run K4 native smoke from `33.32` to `37.59` t/s.
+- `M1` cannot store a useful queue under the safe state contract because it only
+  materializes the preview token's state. `M4` generally creates too much
+  overlapped contention. The promising direction is adaptive materialized
+  shallow continuation, probably `M2`, gated by observed preview-hit rate rather
+  than blindly running continuation on every cycle.

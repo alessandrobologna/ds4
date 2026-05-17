@@ -22,17 +22,58 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
+void ds4_gpu_tensor_set_label(ds4_gpu_tensor *tensor, const char *label);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_compute(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                const ds4_gpu_tensor *src, uint64_t src_offset,
+                                uint64_t bytes);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+int ds4_gpu_begin_mtp_async_commands(void);
+int ds4_gpu_end_mtp_async_commands(void);
+int ds4_gpu_wait_mtp_async_commands(void);
+int ds4_gpu_mtp_async_pending(void);
+
+typedef enum {
+    DS4_GPU_SCHED2_RESOURCE_TENSOR_SLICE = 1,
+    DS4_GPU_SCHED2_RESOURCE_MODEL_VIEW = 2,
+    DS4_GPU_SCHED2_RESOURCE_SCRATCH_ARENA = 3,
+    DS4_GPU_SCHED2_RESOURCE_COMMAND_OUTPUT = 4,
+    DS4_GPU_SCHED2_RESOURCE_HOST_READBACK = 5,
+} ds4_gpu_sched2_resource_kind;
+
+typedef enum {
+    DS4_GPU_SCHED2_LANE_TARGET = 1,
+    DS4_GPU_SCHED2_LANE_MTP = 2,
+} ds4_gpu_sched2_lane;
+
+#ifdef __APPLE__
+typedef struct {
+    int valid;
+    double gpu_start;
+    double gpu_end;
+    double kernel_start;
+    double kernel_end;
+    char label[64];
+} ds4_gpu_command_span;
+
+void ds4_gpu_command_spans_reset(void);
+int ds4_gpu_command_spans_read(ds4_gpu_command_span *target, ds4_gpu_command_span *mtp);
+int ds4_gpu_metal_concurrency_probe(void);
+int ds4_gpu_metal_sched2_probe(void);
+int ds4_gpu_metal_block_verifier_probe(void);
+void ds4_gpu_set_verifier_exact_mv_batch(int enabled);
+void ds4_gpu_set_verifier_smallm_matvec(int enabled);
+void ds4_gpu_set_moe_batch_direct_sum6(int enabled);
+#endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -113,6 +154,12 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+int ds4_gpu_top1_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        uint32_t                n_tokens);
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
@@ -138,6 +185,27 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+int ds4_gpu_matmul_q8_0_top1_final_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *final_logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint32_t                final_row);
+int ds4_gpu_matmul_q8_0_top1_only_tensor(
+        ds4_gpu_tensor       *selected,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -149,6 +217,19 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x);
+
+int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
 
 int ds4_gpu_matmul_f16_tensor(
         ds4_gpu_tensor       *out,
@@ -263,6 +344,26 @@ int ds4_gpu_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow);
 
+/* Like ds4_gpu_rope_tail_tensor(), but consecutive token rows advance by
+ * pos_step.  A zero step is the branch-sibling case for speculative trees:
+ * several candidate rows share the same absolute decode position. */
+int ds4_gpu_rope_tail_tensor_step(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          pos_step,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
@@ -271,6 +372,15 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
         uint32_t          row,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+int ds4_gpu_kv_fp8_store_raw_batch_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          pos0,
+        uint32_t          n_tokens,
         uint32_t          head_dim,
         uint32_t          n_rot);
 
@@ -540,6 +650,19 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
 
+int ds4_gpu_attention_output_low_q8_batch_tensor(
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens);
+
 int ds4_gpu_attention_output_low_q8_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -784,6 +907,22 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_shared_down_hc_expand_q8_0_batch_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens);
+
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
@@ -797,5 +936,20 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+int ds4_gpu_matmul_q8_0_hc_expand_batch_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens);
 
 #endif

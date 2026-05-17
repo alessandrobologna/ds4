@@ -145,6 +145,7 @@ int ds4_token_eos(ds4_engine *e);
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
+void ds4_session_set_greedy_top_id_frontier(ds4_session *s, bool enabled);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
@@ -181,6 +182,7 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
+int ds4_mtp_cache_contract_selftest(void);
 
 /* Disk KV cache payload helpers.  The server owns the outer file header and
  * policy; the engine owns the DS4-specific serialized graph state. */

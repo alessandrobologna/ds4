@@ -31,6 +31,16 @@ struct ds4_metal_args_argsort_merge {
     int32_t  len;
 };
 
+struct ds4_metal_args_top1 {
+    int32_t n_comp;
+    int32_t n_rows;
+};
+
+struct ds4_metal_args_top1_pair {
+    int32_t n_items;
+    int32_t n_rows;
+};
+
 typedef void (argsort_t)(
         constant   ds4_metal_args_argsort & args,
         device   const char * src0,
@@ -106,6 +116,89 @@ kernel void kernel_argsort_f32_i32(
 
 // Host-visible sort variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
+
+kernel void kernel_top1_f32_i32(
+        constant ds4_metal_args_top1 & args,
+        device const float *scores,
+        device int32_t *dst,
+        threadgroup float *shmem_val [[threadgroup(0)]],
+        threadgroup int32_t *shmem_idx [[threadgroup(1)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    if ((int32_t)row >= args.n_rows) return;
+    device const float *row_scores = scores + (uint64_t)row * (uint64_t)args.n_comp;
+    float best_val = -3.402823466e+38f;
+    int32_t best_idx = 0;
+    for (int32_t i = (int32_t)tid; i < args.n_comp; i += (int32_t)ntg) {
+        const float v = row_scores[i];
+        if (v > best_val || (v == best_val && i < best_idx)) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    shmem_val[tid] = best_val;
+    shmem_idx[tid] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (ushort stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const ushort other = tid + stride;
+            const float v = shmem_val[other];
+            const int32_t idx = shmem_idx[other];
+            if (v > shmem_val[tid] || (v == shmem_val[tid] && idx < shmem_idx[tid])) {
+                shmem_val[tid] = v;
+                shmem_idx[tid] = idx;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) dst[row] = shmem_idx[0];
+}
+
+kernel void kernel_top1_pair_f32_i32(
+        constant ds4_metal_args_top1_pair & args,
+        device const float *scores,
+        device const int32_t *ids,
+        device int32_t *dst,
+        threadgroup float *shmem_val [[threadgroup(0)]],
+        threadgroup int32_t *shmem_idx [[threadgroup(1)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    if ((int32_t)row >= args.n_rows) return;
+    device const float *row_scores = scores + (uint64_t)row * (uint64_t)args.n_items;
+    device const int32_t *row_ids = ids + (uint64_t)row * (uint64_t)args.n_items;
+    float best_val = -3.402823466e+38f;
+    int32_t best_idx = 2147483647;
+    for (int32_t i = (int32_t)tid; i < args.n_items; i += (int32_t)ntg) {
+        const float v = row_scores[i];
+        const int32_t idx = row_ids[i];
+        if (v > best_val || (v == best_val && idx < best_idx)) {
+            best_val = v;
+            best_idx = idx;
+        }
+    }
+    shmem_val[tid] = best_val;
+    shmem_idx[tid] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (ushort stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const ushort other = tid + stride;
+            const float v = shmem_val[other];
+            const int32_t idx = shmem_idx[other];
+            if (v > shmem_val[tid] || (v == shmem_val[tid] && idx < shmem_idx[tid])) {
+                shmem_val[tid] = v;
+                shmem_idx[tid] = idx;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) dst[row] = shmem_idx[0];
+}
 
 typedef void (argsort_merge_t)(
         constant   ds4_metal_args_argsort_merge & args,

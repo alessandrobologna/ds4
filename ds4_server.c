@@ -7030,6 +7030,12 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
+    const bool greedy_top_id_frontier =
+        j->req.temperature <= 0.0f &&
+        !ds4_think_mode_enabled(j->req.think_mode) &&
+        !(j->req.kind == REQ_CHAT && j->req.has_tools);
+    ds4_session_set_greedy_top_id_frontier(s->session, greedy_top_id_frontier);
+
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
@@ -7128,6 +7134,11 @@ static void generate_job(server *s, job *j) {
             temperature = 0.0f;
         }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        if (token < 0) {
+            snprintf(err, sizeof(err), "sample failed: fresh full logits are unavailable");
+            finish = "error";
+            break;
+        }
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;

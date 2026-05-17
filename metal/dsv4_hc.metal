@@ -602,8 +602,9 @@ kernel void kernel_dsv4_hc_expand4(
 //
 // The Q8_0 dot reduction is intentionally copied from the normal matvec shape
 // so the shared expert result is bit-identical.  The only specialization is
-// that DS4 decode has one token and HC=4, so the thread that finishes each
-// shared-down output row can immediately expand it into the four HC streams.
+// that DS4 decode has HC=4, so the thread that finishes each shared-down output
+// row can immediately expand it into the four HC streams.  The z grid dimension
+// carries tiny verifier batches as independent token rows.
 kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
         constant ds4_metal_args_mul_mv        & mv,
         constant ds4_metal_args_dsv4_hc_expand & hc,
@@ -619,7 +620,7 @@ kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    if (hc.n_hc != 4 || hc.n_tokens != 1) {
+    if (hc.n_hc != 4 || hc.n_tokens == 0) {
         return;
     }
 
@@ -630,12 +631,16 @@ kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
 
     const int nb = mv.ne00 / QK8_0;
     const int row0 = tgpig.x * NR0;
+    const int t = tgpig.z;
+    if (t >= hc.n_tokens) {
+        return;
+    }
 
     const short ix = tiisg / (NW / NQ);
     const short il = tiisg % (NW / NQ);
     const int ib0 = sgitg * NQ + ix;
 
-    device const float *y = (device const float *)(shared_mid);
+    device const float *y = (device const float *)(shared_mid + (uint64_t)t * mv.ne00 * sizeof(float));
     device const float *yb = y + ib0 * QK8_0 + il * NQ;
 
     device const block_q8_0 *ax[NR0];
@@ -693,25 +698,25 @@ kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
 
         const float shared_v = simd_sum(shmem_f32[row][tiisg]);
         if (tiisg == 0 && sgitg == 0) {
-            *((device float *)(shared_out + (uint64_t)d * sizeof(float))) = shared_v;
+            *((device float *)(shared_out + (uint64_t)d * hc.nb_block0 + (uint64_t)t * hc.nb_block1)) = shared_v;
 
-            float block_v = *((device const float *)(routed_out + (uint64_t)d * hc.nb_block0));
+            float block_v = *((device const float *)(routed_out + (uint64_t)d * hc.nb_add0 + (uint64_t)t * hc.nb_add1));
             block_v += shared_v;
 
-            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
-            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
-            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
-            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1 + (uint64_t)t * hc.nb_res2));
+            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1 + (uint64_t)t * hc.nb_res2));
+            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1 + (uint64_t)t * hc.nb_res2));
+            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1 + (uint64_t)t * hc.nb_res2));
 
             for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
-                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0 + (uint64_t)t * hc.nb_post1));
 
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1 + (uint64_t)t * hc.nb_comb2)) * r0;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1 + (uint64_t)t * hc.nb_comb2)) * r1;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1 + (uint64_t)t * hc.nb_comb2)) * r2;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1 + (uint64_t)t * hc.nb_comb2)) * r3;
 
-                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1 + (uint64_t)t * hc.nb2)) = acc;
             }
         }
     }
@@ -739,7 +744,7 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    if (hc.n_hc != 4 || hc.n_tokens != 1) {
+    if (hc.n_hc != 4 || hc.n_tokens == 0) {
         return;
     }
 
@@ -750,12 +755,16 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0(
 
     const int nb = mv.ne00 / QK8_0;
     const int row0 = tgpig.x * NR0;
+    const int t = tgpig.z;
+    if (t >= hc.n_tokens) {
+        return;
+    }
 
     const short ix = tiisg / (NW / NQ);
     const short il = tiisg % (NW / NQ);
     const int ib0 = sgitg * NQ + ix;
 
-    device const float *y = (device const float *)(input);
+    device const float *y = (device const float *)(input + (uint64_t)t * mv.ne00 * sizeof(float));
     device const float *yb = y + ib0 * QK8_0 + il * NQ;
 
     device const block_q8_0 *ax[NR0];
@@ -813,22 +822,22 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0(
 
         const float block_v = simd_sum(shmem_f32[row][tiisg]);
         if (tiisg == 0 && sgitg == 0) {
-            *((device float *)(block_out + (uint64_t)d * sizeof(float))) = block_v;
+            *((device float *)(block_out + (uint64_t)d * hc.nb_block0 + (uint64_t)t * hc.nb_block1)) = block_v;
 
-            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
-            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
-            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
-            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1 + (uint64_t)t * hc.nb_res2));
+            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1 + (uint64_t)t * hc.nb_res2));
+            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1 + (uint64_t)t * hc.nb_res2));
+            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1 + (uint64_t)t * hc.nb_res2));
 
             for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
-                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0 + (uint64_t)t * hc.nb_post1));
 
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1 + (uint64_t)t * hc.nb_comb2)) * r0;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1 + (uint64_t)t * hc.nb_comb2)) * r1;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1 + (uint64_t)t * hc.nb_comb2)) * r2;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1 + (uint64_t)t * hc.nb_comb2)) * r3;
 
-                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1 + (uint64_t)t * hc.nb2)) = acc;
             }
         }
     }

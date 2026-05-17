@@ -150,6 +150,126 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(weights_raw);
 }
 
+static void test_metal_rope_tail_same_position_batch(void) {
+    const uint32_t n_tok = 4;
+    const uint32_t n_head = 8;
+    const uint32_t head_dim = 8;
+    const uint32_t n_rot = 4;
+    const uint32_t pos = 17;
+    const float freq_base = 10000.0f;
+    const float beta_fast = 32.0f;
+    const float beta_slow = 1.0f;
+    const uint64_t row_values = (uint64_t)n_head * head_dim;
+    const uint64_t total_values = (uint64_t)n_tok * row_values;
+    const uint64_t total_bytes = total_values * sizeof(float);
+
+    ds4_gpu_tensor *batch = ds4_gpu_tensor_alloc(total_bytes);
+    ds4_gpu_tensor *serial = ds4_gpu_tensor_alloc(total_bytes);
+    TEST_ASSERT(batch != NULL);
+    TEST_ASSERT(serial != NULL);
+    if (!batch || !serial) {
+        ds4_gpu_tensor_free(batch);
+        ds4_gpu_tensor_free(serial);
+        return;
+    }
+
+    float *input = malloc((size_t)total_bytes);
+    float *batch_out = malloc((size_t)total_bytes);
+    float *serial_out = malloc((size_t)total_bytes);
+    TEST_ASSERT(input != NULL);
+    TEST_ASSERT(batch_out != NULL);
+    TEST_ASSERT(serial_out != NULL);
+    if (!input || !batch_out || !serial_out) {
+        free(serial_out);
+        free(batch_out);
+        free(input);
+        ds4_gpu_tensor_free(batch);
+        ds4_gpu_tensor_free(serial);
+        return;
+    }
+
+    for (uint64_t i = 0; i < total_values; i++) {
+        input[i] = (float)((int)(i % 29u) - 14) / 13.0f;
+    }
+    TEST_ASSERT(ds4_gpu_tensor_write(batch, 0, input, total_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(serial, 0, input, total_bytes) != 0);
+
+    TEST_ASSERT(ds4_gpu_rope_tail_tensor_step(batch,
+                                              n_tok,
+                                              n_head,
+                                              head_dim,
+                                              n_rot,
+                                              pos,
+                                              0,
+                                              0,
+                                              false,
+                                              freq_base,
+                                              1.0f,
+                                              0.0f,
+                                              1.0f,
+                                              beta_fast,
+                                              beta_slow) != 0);
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(serial,
+                                                  (uint64_t)t * row_values * sizeof(float),
+                                                  row_values * sizeof(float));
+        TEST_ASSERT(row != NULL);
+        if (row) {
+            TEST_ASSERT(ds4_gpu_rope_tail_tensor(row,
+                                                 1,
+                                                 n_head,
+                                                 head_dim,
+                                                 n_rot,
+                                                 pos,
+                                                 0,
+                                                 false,
+                                                 freq_base,
+                                                 1.0f,
+                                                 0.0f,
+                                                 1.0f,
+                                                 beta_fast,
+                                                 beta_slow) != 0);
+        }
+        ds4_gpu_tensor_free(row);
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_read(batch, 0, batch_out, total_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(serial, 0, serial_out, total_bytes) != 0);
+
+    float max_abs = 0.0f;
+    for (uint64_t i = 0; i < total_values; i++) {
+        float err = fabsf(batch_out[i] - serial_out[i]);
+        if (err > max_abs) max_abs = err;
+    }
+    TEST_ASSERT(max_abs == 0.0f);
+
+    free(serial_out);
+    free(batch_out);
+    free(input);
+    ds4_gpu_tensor_free(serial);
+    ds4_gpu_tensor_free(batch);
+}
+
+static void test_metal_kernels(void) {
+    test_metal_f16_matvec_fast_nr0_4();
+    test_metal_rope_tail_same_position_batch();
+}
+
+#ifdef __APPLE__
+static void test_metal_concurrency_probe(void) {
+    TEST_ASSERT(ds4_gpu_metal_concurrency_probe() != 0);
+}
+
+static void test_metal_sched2_probe(void) {
+    TEST_ASSERT(ds4_gpu_metal_sched2_probe() != 0);
+}
+
+static void test_metal_block_verifier_probe(void) {
+    TEST_ASSERT(ds4_gpu_metal_block_verifier_probe() != 0);
+}
+#endif
+
 static char *test_read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
@@ -577,12 +697,24 @@ typedef struct {
     test_fn fn;
 } ds4_test_entry;
 
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+static void test_metal_mtp_cache_contract(void) {
+    TEST_ASSERT(ds4_mtp_cache_contract_selftest() == 0);
+}
+#endif
+
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
-    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
+    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernels},
+#ifdef __APPLE__
+    {"--metal-concurrency", "metal-concurrency", "Metal compute dispatch concurrency probe", test_metal_concurrency_probe},
+    {"--metal-sched2", "metal-sched2", "Metal sched2 explicit-resource DAG probe", test_metal_sched2_probe},
+    {"--metal-block-verifier", "metal-block-verifier", "Metal block-verifier top-id harness", test_metal_block_verifier_probe},
+    {"--metal-mtp-cache-contract", "metal-mtp-cache-contract", "native MTP cache ledger contract harness", test_metal_mtp_cache_contract},
+#endif
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
@@ -603,6 +735,10 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context regression prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
+    puts("  DS4_METAL_CONCURRENCY_PROBE_*  Tune --metal-concurrency groups/threads/iters.");
+    puts("  DS4_METAL_SCHED2_PROBE_*       Tune --metal-sched2 groups/threads/iters.");
+    puts("  DS4_MTP_BLOCK_*                Enable/tune block verifier experiments.");
+    puts("  DS4_MTP_NATIVE_*               Enable/tune native MTP cache-contract experiments.");
 }
 
 static const ds4_test_entry *test_find_entry(const char *arg) {

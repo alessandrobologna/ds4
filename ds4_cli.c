@@ -488,6 +488,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         return 1;
     }
     ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_greedy_top_id_frontier(session, cfg->gen.temperature <= 0.0f);
     const double t_prefill1 = cli_now_sec();
 
     int max_tokens = cfg->gen.n_predict;
@@ -501,6 +502,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
+        if (token < 0) {
+            fprintf(stderr, "ds4: sample failed: fresh full logits are unavailable\n");
+            ds4_session_free(session);
+            return 1;
+        }
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
@@ -936,6 +942,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         return 1;
     }
     ds4_session_set_progress(chat->session, NULL, NULL);
+    ds4_session_set_greedy_top_id_frontier(chat->session, cfg->gen.temperature <= 0.0f);
     const double t_prefill1 = cli_now_sec();
 
     token_printer printer = {
@@ -963,6 +970,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        cfg->gen.top_p,
                                        0.0f,
                                        &rng);
+        if (token < 0) {
+            fprintf(stderr, "ds4: sample failed: fresh full logits are unavailable\n");
+            return 1;
+        }
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];

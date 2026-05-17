@@ -27,6 +27,13 @@ struct ds4_metal_args_dsv4_kv_fp8_store {
     int32_t raw_row;
 };
 
+struct ds4_metal_args_dsv4_kv_fp8_store_batch {
+    int32_t head_dim;
+    int32_t n_rot;
+    int32_t raw_cap;
+    int32_t pos0;
+};
+
 struct ds4_metal_args_dsv4_ratio4_shift {
     uint32_t width;
 };
@@ -174,6 +181,56 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
 
     for (int i = n_nope + tid; i < head_dim; i += 64) {
         raw[i] = (float)((half)kv[i]);
+    }
+}
+
+kernel void kernel_dsv4_kv_fp8_store_batch_f32(
+        constant ds4_metal_args_dsv4_kv_fp8_store_batch & args,
+        device        float * kv,
+        device        float * raw_cache,
+        threadgroup   float * scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint token [[threadgroup_position_in_grid]]) {
+    const int head_dim = args.head_dim;
+    const int n_rot = args.n_rot;
+    const int n_nope = head_dim - n_rot;
+    if (head_dim <= 0 || n_rot < 0 || n_nope < 0 || tid >= 64 || args.raw_cap <= 0) {
+        return;
+    }
+
+    device float * kv_row = kv + (int64_t)token * head_dim;
+    const int raw_row = (args.pos0 + (int)token) % args.raw_cap;
+    device float * raw = raw_cache + (int64_t)raw_row * head_dim;
+
+    for (int off = 0; off < n_nope; off += 64) {
+        float v = 0.0f;
+        if (off + (int)tid < n_nope) {
+            v = kv_row[off + tid];
+            scratch[tid] = abs(v);
+        } else {
+            scratch[tid] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float amax = max(scratch[0], 1.0e-4f);
+        const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+        if (off + (int)tid < n_nope) {
+            const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
+            kv_row[off + tid] = q;
+            raw[off + tid] = (float)((half)q);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = n_nope + tid; i < head_dim; i += 64) {
+        raw[i] = (float)((half)kv_row[i]);
     }
 }
 

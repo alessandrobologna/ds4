@@ -5590,3 +5590,94 @@ Interpretation:
 - Keep this path as an evidence probe only. Do not promote it unless a later
   scheduler rewrite can show nonzero GPU overlap with the same native verifier
   contract.
+
+### 2026-05-17 Target-First Native Scheduler Probe
+
+Implementation:
+
+- Added an Apple-only target command-buffer primitive:
+  - `ds4_gpu_end_commands_no_wait()`
+  - `ds4_gpu_wait_target_async_commands()`
+- Added `DS4_MTP_NATIVE_TARGET_FIRST_CONT=1`.
+- Unlike `DS4_MTP_NATIVE_SCHED2_CONT=1`, this submits the target verifier first
+  without waiting, then submits the MTP continuation while the target verifier is
+  still pending.
+- The hook is deliberately narrow: it only arms for the native small-M,
+  top-id-only, single-command verifier path. It does not alter default native
+  decoding and does not promote the continuation tokens yet.
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: same build and Metal harness checks in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Timeline evidence:
+
+- Artifact: `/tmp/ds4-native-targetfirst-timeline-20260517_041558`
+- Settings: `DS4_MTP_NATIVE_TARGET_FIRST_CONT=1`,
+  `DS4_MTP_NATIVE_SCHED2_CONT_M=4`, native `K=4`, count prompt, `-n 8`.
+- Result: real GPU overlap is achieved.
+
+Example first cycle:
+
+- Target verifier GPU span: `51.266 ms`
+- MTP continuation GPU span: `57.938 ms`
+- Overlap: `51.266 ms`
+- Overlap percentage: `100.00%`
+
+The important caveat is resource contention: the same continuation work that
+previously took about `6.4 ms` when serialized stretches to about `58 ms` when
+run concurrently with the target verifier.
+
+Studio smoke matrix:
+
+- Artifact: `/tmp/ds4-native-targetfirst-20260517_041620`
+- Baseline native settings: `DS4_MTP_NATIVE=1 DS4_MTP_NATIVE_TIMING=1
+  DS4_MTP_NATIVE_VERIFY_OPT=smallm DS4_MTP_NATIVE_CACHE_MODE=owned`
+- Target-first settings add `DS4_MTP_NATIVE_TARGET_FIRST_CONT=1`.
+
+| Prompt | K | baseline t/s | target-first M1 t/s | target-first M4 t/s | stdout |
+| --- | ---: | ---: | ---: | ---: | --- |
+| count | 3 | 39.53 | 38.63 | 36.44 | match |
+| count | 4 | 44.80 | 44.33 | 42.10 | match |
+| explain | 3 | 32.42 | 31.76 | 30.35 | match |
+| explain | 4 | 32.29 | 31.72 | 30.18 | match |
+| code | 3 | 37.68 | 37.00 | 34.98 | match |
+| code | 4 | 33.05 | 33.37 | 33.30 | match |
+
+Overlap summary:
+
+| Mode | Prompt | K | started/cycles | avg target GPU | avg MTP GPU | avg overlap | avg overlap pct |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| M1 | count | 3 | 21/21 | 40.250 ms | 41.859 ms | 40.247 ms | 99.99% |
+| M1 | count | 4 | 16/16 | 51.765 ms | 53.398 ms | 51.763 ms | 99.99% |
+| M1 | explain | 3 | 22/30 | 30.232 ms | 31.414 ms | 30.230 ms | 73.33% |
+| M1 | explain | 4 | 22/30 | 30.412 ms | 31.606 ms | 30.410 ms | 73.33% |
+| M1 | code | 3 | 21/23 | 37.405 ms | 38.877 ms | 37.403 ms | 91.30% |
+| M4 | count | 3 | 21/21 | 40.350 ms | 46.632 ms | 40.218 ms | 99.67% |
+| M4 | count | 4 | 16/16 | 51.875 ms | 58.157 ms | 51.750 ms | 99.76% |
+| M4 | explain | 3 | 22/30 | 30.081 ms | 34.692 ms | 29.993 ms | 73.12% |
+| M4 | explain | 4 | 22/30 | 30.313 ms | 34.953 ms | 30.234 ms | 73.14% |
+| M4 | code | 3 | 21/23 | 37.451 ms | 43.194 ms | 37.344 ms | 91.04% |
+
+Audit:
+
+- Artifact: `/tmp/ds4-native-targetfirst-audit-20260517_041842`
+- `K=4`, count prompt, `-n 16`, `DS4_MTP_NATIVE_OUTPUT_FUSED_TOP1_AUDIT=1`
+- Stdout matched serial and audit mismatch count stayed `0`.
+
+Interpretation:
+
+- The scheduler question has changed: target-first no-wait submission can
+  produce real target/MTP overlap on Studio.
+- The current continuation probe is not throughput-positive because overlapped
+  MTP work contends so heavily with target verification that it lengthens to
+  almost the target span. Since the continuation is also discarded in this probe,
+  M1/M4 are expected to be neutral-to-negative.
+- A promotable follow-up would need to store and consume the continuation queue
+  transactionally, then measure whether avoiding the next-cycle draft work
+  offsets the contention. That is a state-contract problem, not another Metal
+  scheduling proof.

@@ -14449,6 +14449,110 @@ static bool metal_graph_start_mtp_native_continuation_probe(
     return ok;
 }
 
+static bool metal_graph_finish_mtp_native_target_hc_chain_timed(
+        ds4_gpu_graph *g,
+        int           *tokens,
+        uint32_t       depth,
+        double        *wait_ms,
+        double        *read_ms);
+
+#ifdef __APPLE__
+typedef struct {
+    bool enabled;
+    bool started;
+    bool finished;
+    ds4_gpu_graph *g;
+    const ds4_model *base_model;
+    const ds4_weights *base_weights;
+    const ds4_model *mtp_model;
+    const ds4_mtp_weights *mtp;
+    ds4_gpu_tensor *base_hc;
+    uint32_t base_mtp_raw;
+    uint32_t pos;
+    uint32_t depth;
+    int token;
+    double start_ms;
+    double wait_target_ms;
+    double wait_mtp_ms;
+    double read_ms;
+} ds4_mtp_native_target_first_probe;
+
+static ds4_mtp_native_target_first_probe g_mtp_native_target_first_probe;
+
+static void ds4_mtp_native_target_first_probe_clear(void) {
+    memset(&g_mtp_native_target_first_probe, 0, sizeof(g_mtp_native_target_first_probe));
+    g_mtp_native_target_first_probe.token = -1;
+}
+
+static void ds4_mtp_native_target_first_probe_arm(
+        ds4_gpu_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        ds4_gpu_tensor       *base_hc,
+        uint32_t               base_mtp_raw,
+        int                    token,
+        uint32_t               pos,
+        uint32_t               depth) {
+    ds4_mtp_native_target_first_probe_clear();
+    if (!g || !base_model || !base_weights || !mtp_model || !mtp || !base_hc ||
+        token < 0 || depth == 0 || depth > DS4_MTP_SCHED2_MAX_BRANCH_K) {
+        return;
+    }
+    g_mtp_native_target_first_probe.enabled = true;
+    g_mtp_native_target_first_probe.g = g;
+    g_mtp_native_target_first_probe.base_model = base_model;
+    g_mtp_native_target_first_probe.base_weights = base_weights;
+    g_mtp_native_target_first_probe.mtp_model = mtp_model;
+    g_mtp_native_target_first_probe.mtp = mtp;
+    g_mtp_native_target_first_probe.base_hc = base_hc;
+    g_mtp_native_target_first_probe.base_mtp_raw = base_mtp_raw;
+    g_mtp_native_target_first_probe.token = token;
+    g_mtp_native_target_first_probe.pos = pos;
+    g_mtp_native_target_first_probe.depth = depth;
+}
+
+static bool ds4_mtp_native_target_first_probe_submit_and_wait(void) {
+    ds4_mtp_native_target_first_probe *p = &g_mtp_native_target_first_probe;
+    if (!p->enabled) return ds4_gpu_end_commands() != 0;
+
+    bool ok = ds4_gpu_end_commands_no_wait() != 0;
+    const double start_t0 = now_sec();
+    if (ok) {
+        p->started = metal_graph_start_mtp_native_continuation_probe(p->g,
+                                                                     p->base_model,
+                                                                     p->base_weights,
+                                                                     p->mtp_model,
+                                                                     p->mtp,
+                                                                     p->base_hc,
+                                                                     p->base_mtp_raw,
+                                                                     p->token,
+                                                                     p->pos,
+                                                                     p->depth);
+    }
+    const double start_done = now_sec();
+    p->start_ms = (start_done - start_t0) * 1000.0;
+
+    const double target_t0 = now_sec();
+    const bool target_ok = ds4_gpu_wait_target_async_commands() != 0;
+    const double target_done = now_sec();
+    p->wait_target_ms = (target_done - target_t0) * 1000.0;
+    ok = ok && target_ok;
+
+    if (p->started) {
+        int cont_tokens[DS4_MTP_SCHED2_MAX_BRANCH_K];
+        for (int i = 0; i < DS4_MTP_SCHED2_MAX_BRANCH_K; i++) cont_tokens[i] = -1;
+        p->finished = metal_graph_finish_mtp_native_target_hc_chain_timed(p->g,
+                                                                          cont_tokens,
+                                                                          p->depth,
+                                                                          &p->wait_mtp_ms,
+                                                                          &p->read_ms);
+    }
+    return ok;
+}
+#endif
+
 static bool metal_graph_start_mtp_runahead_branches(
         ds4_gpu_graph       *g,
         const ds4_model       *base_model,
@@ -17869,7 +17973,13 @@ static bool metal_graph_verify_decode_exact(
     if (single_command) {
         if (!ok) (void)ds4_gpu_synchronize();
     } else {
-        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) {
+#ifdef __APPLE__
+            ok = ds4_mtp_native_target_first_probe_submit_and_wait();
+#else
+            ok = ds4_gpu_end_commands() != 0;
+#endif
+        }
         else (void)ds4_gpu_synchronize();
     }
     const double decode_done = profile ? now_sec() : 0.0;
@@ -17919,7 +18029,13 @@ static bool metal_graph_verify_decode_exact(
                                                  top_k) != 0;
             }
         }
-        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) {
+#ifdef __APPLE__
+            ok = ds4_mtp_native_target_first_probe_submit_and_wait();
+#else
+            ok = ds4_gpu_end_commands() != 0;
+#endif
+        }
         else (void)ds4_gpu_synchronize();
         const double head_done = profile ? now_sec() : 0.0;
         if (profile) profile->head_wall_ms = (head_done - head_t0) * 1000.0;
@@ -20271,6 +20387,11 @@ static bool ds4_mtp_native_pretarget_draft_enabled(void) {
 
 static bool ds4_mtp_native_sched2_cont_enabled(void) {
     const char *v = getenv("DS4_MTP_NATIVE_SCHED2_CONT");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static bool ds4_mtp_native_target_first_cont_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_TARGET_FIRST_CONT");
     return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
 }
 
@@ -24942,6 +25063,7 @@ static int ds4_session_eval_mtp_native(
     const bool chain_draft_requested = ds4_mtp_native_chain_draft_enabled();
     const bool pretarget_requested = ds4_mtp_native_pretarget_draft_enabled();
     const bool sched2_cont_requested = ds4_mtp_native_sched2_cont_enabled();
+    const bool target_first_cont_requested = ds4_mtp_native_target_first_cont_enabled();
     const int sched2_cont_m = ds4_mtp_native_sched2_cont_m_get();
     const bool root_inclusive_requested = ds4_mtp_native_root_inclusive_enabled();
     const int adaptive_optimistic_streak =
@@ -25019,6 +25141,7 @@ static int ds4_session_eval_mtp_native(
     double restore_ms = 0.0;
     double replay_ms = 0.0;
     double sched2_cont_start_ms = 0.0;
+    double sched2_cont_wait_target_ms = 0.0;
     double sched2_cont_wait_ms = 0.0;
     double sched2_cont_read_ms = 0.0;
     double sched2_cont_target_gpu_ms = 0.0;
@@ -25621,6 +25744,7 @@ static int ds4_session_eval_mtp_native(
     }
 
     if (sched2_cont_requested &&
+        !target_first_cont_requested &&
         !validate &&
         native_approx_topk == 1 &&
         suffix_n > 0 &&
@@ -25714,6 +25838,44 @@ static int ds4_session_eval_mtp_native(
                 ds4_mtp_single_command_default_set(native_single_command_default);
             const int saved_top1_only_default =
                 ds4_mtp_output_top1_only_default_set(verifier_output_top1_only_default);
+#ifdef __APPLE__
+            bool target_first_armed = false;
+            ds4_mtp_native_target_first_probe_clear();
+            if (target_first_cont_requested &&
+                native_single_command_default &&
+                native_top_only &&
+                native_approx_topk == 1 &&
+                preview_valid &&
+                preview >= 0 &&
+                preview != eos_token &&
+                draft_n > 1 &&
+                draft_n <= DS4_MTP_NATIVE_MAX_K &&
+                !ds4_gpu_mtp_async_pending()) {
+                int cont_room = s->ctx_size - (start + draft_n);
+                if (cont_room > sched2_cont_m) cont_room = sched2_cont_m;
+                if (cont_room > DS4_MTP_SCHED2_MAX_BRANCH_K) {
+                    cont_room = DS4_MTP_SCHED2_MAX_BRANCH_K;
+                }
+                if (cont_room > 0) {
+                    const uint32_t base_raw = ds4_mtp_native_clamp_raw(
+                        ledger.begin_mtp_raw + (uint32_t)draft_n,
+                        g->raw_window,
+                        g->raw_cap);
+                    ds4_mtp_native_target_first_probe_arm(g,
+                                                          &e->model,
+                                                          &e->weights,
+                                                          &e->mtp_model,
+                                                          &e->mtp_weights,
+                                                          g->mtp_native_state_hc[draft_n - 1],
+                                                          base_raw,
+                                                          preview,
+                                                          (uint32_t)(start + draft_n),
+                                                          (uint32_t)cont_room);
+                    target_first_armed = g_mtp_native_target_first_probe.enabled;
+                    if (target_first_armed) sched2_cont_depth = (uint32_t)cont_room;
+                }
+            }
+#endif
             verifier_ok = metal_graph_verify_decode_exact(g,
                                                           &e->model,
                                                           &e->weights,
@@ -25728,6 +25890,54 @@ static int ds4_session_eval_mtp_native(
                                                           suffix_top_ids,
                                                           suffix_logits,
                                                           timing ? &profile : NULL);
+#ifdef __APPLE__
+            if (target_first_armed) {
+                sched2_cont_started = g_mtp_native_target_first_probe.started;
+                sched2_cont_finished = g_mtp_native_target_first_probe.finished;
+                sched2_cont_start_ms = g_mtp_native_target_first_probe.start_ms;
+                sched2_cont_wait_target_ms = g_mtp_native_target_first_probe.wait_target_ms;
+                sched2_cont_wait_ms = g_mtp_native_target_first_probe.wait_mtp_ms;
+                sched2_cont_read_ms = g_mtp_native_target_first_probe.read_ms;
+                ds4_gpu_command_span mtp_span = {0};
+                (void)ds4_gpu_command_spans_read(NULL, &mtp_span);
+                if (profile.gpu_end > profile.gpu_start) {
+                    sched2_cont_target_gpu_ms =
+                        (profile.gpu_end - profile.gpu_start) * 1000.0;
+                }
+                if (mtp_span.valid) {
+                    sched2_cont_mtp_gpu_ms =
+                        (mtp_span.gpu_end - mtp_span.gpu_start) * 1000.0;
+                }
+                if (profile.gpu_end > profile.gpu_start && mtp_span.valid) {
+                    const double overlap_start = profile.gpu_start > mtp_span.gpu_start
+                        ? profile.gpu_start
+                        : mtp_span.gpu_start;
+                    const double overlap_end = profile.gpu_end < mtp_span.gpu_end
+                        ? profile.gpu_end
+                        : mtp_span.gpu_end;
+                    if (overlap_end > overlap_start) {
+                        sched2_cont_overlap_ms = (overlap_end - overlap_start) * 1000.0;
+                    } else {
+                        const double a = profile.gpu_start > mtp_span.gpu_start
+                            ? profile.gpu_start
+                            : mtp_span.gpu_start;
+                        const double b = profile.gpu_end < mtp_span.gpu_end
+                            ? profile.gpu_end
+                            : mtp_span.gpu_end;
+                        sched2_cont_gap_ms = (a - b) * 1000.0;
+                        if (sched2_cont_gap_ms < 0.0) sched2_cont_gap_ms = 0.0;
+                    }
+                    const double shorter = sched2_cont_target_gpu_ms < sched2_cont_mtp_gpu_ms
+                        ? sched2_cont_target_gpu_ms
+                        : sched2_cont_mtp_gpu_ms;
+                    if (shorter > 0.0) {
+                        sched2_cont_overlap_pct =
+                            100.0 * sched2_cont_overlap_ms / shorter;
+                    }
+                }
+            }
+            ds4_mtp_native_target_first_probe_clear();
+#endif
             ds4_mtp_output_top1_only_default_restore(saved_top1_only_default);
             ds4_mtp_single_command_default_restore(saved_single_default);
             (void)ds4_mtp_decode2_override_set(saved_override);
@@ -26125,14 +26335,14 @@ static int ds4_session_eval_mtp_native(
     }
     if (timing) {
         fprintf(stderr,
-                "ds4: mtp native cycle mode=%s verify_opt=%s commit_opt=%s effective_commit=%s approx_topk=%d approx_rows=%d top_only=%d topid_frontier=%d single_command=%d output_fused_top1=%d output_top1_only=%d logits_row=%d remat_row=%d snapshot_elided=%d slot_commit=%d capture_compute_copy=%d pretarget_requested=%d pretarget_possible=%d pretarget=%d chain_draft=%d chain_rows=%u sched2_cont_requested=%d sched2_cont_started=%d sched2_cont_finished=%d sched2_cont_m=%d sched2_cont_depth=%u capture_rows=%d kept_verifier_state=%d capture_cooldown=%d adaptive_full_streak=%d adaptive_partial_streak=%d adaptive_threshold=%d depth=%d drafted=%d processed=%d "
+                "ds4: mtp native cycle mode=%s verify_opt=%s commit_opt=%s effective_commit=%s approx_topk=%d approx_rows=%d top_only=%d topid_frontier=%d single_command=%d output_fused_top1=%d output_top1_only=%d logits_row=%d remat_row=%d snapshot_elided=%d slot_commit=%d capture_compute_copy=%d pretarget_requested=%d pretarget_possible=%d pretarget=%d chain_draft=%d chain_rows=%u sched2_cont_requested=%d target_first_cont_requested=%d sched2_cont_started=%d sched2_cont_finished=%d sched2_cont_m=%d sched2_cont_depth=%u capture_rows=%d kept_verifier_state=%d capture_cooldown=%d adaptive_full_streak=%d adaptive_partial_streak=%d adaptive_threshold=%d depth=%d drafted=%d processed=%d "
                 "committed=%d accepted=%d first_suffix_top=%d first_suffix_draft=%d "
                 "first_suffix_rank=%d preview=%d preview_valid=%d discarded=%d "
                 "target=%.3f ms draft=%.3f ms snapshot=%.3f ms verify=%.3f ms "
                 "verifier_decode=%.3f ms verifier_head=%.3f ms "
                 "verifier_decode_gpu=%.3f ms verifier_head_gpu=%.3f ms verifier_total_gpu=%.3f ms "
                 "logits_read=%.3f ms restore=%.3f ms validate=%.3f ms commit=%.3f ms replay=%.3f ms mtp_commit=%.3f ms "
-                "sched2_cont_start=%.3f ms sched2_cont_wait=%.3f ms sched2_cont_read=%.3f ms "
+                "sched2_cont_start=%.3f ms sched2_cont_wait_target=%.3f ms sched2_cont_wait=%.3f ms sched2_cont_read=%.3f ms "
                 "sched2_cont_target_gpu=%.3f ms sched2_cont_mtp_gpu=%.3f ms sched2_cont_overlap=%.3f ms sched2_cont_gap=%.3f ms sched2_cont_overlap_pct=%.2f "
                 "mtp_raw_base=%u mtp_raw_keep=%u mtp_raw_discarded=%u "
                 "max_delta=%.6g mismatches=%d total=%.3f ms\n",
@@ -26158,6 +26368,7 @@ static int ds4_session_eval_mtp_native(
                 chain_draft ? 1 : 0,
                 chain_processed_rows,
                 sched2_cont_requested ? 1 : 0,
+                target_first_cont_requested ? 1 : 0,
                 sched2_cont_started ? 1 : 0,
                 sched2_cont_finished ? 1 : 0,
                 sched2_cont_m,
@@ -26195,6 +26406,7 @@ static int ds4_session_eval_mtp_native(
                 replay_ms,
                 mtp_commit_ms,
                 sched2_cont_start_ms,
+                sched2_cont_wait_target_ms,
                 sched2_cont_wait_ms,
                 sched2_cont_read_ms,
                 sched2_cont_target_gpu_ms,

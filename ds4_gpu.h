@@ -67,6 +67,8 @@ typedef struct {
 
 void ds4_gpu_command_spans_reset(void);
 int ds4_gpu_command_spans_read(ds4_gpu_command_span *target, ds4_gpu_command_span *mtp);
+int ds4_gpu_end_commands_no_wait(void);
+int ds4_gpu_wait_target_async_commands(void);
 int ds4_gpu_metal_concurrency_probe(void);
 int ds4_gpu_metal_sched2_probe(void);
 int ds4_gpu_metal_block_verifier_probe(void);

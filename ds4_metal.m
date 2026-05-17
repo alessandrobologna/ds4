@@ -4458,6 +4458,31 @@ int ds4_gpu_end_commands(void) {
     return ok;
 }
 
+int ds4_gpu_end_commands_no_wait(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb) return 0;
+    if (g_active_queue == g_mtp_queue) return 0;
+
+    ds4_gpu_close_batch_encoders();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    ds4_metal_buffer_audit_finish("target-async-end");
+    g_batch_cb = nil;
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    g_active_queue = g_queue;
+    g_active_scratch = &g_default_scratch;
+    g_transient_buffers = g_default_transient_buffers;
+    return 1;
+}
+
+int ds4_gpu_wait_target_async_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if ([g_pending_cbs count] == 0) return 1;
+    int ok = ds4_gpu_wait_pending_command_buffers("target async command batch");
+    [g_transient_buffers removeAllObjects];
+    return ok;
+}
+
 int ds4_gpu_mtp_async_pending(void) {
     return g_mtp_pending_cb != nil || (g_batch_cb && g_active_queue == g_mtp_queue);
 }

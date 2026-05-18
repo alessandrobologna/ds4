@@ -360,7 +360,7 @@ kernel void kernel_mul_mv_q8_0_f32_rows4(
     kernel_mul_mv_q8_0_f32_rows_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-template<short NROWS>
+template<short NROWS, short NR0>
 void kernel_mul_mv_q8_0_f32_rows_top1_final_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
@@ -381,7 +381,6 @@ void kernel_mul_mv_q8_0_f32_rows_top1_final_impl(
     const short NSG = FC_mul_mv_nsg;
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
-    constexpr short NR0 = N_R0_Q8_0;
 
     const int nb = args.ne00 / QK8_0;
     const int r0 = tgpig.x * NR0;
@@ -516,7 +515,7 @@ kernel void kernel_mul_mv_q8_0_f32_rows1_top1_final(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<1>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<1, N_R0_Q8_0>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32_rows2_top1_final")]]
@@ -532,7 +531,7 @@ kernel void kernel_mul_mv_q8_0_f32_rows2_top1_final(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<2>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<2, N_R0_Q8_0>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32_rows3_top1_final")]]
@@ -548,7 +547,7 @@ kernel void kernel_mul_mv_q8_0_f32_rows3_top1_final(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<3>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<3, N_R0_Q8_0>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32_rows4_top1_final")]]
@@ -564,7 +563,71 @@ kernel void kernel_mul_mv_q8_0_f32_rows4_top1_final(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<4>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<4, N_R0_Q8_0>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_rows1_top1_final_r4")]]
+kernel void kernel_mul_mv_q8_0_f32_rows1_top1_final_r4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device float * scratch_vals,
+        device int32_t * scratch_ids,
+        device float * final_logits,
+        constant uint32_t & final_row,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<1, 4>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_rows2_top1_final_r4")]]
+kernel void kernel_mul_mv_q8_0_f32_rows2_top1_final_r4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device float * scratch_vals,
+        device int32_t * scratch_ids,
+        device float * final_logits,
+        constant uint32_t & final_row,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<2, 4>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_rows3_top1_final_r4")]]
+kernel void kernel_mul_mv_q8_0_f32_rows3_top1_final_r4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device float * scratch_vals,
+        device int32_t * scratch_ids,
+        device float * final_logits,
+        constant uint32_t & final_row,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<3, 4>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_rows4_top1_final_r4")]]
+kernel void kernel_mul_mv_q8_0_f32_rows4_top1_final_r4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device float * scratch_vals,
+        device int32_t * scratch_ids,
+        device float * final_logits,
+        constant uint32_t & final_row,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rows_top1_final_impl<4, 4>(args, src0, src1, scratch_vals, scratch_ids, final_logits, final_row, shmem, tgpig, tiisg, sgitg);
 }
 
 // Decode shared-expert gate/up projections followed by SwiGLU:

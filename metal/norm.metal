@@ -13,6 +13,65 @@ struct ds4_metal_args_norm {
     uint64_t nbf3[3];
 };
 
+struct ds4_metal_args_dsv4_embed_norm {
+    uint32_t n_embd;
+    uint32_t n_embd4;
+    uint32_t n_vocab;
+    uint32_t token;
+    uint32_t use_token_buffer;
+    uint32_t _pad0;
+    uint64_t embed_row_stride;
+    float    eps;
+};
+
+kernel void kernel_dsv4_embed_token_norm_f16_f32(
+        constant ds4_metal_args_dsv4_embed_norm & args,
+        device const char  * embed,
+        device const int32_t * token_buf,
+        device const float4 * weight,
+        device       float4 * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int32_t tok = args.use_token_buffer ? token_buf[0] : (int32_t) args.token;
+    if (tok < 0 || (uint32_t) tok >= args.n_vocab) {
+        return;
+    }
+
+    device const half * row = (device const half *) (embed + (uint64_t) tok * args.embed_row_stride);
+    float sumf = 0.0f;
+    for (uint32_t i = tpitg.x; i < args.n_embd4; i += ntg.x) {
+        const uint32_t off = i * 4u;
+        const float4 v = float4(row[off + 0u], row[off + 1u], row[off + 2u], row[off + 3u]);
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float scale = 1.0f / sqrt(sumf / (float) args.n_embd + args.eps);
+    for (uint32_t i = tpitg.x; i < args.n_embd4; i += ntg.x) {
+        const uint32_t off = i * 4u;
+        const float4 v = float4(row[off + 0u], row[off + 1u], row[off + 2u], row[off + 3u]);
+        dst[i] = (v * scale) * weight[i];
+    }
+}
+
 // RMSNorm over one activation row, optionally fusing the learned weight
 // multiply. DS4 calls this before attention, before the FFN, and for plain
 // diagnostics that need normalized but unweighted rows.

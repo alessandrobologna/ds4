@@ -21,6 +21,19 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     uint64_t nb1;
 };
 
+struct ds4_metal_args_dsv4_hc_add_broadcast {
+    uint32_t n_embd;
+    uint32_t n_hc;
+};
+
+struct ds4_metal_args_dsv4_output_hc_norm {
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t n_tokens;
+    float    eps;
+    float    norm_eps;
+};
+
 struct ds4_metal_args_dsv4_hc_split_weighted_sum {
     int64_t  n_embd;
     int32_t  n_hc;
@@ -867,4 +880,77 @@ kernel void kernel_dsv4_hc_weighted_sum(
     }
 
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+}
+
+// Adds one embedding row to every HC channel without materializing a repeated
+// HC tensor first. Used by native MTP continuation row input construction.
+kernel void kernel_dsv4_hc_add_broadcast(
+        constant ds4_metal_args_dsv4_hc_add_broadcast & args,
+        device const float * hc,
+        device const float * row,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = args.n_embd * args.n_hc;
+    if (gid >= n) {
+        return;
+    }
+
+    const uint d = gid % args.n_embd;
+    dst[gid] = hc[gid] + row[d];
+}
+
+// MTP output-head HC reducer specialized for one small HC bundle per token.
+// It fuses output HC weights, weighted HC sum, and weighted RMS norm.
+kernel void kernel_dsv4_output_hc_norm(
+        constant ds4_metal_args_dsv4_output_hc_norm & args,
+        device const float * pre,
+        device const float * scale,
+        device const float * base,
+        device const float * residual_hc,
+        device const float * norm_weight,
+        device       float * dst,
+        threadgroup float * scratch [[threadgroup(0)]],
+        uint t [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (t >= args.n_tokens || args.n_hc > 16) {
+        return;
+    }
+
+    threadgroup float * weights = scratch;
+    threadgroup float * sums = scratch + 16;
+    if (tid < args.n_hc) {
+        const float x = pre[t * args.n_hc + tid] * scale[0] + base[tid];
+        weights[tid] = 1.0f / (1.0f + exp(-x)) + args.eps;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local = 0.0f;
+    for (uint d = tid; d < args.n_embd; d += nth) {
+        float acc = 0.0f;
+        for (uint h = 0; h < args.n_hc; ++h) {
+            const uint64_t idx = ((uint64_t)t * args.n_hc + h) * args.n_embd + d;
+            acc += residual_hc[idx] * weights[h];
+        }
+        local += acc * acc;
+    }
+    sums[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sums[tid] += sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_rms = rsqrt(sums[0] / (float) args.n_embd + args.norm_eps);
+
+    for (uint d = tid; d < args.n_embd; d += nth) {
+        float acc = 0.0f;
+        for (uint h = 0; h < args.n_hc; ++h) {
+            const uint64_t idx = ((uint64_t)t * args.n_hc + h) * args.n_embd + d;
+            acc += residual_hc[idx] * weights[h];
+        }
+        dst[(uint64_t)t * args.n_embd + d] = acc * inv_rms * norm_weight[d];
+    }
 }

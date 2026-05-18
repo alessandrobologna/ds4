@@ -10750,46 +10750,138 @@ static bool metal_graph_matmul_plain_tensor(
     return false;
 }
 
+typedef struct ds4_mtp_draft_stage_profile ds4_mtp_draft_stage_profile;
+
+static bool metal_graph_mtp_draft_profile_boundary(
+        ds4_mtp_draft_stage_profile *profile,
+        const char                  *stage);
+
+static bool ds4_mtp_native_mtp_output_fused_norm_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_MTP_OUTPUT_FUSED_NORM");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static bool ds4_metal_q8_top1_nr4_enabled(void) {
+    const char *v = getenv("DS4_METAL_Q8_TOP1_NR4");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static bool metal_graph_encode_output_head_mtp_impl(
+        ds4_gpu_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        uint64_t               vocab_dim,
+        ds4_gpu_tensor        *top1_out,
+        bool                   top1_only,
+        ds4_gpu_tensor        *next_enorm_out,
+        ds4_mtp_draft_stage_profile *stage_profile) {
+    if ((top1_only || next_enorm_out) && (!top1_out || vocab_dim != DS4_N_VOCAB)) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    if (ok) ok = metal_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
+                                                 hc_dim, DS4_N_HC, g->flat_hc, 1);
+    if (ok && ds4_mtp_native_mtp_output_fused_norm_enabled()) {
+        ok = ds4_gpu_output_hc_norm_fused_tensor(g->output_norm,
+                                                  g->cur_hc,
+                                                  g->output_pre,
+                                                  mtp_model->map,
+                                                  mtp_model->size,
+                                                  mtp->hc_head_scale->abs_offset,
+                                                  mtp->hc_head_base->abs_offset,
+                                                  mtp->norm->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC,
+                                                  DS4_HC_EPS,
+                                                  DS4_RMS_EPS) != 0;
+    } else {
+        if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
+                                                        g->output_pre,
+                                                        mtp_model->map,
+                                                        mtp_model->size,
+                                                        mtp->hc_head_scale->abs_offset,
+                                                        mtp->hc_head_base->abs_offset,
+                                                        DS4_N_HC,
+                                                        DS4_HC_EPS) != 0;
+        if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(g->output_embd,
+                                                      g->cur_hc,
+                                                      g->output_weights,
+                                                      DS4_N_EMBD,
+                                                      DS4_N_HC) != 0;
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+                                                      g->output_embd,
+                                                      mtp_model->map,
+                                                      mtp_model->size,
+                                                      mtp->norm->abs_offset,
+                                                      DS4_N_EMBD,
+                                                      DS4_RMS_EPS) != 0;
+    }
+    if (ok) ok = metal_graph_mtp_draft_profile_boundary(stage_profile, "output_hc_norm");
+    if (ok && next_enorm_out) {
+        ok = ds4_gpu_matmul_q8_0_top1_embed_norm_tensor(top1_out,
+                                                        next_enorm_out,
+                                                        base_model->map,
+                                                        base_model->size,
+                                                        base_weights->output->abs_offset,
+                                                        DS4_N_EMBD,
+                                                        vocab_dim,
+                                                        g->output_norm,
+                                                        1,
+                                                        base_model->map,
+                                                        base_model->size,
+                                                        mtp_model->map,
+                                                        mtp_model->size,
+                                                        base_weights->token_embd->abs_offset,
+                                                        mtp->enorm->abs_offset,
+                                                        (uint32_t)base_weights->token_embd->dim[1],
+                                                        DS4_N_EMBD,
+                                                        DS4_RMS_EPS) != 0;
+        if (ok) ok = metal_graph_mtp_draft_profile_boundary(stage_profile, "output_top1_next_input");
+    } else if (ok && top1_only) {
+        ok = ds4_gpu_matmul_q8_0_top1_only_tensor(top1_out,
+                                                  base_model->map,
+                                                  base_model->size,
+                                                  base_weights->output->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  vocab_dim,
+                                                  g->output_norm,
+                                                  1) != 0;
+        if (ok) ok = metal_graph_mtp_draft_profile_boundary(stage_profile, "output_vocab_top1");
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
+                                        base_model->map,
+                                        base_model->size,
+                                        base_weights->output->abs_offset,
+                                        DS4_N_EMBD,
+                                        vocab_dim,
+                                        g->output_norm,
+                                        1) != 0;
+        if (ok) ok = metal_graph_mtp_draft_profile_boundary(stage_profile, "output_vocab_logits");
+    }
+    return ok;
+}
+
 static bool metal_graph_encode_output_head_mtp(
         ds4_gpu_graph       *g,
         const ds4_model       *base_model,
         const ds4_weights     *base_weights,
         const ds4_model       *mtp_model,
         const ds4_mtp_weights *mtp,
-        uint64_t               vocab_dim) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
-                                                 hc_dim, DS4_N_HC, g->flat_hc, 1);
-    if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
-                                                    g->output_pre,
-                                                    mtp_model->map,
-                                                    mtp_model->size,
-                                                    mtp->hc_head_scale->abs_offset,
-                                                    mtp->hc_head_base->abs_offset,
-                                                    DS4_N_HC,
-                                                    DS4_HC_EPS) != 0;
-    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(g->output_embd,
-                                                  g->cur_hc,
-                                                  g->output_weights,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
-                                                  g->output_embd,
-                                                  mtp_model->map,
-                                                  mtp_model->size,
-                                                  mtp->norm->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
-                                              base_model->map,
-                                              base_model->size,
-                                              base_weights->output->abs_offset,
-                                              DS4_N_EMBD,
-                                              vocab_dim,
-                                              g->output_norm,
-                                              1) != 0;
-    return ok;
+        uint64_t               vocab_dim,
+        ds4_gpu_tensor        *top1_out,
+        bool                   top1_only,
+        ds4_mtp_draft_stage_profile *stage_profile) {
+    return metal_graph_encode_output_head_mtp_impl(g,
+                                                   base_model,
+                                                   base_weights,
+                                                   mtp_model,
+                                                   mtp,
+                                                   vocab_dim,
+                                                   top1_out,
+                                                   top1_only,
+                                                   NULL,
+                                                   stage_profile);
 }
 
 /* =========================================================================
@@ -14022,6 +14114,166 @@ static bool metal_graph_eval_token_raw_swa_top(
     return ok;
 }
 
+struct ds4_mtp_draft_stage_profile {
+    bool enabled;
+    uint32_t row;
+    double *stage_t0;
+};
+
+static bool ds4_mtp_native_cont_stage_profile_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_STAGE_PROFILE");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static bool metal_graph_mtp_async_stage_profile_boundary(
+        const char *stage,
+        uint32_t    row,
+        double     *stage_t0) {
+    if (!stage_t0) return false;
+    if (ds4_gpu_end_mtp_async_commands() == 0) return false;
+    const double wait_t0 = now_sec();
+    if (ds4_gpu_wait_mtp_async_commands() == 0) return false;
+    const double now = now_sec();
+    fprintf(stderr,
+            "ds4: mtp native continuation stage row=%u %s=%.3f ms wait=%.3f ms\n",
+            row,
+            stage ? stage : "unknown",
+            (now - *stage_t0) * 1000.0,
+            (now - wait_t0) * 1000.0);
+    *stage_t0 = now;
+    return ds4_gpu_begin_mtp_async_commands() != 0;
+}
+
+static bool metal_graph_mtp_draft_profile_boundary(
+        ds4_mtp_draft_stage_profile *profile,
+        const char                  *stage) {
+    if (!profile || !profile->enabled) return true;
+    return metal_graph_mtp_async_stage_profile_boundary(stage,
+                                                        profile->row,
+                                                        profile->stage_t0);
+}
+
+static bool metal_graph_encode_mtp_draft_from_enorm_hc(
+        ds4_gpu_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        ds4_gpu_tensor       *raw_cache,
+        uint32_t               mtp_n_raw,
+        ds4_gpu_tensor       *prev_hc,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *enorm,
+        const ds4_gpu_tensor *token_tensor,
+        int                    token,
+        uint32_t               pos,
+        ds4_gpu_tensor        *top_out,
+        uint32_t               want_top,
+        bool                   emit_output_head,
+        bool                   broadcast_eproj_add,
+        ds4_gpu_tensor        *next_enorm_out,
+        ds4_mtp_draft_stage_profile *stage_profile) {
+    if (!mtp || !mtp->block.attn_q_a || !raw_cache || !prev_hc || !out_hc || !enorm) return false;
+    if (!emit_output_head && want_top != 0) return false;
+    if (next_enorm_out && (!emit_output_head || want_top != 1 || !top_out)) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint32_t raw_row = pos % g->raw_cap;
+    uint32_t n_raw = mtp_n_raw + 1u;
+    if (n_raw > g->raw_window) n_raw = g->raw_window;
+    if (n_raw > g->raw_cap) n_raw = g->raw_cap;
+
+    bool ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_eproj,
+                                          mtp_model->map,
+                                          mtp_model->size,
+                                          mtp->e_proj->abs_offset,
+                                          DS4_N_EMBD,
+                                          DS4_N_EMBD,
+                                          enorm,
+                                          1) != 0;
+    if (ok && !broadcast_eproj_add) {
+        ok = ds4_gpu_repeat_hc_tensor(g->mtp_eproj_hc,
+                                      g->mtp_eproj,
+                                      DS4_N_EMBD,
+                                      DS4_N_HC) != 0;
+    }
+    if (ok) ok = metal_graph_mtp_draft_profile_boundary(stage_profile, "embed_eproj");
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mtp_hnorm_hc,
+                                                       prev_hc,
+                                                       mtp_model->map,
+                                                       mtp_model->size,
+                                                       mtp->hnorm->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       DS4_N_HC,
+                                                       DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_hproj_hc,
+                                              mtp_model->map,
+                                              mtp_model->size,
+                                              mtp->h_proj->abs_offset,
+                                              DS4_N_EMBD,
+                                              DS4_N_EMBD,
+                                              g->mtp_hnorm_hc,
+                                              DS4_N_HC) != 0;
+    if (ok && broadcast_eproj_add) {
+        ok = ds4_gpu_hc_add_broadcast_tensor(g->mtp_input_hc,
+                                             g->mtp_hproj_hc,
+                                             g->mtp_eproj,
+                                             DS4_N_EMBD,
+                                             DS4_N_HC) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_add_tensor(g->mtp_input_hc,
+                                g->mtp_eproj_hc,
+                                g->mtp_hproj_hc,
+                                (uint32_t)hc_dim) != 0;
+    }
+    if (ok) ok = metal_graph_mtp_draft_profile_boundary(stage_profile, "hproj_add");
+    if (ok) {
+        g->cur_hc = g->mtp_input_hc;
+        g->after_ffn_hc = out_hc;
+        ok = metal_graph_encode_decode_layer(g,
+                                             mtp_model,
+                                             &mtp->block,
+                                             1,
+                                             pos,
+                                             raw_cache,
+                                             g->raw_cap,
+                                             raw_row,
+                                             n_raw,
+                                             token,
+                                             token_tensor);
+    }
+    if (ok) ok = metal_graph_mtp_draft_profile_boundary(stage_profile, "decode_layer");
+    if (ok) g->cur_hc = out_hc;
+    const char *mtp_top1_env = getenv("DS4_MTP_NATIVE_MTP_TOP1_ONLY");
+    const bool mtp_top1_only =
+        (want_top == 1 && top_out != NULL &&
+         mtp_top1_env != NULL && strcmp(mtp_top1_env, "0") != 0) ||
+        next_enorm_out != NULL;
+    if (ok && emit_output_head) {
+        ok = metal_graph_encode_output_head_mtp_impl(g,
+                                                     base_model,
+                                                     base_weights,
+                                                     mtp_model,
+                                                     mtp,
+                                                     base_weights->output->dim[1],
+                                                     top_out,
+                                                     mtp_top1_only,
+                                                     next_enorm_out,
+                                                     stage_profile);
+    }
+    if (ok && emit_output_head && want_top && !mtp_top1_only) {
+        ds4_gpu_tensor *selected = top_out ? top_out : g->comp_selected;
+        ok = want_top == 1
+            ? ds4_gpu_top1_tensor(selected, g->logits, DS4_N_VOCAB, 1) != 0
+            : ds4_gpu_indexer_topk_tensor(selected,
+                                          g->logits,
+                                          DS4_N_VOCAB,
+                                          1,
+                                          want_top) != 0;
+        if (ok) ok = metal_graph_mtp_draft_profile_boundary(stage_profile, "top_reduce");
+    }
+    return ok;
+}
+
 static bool metal_graph_encode_mtp_draft_from_input_hc(
         ds4_gpu_graph       *g,
         const ds4_model       *base_model,
@@ -14036,16 +14288,30 @@ static bool metal_graph_encode_mtp_draft_from_input_hc(
         int                    token,
         uint32_t               pos,
         ds4_gpu_tensor       *top_out,
-        uint32_t               want_top) {
+        uint32_t               want_top,
+        bool                   emit_output_head,
+        bool                   fuse_input_norm,
+        bool                   broadcast_eproj_add,
+        ds4_mtp_draft_stage_profile *stage_profile) {
     if (!mtp || !mtp->block.attn_q_a || !raw_cache || !prev_hc || !out_hc) return false;
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint32_t raw_row = pos % g->raw_cap;
-    uint32_t n_raw = mtp_n_raw + 1u;
-    if (n_raw > g->raw_window) n_raw = g->raw_window;
-    if (n_raw > g->raw_cap) n_raw = g->raw_cap;
+    if (!emit_output_head && want_top != 0) return false;
 
     bool ok = true;
-    if (token_tensor) {
+    if (fuse_input_norm) {
+        ok = (token_tensor || token >= 0) &&
+             ds4_gpu_embed_token_norm_tensor(g->mtp_enorm,
+                                             token_tensor,
+                                             base_model->map,
+                                             base_model->size,
+                                             mtp_model->map,
+                                             mtp_model->size,
+                                             base_weights->token_embd->abs_offset,
+                                             mtp->enorm->abs_offset,
+                                             (uint32_t)base_weights->token_embd->dim[1],
+                                             token >= 0 ? (uint32_t)token : 0u,
+                                             DS4_N_EMBD,
+                                             DS4_RMS_EPS) != 0;
+    } else if (token_tensor) {
         ok = ds4_gpu_embed_tokens_hc_tensor(g->mtp_embed,
                                             token_tensor,
                                             base_model->map,
@@ -14066,78 +14332,34 @@ static bool metal_graph_encode_mtp_draft_from_input_hc(
                                            DS4_N_EMBD,
                                            1) != 0;
     }
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_enorm,
-                                                  g->mtp_embed,
-                                                  mtp_model->map,
-                                                  mtp_model->size,
-                                                  mtp->enorm->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_eproj,
-                                              mtp_model->map,
-                                              mtp_model->size,
-                                              mtp->e_proj->abs_offset,
-                                              DS4_N_EMBD,
-                                              DS4_N_EMBD,
-                                              g->mtp_enorm,
-                                              1) != 0;
-    if (ok) ok = ds4_gpu_repeat_hc_tensor(g->mtp_eproj_hc,
-                                            g->mtp_eproj,
+    if (ok && !fuse_input_norm) {
+        ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_enorm,
+                                            g->mtp_embed,
+                                            mtp_model->map,
+                                            mtp_model->size,
+                                            mtp->enorm->abs_offset,
                                             DS4_N_EMBD,
-                                            DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mtp_hnorm_hc,
-                                                       prev_hc,
-                                                       mtp_model->map,
-                                                       mtp_model->size,
-                                                       mtp->hnorm->abs_offset,
-                                                       DS4_N_EMBD,
-                                                       DS4_N_HC,
-                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_hproj_hc,
-                                              mtp_model->map,
-                                              mtp_model->size,
-                                              mtp->h_proj->abs_offset,
-                                              DS4_N_EMBD,
-                                              DS4_N_EMBD,
-                                              g->mtp_hnorm_hc,
-                                              DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_add_tensor(g->mtp_input_hc,
-                                      g->mtp_eproj_hc,
-                                      g->mtp_hproj_hc,
-                                      (uint32_t)hc_dim) != 0;
-    if (ok) {
-        g->cur_hc = g->mtp_input_hc;
-        g->after_ffn_hc = out_hc;
-        ok = metal_graph_encode_decode_layer(g,
-                                             mtp_model,
-                                             &mtp->block,
-                                             1,
-                                             pos,
-                                             raw_cache,
-                                             g->raw_cap,
-                                             raw_row,
-                                             n_raw,
-                                             token,
-                                             token_tensor);
+                                            DS4_RMS_EPS) != 0;
     }
-    if (ok) g->cur_hc = out_hc;
-    if (ok) ok = metal_graph_encode_output_head_mtp(g,
-                                                    base_model,
-                                                    base_weights,
-                                                    mtp_model,
-                                                    mtp,
-                                                    base_weights->output->dim[1]);
-    if (ok && want_top) {
-        ds4_gpu_tensor *selected = top_out ? top_out : g->comp_selected;
-        ok = want_top == 1
-            ? ds4_gpu_top1_tensor(selected, g->logits, DS4_N_VOCAB, 1) != 0
-            : ds4_gpu_indexer_topk_tensor(selected,
-                                          g->logits,
-                                          DS4_N_VOCAB,
-                                          1,
-                                          want_top) != 0;
-    }
-    return ok;
+    return ok && metal_graph_encode_mtp_draft_from_enorm_hc(g,
+                                                            base_model,
+                                                            base_weights,
+                                                            mtp_model,
+                                                            mtp,
+                                                            raw_cache,
+                                                            mtp_n_raw,
+                                                            prev_hc,
+                                                            out_hc,
+                                                            g->mtp_enorm,
+                                                            token_tensor,
+                                                            token,
+                                                            pos,
+                                                            top_out,
+                                                            want_top,
+                                                            emit_output_head,
+                                                            broadcast_eproj_add,
+                                                            NULL,
+                                                            stage_profile);
 }
 
 static bool metal_graph_encode_mtp_draft_from_hc(
@@ -14166,7 +14388,11 @@ static bool metal_graph_encode_mtp_draft_from_hc(
                                                       token,
                                                       pos,
                                                       NULL,
-                                                      want_top);
+                                                      want_top,
+                                                      true,
+                                                      false,
+                                                      false,
+                                                      NULL);
 }
 
 static bool metal_graph_eval_mtp_draft_from_hc(
@@ -14291,7 +14517,11 @@ static bool metal_graph_start_mtp_runahead_chain(
                                                         i == 0 ? token : -1,
                                                         pos + i,
                                                         top_view,
-                                                        1);
+                                                        1,
+                                                        true,
+                                                        false,
+                                                        false,
+                                                        NULL);
         ds4_gpu_tensor_free(token_view);
         ds4_gpu_tensor_free(top_view);
     }
@@ -14364,7 +14594,11 @@ static bool metal_graph_start_mtp_native_target_hc_chain(
                                                         i == 0 ? token : -1,
                                                         pos + i,
                                                         top_view,
-                                                        1);
+                                                        1,
+                                                        true,
+                                                        false,
+                                                        false,
+                                                        NULL);
         ds4_gpu_tensor_free(token_view);
         ds4_gpu_tensor_free(top_view);
     }
@@ -14372,6 +14606,196 @@ static bool metal_graph_start_mtp_native_target_hc_chain(
     else (void)ds4_gpu_synchronize();
     metal_graph_mtp_async_scratch_restore(g, &async_guard);
     return ok;
+}
+
+static bool ds4_mtp_native_cont_broadcast_add_enabled(void);
+static bool ds4_mtp_native_cont_fused_input_enabled(void);
+
+static bool metal_graph_start_mtp_native_resume_async_state_chain(
+        ds4_gpu_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        uint32_t               base_mtp_raw,
+        uint32_t               pos,
+        uint32_t               depth) {
+    if (!g || !g->mtp_async || !g->mtp_async->raw_cache ||
+        depth == 0 || depth > DS4_MTP_NATIVE_MAX_K ||
+        ds4_gpu_mtp_async_pending()) {
+        return false;
+    }
+    const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    for (uint32_t i = 0; i < depth; i++) {
+        if (ds4_gpu_tensor_bytes(g->mtp_async->branch_state_hc[i]) < hc_bytes) {
+            return false;
+        }
+    }
+
+    ds4_mtp_async_scratch_guard async_guard;
+    if (!metal_graph_mtp_async_scratch_bind(g, &async_guard)) return false;
+
+    const char *mtp_top1_env = getenv("DS4_MTP_NATIVE_MTP_TOP1_ONLY");
+    const bool mtp_top1_only =
+        mtp_top1_env != NULL && strcmp(mtp_top1_env, "0") != 0;
+    const bool broadcast_add = ds4_mtp_native_cont_broadcast_add_enabled();
+    const bool fuse_input_norm = ds4_mtp_native_cont_fused_input_enabled();
+    double stage_t0 = ds4_mtp_native_cont_stage_profile_enabled() ? now_sec() : 0.0;
+
+    bool ok = ds4_gpu_begin_mtp_async_commands() != 0;
+    for (uint32_t i = 0; ok && i < depth; i++) {
+        ds4_gpu_tensor *top_view = ds4_gpu_tensor_view(g->comp_selected,
+                                                       (uint64_t)i * sizeof(uint32_t),
+                                                       sizeof(uint32_t));
+        ds4_mtp_draft_stage_profile stage_profile = {
+            .enabled = stage_t0 != 0.0,
+            .row = i,
+            .stage_t0 = &stage_t0,
+        };
+        if (i == 0) {
+            g->cur_hc = g->mtp_async->branch_state_hc[0];
+            ok = top_view &&
+                 metal_graph_encode_output_head_mtp(g,
+                                                    base_model,
+                                                    base_weights,
+                                                    mtp_model,
+                                                    mtp,
+                                                    base_weights->output->dim[1],
+                                                    top_view,
+                                                    mtp_top1_only,
+                                                    &stage_profile);
+            if (ok && !mtp_top1_only) {
+                ok = ds4_gpu_top1_tensor(top_view, g->logits, DS4_N_VOCAB, 1) != 0;
+                if (ok) ok = metal_graph_mtp_draft_profile_boundary(&stage_profile,
+                                                                    "top_reduce");
+            }
+        } else {
+            ds4_gpu_tensor *token_view = ds4_gpu_tensor_view(
+                g->comp_selected,
+                (uint64_t)(i - 1u) * sizeof(uint32_t),
+                sizeof(uint32_t));
+            ok = top_view &&
+                 token_view &&
+                 metal_graph_encode_mtp_draft_from_input_hc(g,
+                                                            base_model,
+                                                            base_weights,
+                                                            mtp_model,
+                                                            mtp,
+                                                            g->mtp_async->raw_cache,
+                                                            base_mtp_raw + i,
+                                                            g->mtp_async->branch_state_hc[i - 1u],
+                                                            g->mtp_async->branch_state_hc[i],
+                                                            token_view,
+                                                            -1,
+                                                            pos + i,
+                                                            top_view,
+                                                            1,
+                                                            true,
+                                                            fuse_input_norm,
+                                                            broadcast_add,
+                                                            &stage_profile);
+            ds4_gpu_tensor_free(token_view);
+        }
+        ds4_gpu_tensor_free(top_view);
+    }
+    if (ok) ok = ds4_gpu_end_mtp_async_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    metal_graph_mtp_async_scratch_restore(g, &async_guard);
+    return ok;
+}
+
+static bool metal_graph_copy_mtp_raw_live_prefix(
+        ds4_gpu_graph *g,
+        ds4_gpu_tensor *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t live_rows,
+        uint32_t next_pos,
+        uint64_t *copied_bytes) {
+    if (copied_bytes) *copied_bytes = 0;
+    if (!g || !dst || !src || g->raw_cap == 0) return false;
+
+    if (live_rows > g->raw_window) live_rows = g->raw_window;
+    if (live_rows > g->raw_cap) live_rows = g->raw_cap;
+    if (live_rows == 0) return true;
+
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t needed_bytes = (uint64_t)g->raw_cap * row_bytes;
+    if (ds4_gpu_tensor_bytes(dst) < needed_bytes ||
+        ds4_gpu_tensor_bytes(src) < needed_bytes) {
+        return false;
+    }
+
+    const uint32_t first_pos = next_pos >= live_rows ? next_pos - live_rows : 0u;
+    const uint32_t raw_start = first_pos % g->raw_cap;
+    const uint32_t tail_rows = g->raw_cap - raw_start < live_rows
+        ? g->raw_cap - raw_start
+        : live_rows;
+    const uint32_t head_rows = live_rows - tail_rows;
+
+    bool ok = true;
+    if (tail_rows != 0) {
+        const uint64_t offset = (uint64_t)raw_start * row_bytes;
+        const uint64_t bytes = (uint64_t)tail_rows * row_bytes;
+        ok = ds4_gpu_tensor_copy(dst, offset, src, offset, bytes) != 0;
+        if (ok && copied_bytes) *copied_bytes += bytes;
+    }
+    if (ok && head_rows != 0) {
+        const uint64_t bytes = (uint64_t)head_rows * row_bytes;
+        ok = ds4_gpu_tensor_copy(dst, 0, src, 0, bytes) != 0;
+        if (ok && copied_bytes) *copied_bytes += bytes;
+    }
+    return ok;
+}
+
+static bool ds4_mtp_native_cont_full_raw_clone_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_FULL_RAW_CLONE");
+    return v && strcmp(v, "0") != 0;
+}
+
+static bool ds4_mtp_native_cont_skip_final_top_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_SKIP_FINAL_TOP");
+    return v && strcmp(v, "0") != 0;
+}
+
+static bool ds4_mtp_native_cont_broadcast_add_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_BROADCAST_ADD");
+    return v && strcmp(v, "0") != 0;
+}
+
+static bool ds4_mtp_native_cont_fused_input_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_FUSED_INPUT");
+    return v && strcmp(v, "0") != 0;
+}
+
+static bool ds4_mtp_native_cont_state_only_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_STATE_ONLY");
+    return v && strcmp(v, "0") != 0;
+}
+
+static bool ds4_mtp_native_cont_reuse_state_draft_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_REUSE_STATE_DRAFT");
+    return v && strcmp(v, "0") != 0;
+}
+
+static bool ds4_mtp_native_cont_fused_chain_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_FUSED_CHAIN");
+    return v && strcmp(v, "0") != 0;
+}
+
+static int ds4_mtp_native_cont_reuse_verify_cap_get(void) {
+    const char *env = getenv("DS4_MTP_NATIVE_CONT_REUSE_VERIFY_CAP");
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env) return 0;
+    if (v < 2) v = 2;
+    if (v > DS4_MTP_NATIVE_MAX_K) v = DS4_MTP_NATIVE_MAX_K;
+    return (int)v;
+}
+
+static bool ds4_mtp_native_cont_lazy_tail_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_LAZY_TAIL");
+    return v && strcmp(v, "0") != 0;
 }
 
 static bool metal_graph_start_mtp_native_continuation_probe(
@@ -14384,7 +14808,13 @@ static bool metal_graph_start_mtp_native_continuation_probe(
         uint32_t               base_mtp_raw,
         int                    token,
         uint32_t               pos,
-        uint32_t               depth) {
+        uint32_t               depth,
+        uint64_t              *raw_copy_bytes,
+        uint32_t              *produced_tokens,
+        uint32_t              *produced_state_rows) {
+    if (raw_copy_bytes) *raw_copy_bytes = 0;
+    if (produced_tokens) *produced_tokens = depth;
+    if (produced_state_rows) *produced_state_rows = depth;
     if (!g || !g->mtp_async || !g->mtp_raw_cache || !base_hc ||
         token < 0 || depth == 0 || depth > DS4_MTP_SCHED2_MAX_BRANCH_K ||
         ds4_gpu_mtp_async_pending()) {
@@ -14405,41 +14835,154 @@ static bool metal_graph_start_mtp_native_continuation_probe(
     if (!metal_graph_mtp_async_scratch_bind(g, &async_guard)) return false;
 
     bool ok = ds4_gpu_begin_mtp_async_commands() != 0;
-    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_async->raw_cache,
+    const bool stage_profile_enabled = ds4_mtp_native_cont_stage_profile_enabled();
+    const bool skip_final_top =
+        ds4_mtp_native_cont_skip_final_top_enabled() && depth > 1;
+    const bool lazy_tail =
+        skip_final_top && ds4_mtp_native_cont_lazy_tail_enabled();
+    const bool broadcast_add = ds4_mtp_native_cont_broadcast_add_enabled();
+    const bool fuse_input_norm = ds4_mtp_native_cont_fused_input_enabled();
+    const bool state_only = ds4_mtp_native_cont_state_only_enabled();
+    const bool fused_chain =
+        ds4_mtp_native_cont_fused_chain_enabled() &&
+        skip_final_top &&
+        !state_only &&
+        depth >= 2;
+    if (produced_tokens && skip_final_top) *produced_tokens = depth - 1u;
+    if (produced_tokens && state_only) *produced_tokens = 0;
+    const uint32_t rows_to_encode = state_only ? 1u : ((lazy_tail && !fused_chain) ? depth - 1u : depth);
+    if (produced_state_rows) *produced_state_rows = rows_to_encode;
+    double stage_t0 = stage_profile_enabled ? now_sec() : 0.0;
+    if (ok) {
+        if (ds4_mtp_native_cont_full_raw_clone_enabled()) {
+            ok = ds4_gpu_tensor_copy(g->mtp_async->raw_cache,
                                      0,
                                      g->mtp_raw_cache,
                                      0,
                                      raw_bytes) != 0;
-    for (uint32_t i = 0; ok && i < depth; i++) {
+            if (ok && raw_copy_bytes) *raw_copy_bytes = raw_bytes;
+        } else {
+            ok = metal_graph_copy_mtp_raw_live_prefix(g,
+                                                      g->mtp_async->raw_cache,
+                                                      g->mtp_raw_cache,
+                                                      base_mtp_raw,
+                                                      pos,
+                                                      raw_copy_bytes);
+        }
+    }
+    if (ok && stage_profile_enabled) {
+        ok = metal_graph_mtp_async_stage_profile_boundary("raw_copy",
+                                                          UINT32_MAX,
+                                                          &stage_t0);
+    }
+    for (uint32_t i = 0; ok && i < rows_to_encode; i++) {
         ds4_gpu_tensor *prev_hc = i == 0 ? base_hc : g->mtp_async->branch_state_hc[i - 1u];
         ds4_gpu_tensor *out_hc = g->mtp_async->branch_state_hc[i];
         ds4_gpu_tensor *token_view = NULL;
-        ds4_gpu_tensor *top_view = ds4_gpu_tensor_view(g->comp_selected,
-                                                       (uint64_t)i * sizeof(uint32_t),
-                                                       sizeof(uint32_t));
+        const bool emit_output =
+            !state_only && !(skip_final_top && i + 1u == depth);
+        ds4_gpu_tensor *top_view = emit_output
+            ? ds4_gpu_tensor_view(g->comp_selected,
+                                  (uint64_t)i * sizeof(uint32_t),
+                                  sizeof(uint32_t))
+            : NULL;
         if (i != 0) {
             token_view = ds4_gpu_tensor_view(g->comp_selected,
                                              (uint64_t)(i - 1u) * sizeof(uint32_t),
                                              sizeof(uint32_t));
         }
-        ok = prev_hc &&
-             out_hc &&
-             top_view &&
-             (i == 0 || token_view) &&
-             metal_graph_encode_mtp_draft_from_input_hc(g,
-                                                        base_model,
-                                                        base_weights,
-                                                        mtp_model,
-                                                        mtp,
-                                                        g->mtp_async->raw_cache,
-                                                        base_mtp_raw + i,
-                                                        prev_hc,
-                                                        out_hc,
-                                                        token_view,
-                                                        i == 0 ? token : -1,
-                                                        pos + i,
-                                                        top_view,
-                                                        1);
+        ds4_mtp_draft_stage_profile stage_profile = {
+            .enabled = stage_profile_enabled,
+            .row = i,
+            .stage_t0 = &stage_t0,
+        };
+        if (fused_chain && i == 0) {
+            ok = prev_hc &&
+                 out_hc &&
+                 top_view &&
+                 metal_graph_encode_mtp_draft_from_input_hc(g,
+                                                            base_model,
+                                                            base_weights,
+                                                            mtp_model,
+                                                            mtp,
+                                                            g->mtp_async->raw_cache,
+                                                            base_mtp_raw,
+                                                            prev_hc,
+                                                            out_hc,
+                                                            NULL,
+                                                            token,
+                                                            pos,
+                                                            NULL,
+                                                            0,
+                                                            false,
+                                                            fuse_input_norm,
+                                                            broadcast_add,
+                                                            &stage_profile);
+            if (ok) {
+                g->cur_hc = out_hc;
+                ok = metal_graph_encode_output_head_mtp_impl(g,
+                                                             base_model,
+                                                             base_weights,
+                                                             mtp_model,
+                                                             mtp,
+                                                             base_weights->output->dim[1],
+                                                             top_view,
+                                                             true,
+                                                             i + 1u < rows_to_encode
+                                                                 ? g->mtp_enorm
+                                                                 : NULL,
+                                                             &stage_profile);
+            }
+        } else if (fused_chain && i != 0) {
+            ok = prev_hc &&
+                 out_hc &&
+                 (top_view || !emit_output) &&
+                 token_view &&
+                 metal_graph_encode_mtp_draft_from_enorm_hc(g,
+                                                            base_model,
+                                                            base_weights,
+                                                            mtp_model,
+                                                            mtp,
+                                                            g->mtp_async->raw_cache,
+                                                            base_mtp_raw + i,
+                                                            prev_hc,
+                                                            out_hc,
+                                                            g->mtp_enorm,
+                                                            token_view,
+                                                            -1,
+                                                            pos + i,
+                                                            top_view,
+                                                            emit_output ? 1u : 0u,
+                                                            emit_output,
+                                                            broadcast_add,
+                                                            fused_chain && emit_output && i + 1u < rows_to_encode
+                                                                ? g->mtp_enorm
+                                                                : NULL,
+                                                            &stage_profile);
+        } else {
+            ok = prev_hc &&
+                 out_hc &&
+                 (top_view || !emit_output) &&
+                 (i == 0 || token_view) &&
+                 metal_graph_encode_mtp_draft_from_input_hc(g,
+                                                            base_model,
+                                                            base_weights,
+                                                            mtp_model,
+                                                            mtp,
+                                                            g->mtp_async->raw_cache,
+                                                            base_mtp_raw + i,
+                                                            prev_hc,
+                                                            out_hc,
+                                                            token_view,
+                                                            i == 0 ? token : -1,
+                                                            pos + i,
+                                                            top_view,
+                                                            emit_output ? 1u : 0u,
+                                                            emit_output,
+                                                            fuse_input_norm,
+                                                            broadcast_add,
+                                                            &stage_profile);
+        }
         ds4_gpu_tensor_free(token_view);
         ds4_gpu_tensor_free(top_view);
     }
@@ -14456,6 +14999,10 @@ static bool metal_graph_finish_mtp_native_target_hc_chain_timed(
         double        *wait_ms,
         double        *read_ms);
 
+static bool metal_graph_wait_mtp_native_target_hc_chain_timed(
+        ds4_gpu_graph *g,
+        double        *wait_ms);
+
 #ifdef __APPLE__
 typedef struct {
     bool enabled;
@@ -14470,8 +15017,11 @@ typedef struct {
     uint32_t base_mtp_raw;
     uint32_t pos;
     uint32_t depth;
+    uint32_t produced_tokens;
+    uint32_t produced_state_rows;
     int token;
     int tokens[DS4_MTP_SCHED2_MAX_BRANCH_K];
+    uint64_t raw_copy_bytes;
     double start_ms;
     double wait_target_ms;
     double wait_mtp_ms;
@@ -14533,7 +15083,10 @@ static bool ds4_mtp_native_target_first_probe_submit_and_wait(void) {
                                                                      p->base_mtp_raw,
                                                                      p->token,
                                                                      p->pos,
-                                                                     p->depth);
+                                                                     p->depth,
+                                                                     &p->raw_copy_bytes,
+                                                                     &p->produced_tokens,
+                                                                     &p->produced_state_rows);
     }
     const double start_done = now_sec();
     p->start_ms = (start_done - start_t0) * 1000.0;
@@ -14544,10 +15097,15 @@ static bool ds4_mtp_native_target_first_probe_submit_and_wait(void) {
     p->wait_target_ms = (target_done - target_t0) * 1000.0;
     ok = ok && target_ok;
 
-    if (p->started) {
+    if (p->started && p->produced_tokens == 0) {
+        p->finished = metal_graph_wait_mtp_native_target_hc_chain_timed(
+            p->g,
+            &p->wait_mtp_ms);
+        p->read_ms = 0.0;
+    } else if (p->started) {
         p->finished = metal_graph_finish_mtp_native_target_hc_chain_timed(p->g,
                                                                           p->tokens,
-                                                                          p->depth,
+                                                                          p->produced_tokens ? p->produced_tokens : p->depth,
                                                                           &p->wait_mtp_ms,
                                                                           &p->read_ms);
     }
@@ -14618,7 +15176,11 @@ static bool metal_graph_start_mtp_runahead_branches(
                                                         token,
                                                         pos,
                                                         root_top_view,
-                                                        branch_k);
+                                                        branch_k,
+                                                        true,
+                                                        false,
+                                                        false,
+                                                        NULL);
     }
     ds4_gpu_tensor_free(root_top_view);
 
@@ -14652,7 +15214,11 @@ static bool metal_graph_start_mtp_runahead_branches(
                                                             -1,
                                                             pos + 1u,
                                                             child_top_view,
-                                                            1);
+                                                            1,
+                                                            true,
+                                                            false,
+                                                            false,
+                                                            NULL);
         }
         ds4_gpu_tensor_free(token_view);
         ds4_gpu_tensor_free(child_top_view);
@@ -14750,7 +15316,11 @@ static bool metal_graph_start_mtp_root_branch_chains(
                                                             -1,
                                                             pos + j - 1u,
                                                             top_view,
-                                                            1);
+                                                            1,
+                                                            true,
+                                                            false,
+                                                            false,
+                                                            NULL);
             ds4_gpu_tensor_free(token_view);
             ds4_gpu_tensor_free(top_view);
         }
@@ -14826,6 +15396,17 @@ static bool metal_graph_finish_mtp_native_target_hc_chain_timed(
     }
     const double read_done = read_ms ? now_sec() : 0.0;
     if (read_ms) *read_ms += (read_done - read_t0) * 1000.0;
+    return true;
+}
+
+static bool metal_graph_wait_mtp_native_target_hc_chain_timed(
+        ds4_gpu_graph *g,
+        double        *wait_ms) {
+    if (!g || !g->mtp_async) return false;
+    const double wait_t0 = wait_ms ? now_sec() : 0.0;
+    if (ds4_gpu_wait_mtp_async_commands() == 0) return false;
+    const double wait_done = wait_ms ? now_sec() : 0.0;
+    if (wait_ms) *wait_ms += (wait_done - wait_t0) * 1000.0;
     return true;
 }
 
@@ -20099,11 +20680,14 @@ struct ds4_session {
     bool mtp_runahead_native_async;
     uint32_t mtp_runahead_base_n_raw;
     uint32_t mtp_runahead_base_pos;
+    uint32_t mtp_runahead_native_state_depth;
     bool mtp_lagged_pending_valid;
     int mtp_lagged_pending_token;
     int mtp_native_capture_cooldown;
     int mtp_native_full_accept_streak;
     int mtp_native_partial_accept_streak;
+    int mtp_native_cont_gate_backoff;
+    int mtp_native_cont_gate_bad_streak;
     int logits_top_id;
     bool logits_top_id_valid;
     bool logits_full_valid;
@@ -20144,6 +20728,7 @@ static void ds4_session_reset_mtp_governor(ds4_session *s) {
     s->mtp_runahead_native_async = false;
     s->mtp_runahead_base_n_raw = 0;
     s->mtp_runahead_base_pos = 0;
+    s->mtp_runahead_native_state_depth = 0;
     s->mtp_runahead_depth = 0;
     s->mtp_runahead_cycles = 0;
     s->mtp_runahead_accepted_depth = 0;
@@ -20154,6 +20739,8 @@ static void ds4_session_reset_mtp_governor(ds4_session *s) {
     s->mtp_native_capture_cooldown = 0;
     s->mtp_native_full_accept_streak = 0;
     s->mtp_native_partial_accept_streak = 0;
+    s->mtp_native_cont_gate_backoff = 0;
+    s->mtp_native_cont_gate_bad_streak = 0;
 }
 
 #ifndef DS4_NO_GPU
@@ -20169,6 +20756,7 @@ static void ds4_session_clear_mtp_runahead(ds4_session *s) {
     s->mtp_runahead_native_async = false;
     s->mtp_runahead_base_n_raw = 0;
     s->mtp_runahead_base_pos = 0;
+    s->mtp_runahead_native_state_depth = 0;
     s->mtp_runahead_depth = 0;
     s->mtp_draft_valid = false;
     s->mtp_top_k = 0;
@@ -20202,6 +20790,11 @@ static void ds4_session_consume_mtp_runahead(ds4_session *s, int n_tokens) {
         if (base > s->graph.raw_window) base = s->graph.raw_window;
         if (base > s->graph.raw_cap) base = s->graph.raw_cap;
         s->mtp_runahead_base_n_raw = base;
+    }
+    if (s->mtp_runahead_native_state_depth > (uint32_t)n_tokens) {
+        s->mtp_runahead_native_state_depth -= (uint32_t)n_tokens;
+    } else {
+        s->mtp_runahead_native_state_depth = 0;
     }
     s->mtp_runahead_base_pos += (uint32_t)n_tokens;
     s->mtp_draft_token = s->mtp_runahead_tokens[0];
@@ -20403,6 +20996,47 @@ static bool ds4_mtp_native_sched2_cont_enabled(void) {
 static bool ds4_mtp_native_target_first_cont_enabled(void) {
     const char *v = getenv("DS4_MTP_NATIVE_TARGET_FIRST_CONT");
     return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static bool ds4_mtp_native_cont_adaptive_gate_enabled(void) {
+    const char *v = getenv("DS4_MTP_NATIVE_CONT_ADAPTIVE_GATE");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static int ds4_mtp_native_cont_gate_base_backoff_get(void) {
+    const char *env = getenv("DS4_MTP_NATIVE_CONT_GATE_BASE_BACKOFF");
+    if (!env || !env[0]) return 2;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env) return 2;
+    if (v < 1) v = 1;
+    if (v > 64) v = 64;
+    return (int)v;
+}
+
+static int ds4_mtp_native_cont_gate_max_backoff_get(void) {
+    const char *env = getenv("DS4_MTP_NATIVE_CONT_GATE_MAX_BACKOFF");
+    if (!env || !env[0]) return 16;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env) return 16;
+    if (v < 1) v = 1;
+    if (v > 256) v = 256;
+    return (int)v;
+}
+
+static int ds4_mtp_native_cont_gate_backoff_for_bad_streak(
+        int bad_streak,
+        int base_backoff,
+        int max_backoff) {
+    if (bad_streak < 1) bad_streak = 1;
+    if (base_backoff < 1) base_backoff = 1;
+    if (max_backoff < base_backoff) max_backoff = base_backoff;
+    int shift = bad_streak - 1;
+    if (shift > 6) shift = 6;
+    int backoff = base_backoff << shift;
+    if (backoff < base_backoff || backoff > max_backoff) backoff = max_backoff;
+    return backoff;
 }
 
 static int ds4_mtp_native_sched2_cont_m_get(void) {
@@ -24868,9 +25502,72 @@ static bool ds4_mtp_native_commit_ledger(ds4_gpu_graph *g,
     return true;
 }
 
+static bool ds4_mtp_native_materialize_async_runahead_tail(
+        ds4_session            *s,
+        uint32_t                target_state_depth,
+        double                 *materialize_ms) {
+    if (!s || target_state_depth == 0) return false;
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    if (!e || !e->mtp_ready || !g->mtp_async ||
+        !g->mtp_async->raw_cache ||
+        target_state_depth > (uint32_t)s->mtp_runahead_depth ||
+        target_state_depth > DS4_MTP_SCHED2_MAX_BRANCH_K) {
+        return false;
+    }
+
+    uint32_t state_depth = s->mtp_runahead_native_state_depth;
+    if (state_depth == 0 || state_depth > target_state_depth) {
+        return state_depth >= target_state_depth;
+    }
+
+    const double t0 = materialize_ms ? now_sec() : 0.0;
+    ds4_mtp_async_scratch_guard async_guard;
+    if (!metal_graph_mtp_async_scratch_bind(g, &async_guard)) return false;
+
+    bool ok = ds4_gpu_begin_mtp_async_commands() != 0;
+    const bool broadcast_add = ds4_mtp_native_cont_broadcast_add_enabled();
+    const bool fuse_input_norm = ds4_mtp_native_cont_fused_input_enabled();
+    for (uint32_t i = state_depth; ok && i < target_state_depth; i++) {
+        ds4_gpu_tensor *prev_hc = g->mtp_async->branch_state_hc[i - 1u];
+        ds4_gpu_tensor *out_hc = g->mtp_async->branch_state_hc[i];
+        if (!prev_hc || !out_hc || s->mtp_runahead_tokens[i] < 0) {
+            ok = false;
+            break;
+        }
+        ok = metal_graph_encode_mtp_draft_from_input_hc(g,
+                                                        &e->model,
+                                                        &e->weights,
+                                                        &e->mtp_model,
+                                                        &e->mtp_weights,
+                                                        g->mtp_async->raw_cache,
+                                                        s->mtp_runahead_base_n_raw + i,
+                                                        prev_hc,
+                                                        out_hc,
+                                                        NULL,
+                                                        s->mtp_runahead_tokens[i],
+                                                        s->mtp_runahead_base_pos + i,
+                                                        NULL,
+                                                        0,
+                                                        false,
+                                                        fuse_input_norm,
+                                                        broadcast_add,
+                                                        NULL);
+    }
+    if (ok) ok = ds4_gpu_end_mtp_async_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = ds4_gpu_wait_mtp_async_commands() != 0;
+    metal_graph_mtp_async_scratch_restore(g, &async_guard);
+    if (ok) s->mtp_runahead_native_state_depth = target_state_depth;
+    if (materialize_ms) *materialize_ms += (now_sec() - t0) * 1000.0;
+    return ok;
+}
+
 static bool ds4_mtp_native_commit_async_runahead(ds4_session *s,
                                                  ds4_mtp_native_ledger *l,
-                                                 int committed_tokens) {
+                                                 int committed_tokens,
+                                                 double *tail_materialize_ms,
+                                                 bool *tail_materialized) {
     if (!s || !l || committed_tokens <= 0) return false;
     ds4_gpu_graph *g = &s->graph;
     if (!g->mtp_async ||
@@ -24881,6 +25578,18 @@ static bool ds4_mtp_native_commit_async_runahead(ds4_session *s,
     }
     const uint32_t slot = (uint32_t)committed_tokens - 1u;
     if (!g->mtp_async->branch_state_hc[slot]) return false;
+    if (s->mtp_runahead_native_state_depth == 0) {
+        s->mtp_runahead_native_state_depth = s->mtp_runahead_depth;
+    }
+    if ((uint32_t)committed_tokens > s->mtp_runahead_native_state_depth) {
+        if (tail_materialized) *tail_materialized = true;
+        if (!ds4_mtp_native_materialize_async_runahead_tail(
+                s,
+                (uint32_t)committed_tokens,
+                tail_materialize_ms)) {
+            return false;
+        }
+    }
 
     ds4_gpu_tensor_ptr_swap(&g->mtp_raw_cache, &g->mtp_async->raw_cache);
     ds4_gpu_tensor_ptr_swap(&g->mtp_state_hc, &g->mtp_async->branch_state_hc[slot]);
@@ -25065,6 +25774,7 @@ int ds4_mtp_cache_contract_selftest(void) {
     s.mtp_runahead_native_async = true;
     s.mtp_runahead_base_n_raw = 12;
     s.mtp_runahead_base_pos = 34;
+    s.mtp_runahead_native_state_depth = 2;
     s.mtp_lagged_pending_valid = true;
     s.mtp_lagged_pending_token = 99;
     ds4_session_set_greedy_top_id_frontier(&s, false);
@@ -25074,6 +25784,7 @@ int ds4_mtp_cache_contract_selftest(void) {
         s.mtp_runahead_native_async ||
         s.mtp_runahead_base_n_raw != 0 ||
         s.mtp_runahead_base_pos != 0 ||
+        s.mtp_runahead_native_state_depth != 0 ||
         s.mtp_lagged_pending_valid ||
         s.mtp_lagged_pending_token != -1 ||
         s.logits_top_id_valid ||
@@ -25112,6 +25823,34 @@ static int ds4_session_eval_mtp_native(
     const bool pretarget_requested = ds4_mtp_native_pretarget_draft_enabled();
     const bool sched2_cont_requested = ds4_mtp_native_sched2_cont_enabled();
     const bool target_first_cont_requested = ds4_mtp_native_target_first_cont_enabled();
+    const bool target_first_cont_broadcast_add =
+        ds4_mtp_native_cont_broadcast_add_enabled();
+    const bool target_first_cont_fused_input =
+        ds4_mtp_native_cont_fused_input_enabled();
+    const bool target_first_cont_fused_chain =
+        ds4_mtp_native_cont_fused_chain_enabled();
+    const bool target_first_cont_state_only =
+        ds4_mtp_native_cont_state_only_enabled();
+    const bool target_first_cont_reuse_state_draft =
+        ds4_mtp_native_cont_reuse_state_draft_enabled();
+    const int target_first_cont_reuse_verify_cap =
+        ds4_mtp_native_cont_reuse_verify_cap_get();
+    const bool target_first_cont_lazy_tail =
+        ds4_mtp_native_cont_lazy_tail_enabled();
+    const bool target_first_cont_gate =
+        ds4_mtp_native_cont_adaptive_gate_enabled();
+    const int target_first_cont_gate_base_backoff =
+        ds4_mtp_native_cont_gate_base_backoff_get();
+    const int target_first_cont_gate_max_backoff =
+        ds4_mtp_native_cont_gate_max_backoff_get();
+    bool target_first_cont_gate_allow = true;
+    bool target_first_cont_gate_skip = false;
+    if (target_first_cont_gate && target_first_cont_requested &&
+        s->mtp_native_cont_gate_backoff > 0) {
+        target_first_cont_gate_allow = false;
+        target_first_cont_gate_skip = true;
+        s->mtp_native_cont_gate_backoff--;
+    }
     const int sched2_cont_m = ds4_mtp_native_sched2_cont_m_get();
     const bool root_inclusive_requested = ds4_mtp_native_root_inclusive_enabled();
     const int adaptive_optimistic_streak =
@@ -25197,6 +25936,11 @@ static int ds4_session_eval_mtp_native(
     double sched2_cont_overlap_ms = 0.0;
     double sched2_cont_gap_ms = 0.0;
     double sched2_cont_overlap_pct = 0.0;
+    uint64_t sched2_cont_raw_copy_bytes = 0;
+    uint32_t sched2_cont_output_tokens = 0;
+    uint32_t sched2_cont_state_rows = 0;
+    double native_cont_tail_materialize_ms = 0.0;
+    bool native_cont_tail_materialized = false;
 
     int drafts[DS4_MTP_NATIVE_MAX_K];
     int suffix_top_ids[DS4_MTP_NATIVE_MAX_K * 16];
@@ -25218,6 +25962,14 @@ static int ds4_session_eval_mtp_native(
     bool native_cont_queue_used = false;
     bool native_cont_queue_stored = false;
     bool native_cont_queue_dropped = false;
+    bool native_cont_drop_stale = false;
+    bool native_cont_drop_unfinished = false;
+    bool native_cont_drop_partial = false;
+    bool native_cont_drop_preview_miss = false;
+    bool native_cont_drop_no_payload = false;
+    bool native_cont_reuse_state_draft = false;
+    uint32_t native_cont_reuse_state_tokens = 0;
+    int native_cont_reuse_verify_cap_applied = 0;
     uint32_t chain_processed_rows = 0;
     uint32_t sched2_cont_depth = 0;
     int native_cont_queue_depth = 0;
@@ -25243,11 +25995,15 @@ static int ds4_session_eval_mtp_native(
         (s->mtp_runahead_tokens[0] != first_token ||
          s->mtp_runahead_base_pos != (uint32_t)start)) {
         native_cont_queue_dropped = true;
+        native_cont_drop_stale = true;
         ds4_session_trim_mtp_runahead(s, 0);
         native_cont_queue_available = false;
     }
     if (!native_cont_queue_available) {
-        if (s->mtp_runahead_depth > 0) native_cont_queue_dropped = true;
+        if (s->mtp_runahead_depth > 0) {
+            native_cont_queue_dropped = true;
+            native_cont_drop_stale = true;
+        }
         ds4_session_trim_mtp_runahead(s, 0);
     }
     ds4_session_clear_mtp_lagged_pending(s);
@@ -25679,6 +26435,92 @@ static int ds4_session_eval_mtp_native(
         return n_accept;
     }
 
+    if (native_cont_queue_used &&
+        target_first_cont_reuse_state_draft &&
+        s->mtp_runahead_depth == 1 &&
+        s->mtp_runahead_native_state_depth >= 1 &&
+        cache_mode == DS4_MTP_NATIVE_CACHE_OWNED &&
+        depth_cap > 1 &&
+        !ds4_gpu_mtp_async_pending()) {
+        int chain_tokens[DS4_MTP_NATIVE_MAX_K];
+        for (int i = 0; i < DS4_MTP_NATIVE_MAX_K; i++) chain_tokens[i] = -1;
+        double wait_ms = 0.0;
+        double read_ms = 0.0;
+        const double draft_t0 = timing ? now_sec() : 0.0;
+        bool resume_ok =
+            metal_graph_start_mtp_native_resume_async_state_chain(
+                g,
+                &e->model,
+                &e->weights,
+                &e->mtp_model,
+                &e->mtp_weights,
+                s->mtp_runahead_base_n_raw,
+                s->mtp_runahead_base_pos,
+                (uint32_t)depth_cap) &&
+            metal_graph_finish_mtp_native_target_hc_chain_timed(
+                g,
+                chain_tokens,
+                (uint32_t)depth_cap,
+                &wait_ms,
+                &read_ms);
+        (void)wait_ms;
+        (void)read_ms;
+        if (resume_ok) {
+            draft_n = 1;
+            mtp_processed = depth_cap;
+            bool stopped_on_eos = false;
+            for (int i = 0; i + 1 < depth_cap; i++) {
+                const int mtp_top = chain_tokens[i];
+                if (mtp_top < 0) {
+                    resume_ok = false;
+                    break;
+                }
+                drafts[draft_n++] = mtp_top;
+                if (mtp_top == eos_token) {
+                    stopped_on_eos = true;
+                    break;
+                }
+            }
+            if (resume_ok && !stopped_on_eos &&
+                draft_n == depth_cap &&
+                start + draft_n < s->ctx_size) {
+                preview = chain_tokens[depth_cap - 1];
+                preview_valid = preview >= 0;
+            }
+        }
+        if (resume_ok) {
+            if (target_first_cont_reuse_verify_cap > 0 &&
+                draft_n > target_first_cont_reuse_verify_cap) {
+                const int capped_draft_n = target_first_cont_reuse_verify_cap;
+                if (drafts[capped_draft_n - 1] != eos_token &&
+                    chain_tokens[capped_draft_n - 1] >= 0 &&
+                    start + capped_draft_n < s->ctx_size) {
+                    preview = chain_tokens[capped_draft_n - 1];
+                    preview_valid = true;
+                } else {
+                    preview = -1;
+                    preview_valid = false;
+                }
+                draft_n = capped_draft_n;
+                native_cont_reuse_verify_cap_applied = capped_draft_n;
+            }
+            native_cont_reuse_state_draft = true;
+            native_cont_reuse_state_tokens = (uint32_t)depth_cap;
+            s->mtp_runahead_depth = draft_n;
+            for (int i = 0; i < draft_n; i++) {
+                s->mtp_runahead_tokens[i] = drafts[i];
+            }
+            s->mtp_runahead_native_state_depth = (uint32_t)draft_n;
+            const double draft_done = timing ? now_sec() : 0.0;
+            if (timing) draft_ms = (draft_done - draft_t0) * 1000.0;
+            ds4_mtp_native_ledger_record_draft(&ledger,
+                                               draft_n,
+                                               native_cont_reuse_state_tokens,
+                                               preview,
+                                               preview_valid);
+        }
+    }
+
     if (!native_cont_queue_used &&
         !pretarget_draft && chain_draft_requested &&
         cache_mode == DS4_MTP_NATIVE_CACHE_OWNED &&
@@ -25798,6 +26640,13 @@ static int ds4_session_eval_mtp_native(
     int accepted_approx_rows = 0;
     const bool native_top_only =
         !validate && !ds4_mtp_native_full_logits_enabled();
+    const char *mtp_top1_env = getenv("DS4_MTP_NATIVE_MTP_TOP1_ONLY");
+    const bool mtp_draft_top1_only =
+        mtp_top1_env != NULL && strcmp(mtp_top1_env, "0") != 0;
+    const bool mtp_output_fused_norm =
+        ds4_mtp_native_mtp_output_fused_norm_enabled();
+    const bool mtp_q8_top1_nr4 =
+        ds4_metal_q8_top1_nr4_enabled();
     const bool topid_frontier =
         native_top_only &&
         native_approx_topk == 1 &&
@@ -25876,7 +26725,10 @@ static int ds4_session_eval_mtp_native(
                                                                 base_raw,
                                                                 preview,
                                                                 (uint32_t)(start + draft_n),
-                                                                (uint32_t)cont_room);
+                                                                (uint32_t)cont_room,
+                                                                &sched2_cont_raw_copy_bytes,
+                                                                &sched2_cont_output_tokens,
+                                                                &sched2_cont_state_rows);
             const double cont_done = timing ? now_sec() : 0.0;
             if (sched2_cont_started) {
                 sched2_cont_depth = (uint32_t)cont_room;
@@ -25942,6 +26794,7 @@ static int ds4_session_eval_mtp_native(
             bool target_first_armed = false;
             ds4_mtp_native_target_first_probe_clear();
             if (target_first_cont_requested &&
+                target_first_cont_gate_allow &&
                 !native_cont_queue_used &&
                 native_single_command_default &&
                 native_top_only &&
@@ -25999,6 +26852,12 @@ static int ds4_session_eval_mtp_native(
                 sched2_cont_wait_target_ms = g_mtp_native_target_first_probe.wait_target_ms;
                 sched2_cont_wait_ms = g_mtp_native_target_first_probe.wait_mtp_ms;
                 sched2_cont_read_ms = g_mtp_native_target_first_probe.read_ms;
+                sched2_cont_raw_copy_bytes =
+                    g_mtp_native_target_first_probe.raw_copy_bytes;
+                sched2_cont_output_tokens =
+                    g_mtp_native_target_first_probe.produced_tokens;
+                sched2_cont_state_rows =
+                    g_mtp_native_target_first_probe.produced_state_rows;
                 if (sched2_cont_finished) {
                     for (int i = 0; i < DS4_MTP_SCHED2_MAX_BRANCH_K; i++) {
                         native_cont_queue_tokens[i + 1] =
@@ -26116,12 +26975,20 @@ static int ds4_session_eval_mtp_native(
     if (sched2_cont_started && !sched2_cont_finished) {
         int cont_tokens[DS4_MTP_SCHED2_MAX_BRANCH_K];
         for (int i = 0; i < DS4_MTP_SCHED2_MAX_BRANCH_K; i++) cont_tokens[i] = -1;
-        sched2_cont_finished =
-            metal_graph_finish_mtp_native_target_hc_chain_timed(g,
-                                                                cont_tokens,
-                                                                sched2_cont_depth,
-                                                                timing ? &sched2_cont_wait_ms : NULL,
-                                                                timing ? &sched2_cont_read_ms : NULL);
+        if (sched2_cont_output_tokens == 0) {
+            sched2_cont_finished =
+                metal_graph_wait_mtp_native_target_hc_chain_timed(
+                    g,
+                    timing ? &sched2_cont_wait_ms : NULL);
+            sched2_cont_read_ms = 0.0;
+        } else {
+            sched2_cont_finished =
+                metal_graph_finish_mtp_native_target_hc_chain_timed(g,
+                                                                    cont_tokens,
+                                                                    sched2_cont_output_tokens,
+                                                                    timing ? &sched2_cont_wait_ms : NULL,
+                                                                    timing ? &sched2_cont_read_ms : NULL);
+        }
 #ifdef __APPLE__
         if (timing) {
             ds4_gpu_command_span mtp_span = {0};
@@ -26366,7 +27233,11 @@ static int ds4_session_eval_mtp_native(
     const double mtp_commit_t0 = timing ? now_sec() : 0.0;
     bool mtp_ledger_committed = false;
     if (native_cont_queue_used) {
-        if (!ds4_mtp_native_commit_async_runahead(s, &ledger, commit_drafts)) {
+        if (!ds4_mtp_native_commit_async_runahead(s,
+                                                  &ledger,
+                                                  commit_drafts,
+                                                  timing ? &native_cont_tail_materialize_ms : NULL,
+                                                  &native_cont_tail_materialized)) {
             free(committed_logits);
             free(suffix_logits);
             spec_frontier_free(&frontier);
@@ -26461,7 +27332,11 @@ static int ds4_session_eval_mtp_native(
             s->mtp_runahead_tokens[queue_depth++] = tok;
             if (tok == eos_token) break;
         }
-        if (queue_depth > 1) {
+        const bool state_only_payload =
+            target_first_cont_state_only &&
+            sched2_cont_output_tokens == 0 &&
+            sched2_cont_state_rows > 0;
+        if (queue_depth > 1 || state_only_payload) {
             native_cont_queue_stored = true;
             s->mtp_runahead_depth = queue_depth;
             s->mtp_runahead_native_async = true;
@@ -26471,19 +27346,30 @@ static int ds4_session_eval_mtp_native(
                 g->raw_window,
                 g->raw_cap);
             s->mtp_runahead_base_pos = (uint32_t)(start + draft_n);
+            s->mtp_runahead_native_state_depth = sched2_cont_state_rows;
+            if (s->mtp_runahead_native_state_depth == 0 ||
+                s->mtp_runahead_native_state_depth > (uint32_t)queue_depth) {
+                s->mtp_runahead_native_state_depth = (uint32_t)queue_depth;
+            }
             s->mtp_draft_token = s->mtp_runahead_tokens[0];
             s->mtp_draft_valid = true;
             s->mtp_top_ids[0] = s->mtp_draft_token;
             s->mtp_top_k = 1;
+        } else {
+            native_cont_queue_dropped = true;
+            native_cont_drop_no_payload = true;
         }
     } else if (sched2_cont_started && !sched2_cont_finished) {
         native_cont_queue_dropped = true;
+        native_cont_drop_unfinished = true;
     } else if (sched2_cont_finished && commit_drafts < draft_n) {
         native_cont_queue_dropped = true;
+        native_cont_drop_partial = true;
     } else if (sched2_cont_finished && preview >= 0 &&
                native_cont_next_target_valid &&
                native_cont_next_target != preview) {
         native_cont_queue_dropped = true;
+        native_cont_drop_preview_miss = true;
     }
 
     const int discarded = draft_n - commit_drafts;
@@ -26511,15 +27397,41 @@ static int ds4_session_eval_mtp_native(
             s->mtp_native_full_accept_streak = 0;
         }
     }
+    if (target_first_cont_gate && target_first_cont_requested) {
+        const bool cont_good =
+            native_cont_queue_stored ||
+            (native_cont_queue_used && commit_drafts > 1);
+        const bool cont_bad =
+            native_cont_queue_dropped &&
+            (native_cont_drop_unfinished ||
+             native_cont_drop_partial ||
+             native_cont_drop_preview_miss ||
+             native_cont_drop_no_payload);
+        if (cont_good) {
+            s->mtp_native_cont_gate_bad_streak = 0;
+            s->mtp_native_cont_gate_backoff = 0;
+        } else if (cont_bad) {
+            if (s->mtp_native_cont_gate_bad_streak < 1000000) {
+                s->mtp_native_cont_gate_bad_streak++;
+            }
+            const int backoff = ds4_mtp_native_cont_gate_backoff_for_bad_streak(
+                s->mtp_native_cont_gate_bad_streak,
+                target_first_cont_gate_base_backoff,
+                target_first_cont_gate_max_backoff);
+            if (s->mtp_native_cont_gate_backoff < backoff) {
+                s->mtp_native_cont_gate_backoff = backoff;
+            }
+        }
+    }
     if (timing) {
         fprintf(stderr,
-                "ds4: mtp native cycle mode=%s verify_opt=%s commit_opt=%s effective_commit=%s approx_topk=%d approx_rows=%d top_only=%d topid_frontier=%d single_command=%d output_fused_top1=%d output_top1_only=%d logits_row=%d remat_row=%d snapshot_elided=%d slot_commit=%d capture_compute_copy=%d pretarget_requested=%d pretarget_possible=%d pretarget=%d chain_draft=%d chain_rows=%u sched2_cont_requested=%d target_first_cont_requested=%d native_cont_used=%d native_cont_stored=%d native_cont_dropped=%d native_cont_depth=%d native_cont_next=%d sched2_cont_started=%d sched2_cont_finished=%d sched2_cont_m=%d sched2_cont_depth=%u capture_rows=%d kept_verifier_state=%d capture_cooldown=%d adaptive_full_streak=%d adaptive_partial_streak=%d adaptive_threshold=%d depth=%d drafted=%d processed=%d "
+                "ds4: mtp native cycle mode=%s verify_opt=%s commit_opt=%s effective_commit=%s approx_topk=%d approx_rows=%d top_only=%d topid_frontier=%d single_command=%d output_fused_top1=%d output_top1_only=%d mtp_draft_top1_only=%d mtp_output_fused_norm=%d mtp_q8_top1_nr4=%d logits_row=%d remat_row=%d snapshot_elided=%d slot_commit=%d capture_compute_copy=%d pretarget_requested=%d pretarget_possible=%d pretarget=%d chain_draft=%d chain_rows=%u sched2_cont_requested=%d target_first_cont_requested=%d target_first_cont_broadcast_add=%d target_first_cont_fused_input=%d target_first_cont_fused_chain=%d target_first_cont_state_only=%d target_first_cont_reuse_state_draft=%d target_first_cont_reuse_verify_cap=%d target_first_cont_lazy_tail=%d target_first_cont_gate=%d target_first_cont_gate_allow=%d target_first_cont_gate_skip=%d target_first_cont_gate_backoff=%d target_first_cont_gate_bad=%d native_cont_used=%d native_cont_stored=%d native_cont_dropped=%d native_cont_drop_stale=%d native_cont_drop_unfinished=%d native_cont_drop_partial=%d native_cont_drop_preview_miss=%d native_cont_drop_no_payload=%d native_cont_reuse_state_draft=%d native_cont_reuse_state_tokens=%u native_cont_reuse_verify_cap_applied=%d native_cont_depth=%d native_cont_next=%d sched2_cont_started=%d sched2_cont_finished=%d sched2_cont_m=%d sched2_cont_depth=%u sched2_cont_output_tokens=%u sched2_cont_state_rows=%u sched2_cont_raw_copy_bytes=%" PRIu64 " native_cont_tail_materialized=%d capture_rows=%d kept_verifier_state=%d capture_cooldown=%d adaptive_full_streak=%d adaptive_partial_streak=%d adaptive_threshold=%d depth=%d drafted=%d processed=%d "
                 "committed=%d accepted=%d first_suffix_top=%d first_suffix_draft=%d "
                 "first_suffix_rank=%d preview=%d preview_valid=%d discarded=%d "
                 "target=%.3f ms draft=%.3f ms snapshot=%.3f ms verify=%.3f ms "
                 "verifier_decode=%.3f ms verifier_head=%.3f ms "
                 "verifier_decode_gpu=%.3f ms verifier_head_gpu=%.3f ms verifier_total_gpu=%.3f ms "
-                "logits_read=%.3f ms restore=%.3f ms validate=%.3f ms commit=%.3f ms replay=%.3f ms mtp_commit=%.3f ms "
+                "logits_read=%.3f ms restore=%.3f ms validate=%.3f ms commit=%.3f ms replay=%.3f ms mtp_commit=%.3f ms native_cont_tail_materialize=%.3f ms "
                 "sched2_cont_start=%.3f ms sched2_cont_wait_target=%.3f ms sched2_cont_wait=%.3f ms sched2_cont_read=%.3f ms "
                 "sched2_cont_target_gpu=%.3f ms sched2_cont_mtp_gpu=%.3f ms sched2_cont_overlap=%.3f ms sched2_cont_gap=%.3f ms sched2_cont_overlap_pct=%.2f "
                 "mtp_raw_base=%u mtp_raw_keep=%u mtp_raw_discarded=%u "
@@ -26535,6 +27447,9 @@ static int ds4_session_eval_mtp_native(
                 profile.single_command,
                 profile.output_fused_top1,
                 profile.output_top1_only,
+                mtp_draft_top1_only ? 1 : 0,
+                mtp_output_fused_norm ? 1 : 0,
+                mtp_q8_top1_nr4 ? 1 : 0,
                 profile.logits_materialized_row,
                 profile.logits_rematerialized_row,
                 snapshot_elided ? 1 : 0,
@@ -26547,15 +27462,39 @@ static int ds4_session_eval_mtp_native(
                 chain_processed_rows,
                 sched2_cont_requested ? 1 : 0,
                 target_first_cont_requested ? 1 : 0,
+                target_first_cont_broadcast_add ? 1 : 0,
+                target_first_cont_fused_input ? 1 : 0,
+                target_first_cont_fused_chain ? 1 : 0,
+                target_first_cont_state_only ? 1 : 0,
+                target_first_cont_reuse_state_draft ? 1 : 0,
+                target_first_cont_reuse_verify_cap,
+                target_first_cont_lazy_tail ? 1 : 0,
+                target_first_cont_gate ? 1 : 0,
+                target_first_cont_gate_allow ? 1 : 0,
+                target_first_cont_gate_skip ? 1 : 0,
+                s->mtp_native_cont_gate_backoff,
+                s->mtp_native_cont_gate_bad_streak,
                 native_cont_queue_used ? 1 : 0,
                 native_cont_queue_stored ? 1 : 0,
                 native_cont_queue_dropped ? 1 : 0,
+                native_cont_drop_stale ? 1 : 0,
+                native_cont_drop_unfinished ? 1 : 0,
+                native_cont_drop_partial ? 1 : 0,
+                native_cont_drop_preview_miss ? 1 : 0,
+                native_cont_drop_no_payload ? 1 : 0,
+                native_cont_reuse_state_draft ? 1 : 0,
+                native_cont_reuse_state_tokens,
+                native_cont_reuse_verify_cap_applied,
                 s->mtp_runahead_native_async ? s->mtp_runahead_depth : native_cont_queue_depth,
                 native_cont_next_target_valid ? native_cont_next_target : -1,
                 sched2_cont_started ? 1 : 0,
                 sched2_cont_finished ? 1 : 0,
                 sched2_cont_m,
                 sched2_cont_depth,
+                sched2_cont_output_tokens,
+                sched2_cont_state_rows,
+                sched2_cont_raw_copy_bytes,
+                native_cont_tail_materialized ? 1 : 0,
                 (int)verifier_capture_rows,
                 keep_verifier_state ? 1 : 0,
                 s->mtp_native_capture_cooldown,
@@ -26588,6 +27527,7 @@ static int ds4_session_eval_mtp_native(
                 commit_ms,
                 replay_ms,
                 mtp_commit_ms,
+                native_cont_tail_materialize_ms,
                 sched2_cont_start_ms,
                 sched2_cont_wait_target_ms,
                 sched2_cont_wait_ms,

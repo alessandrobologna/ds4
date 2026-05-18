@@ -5757,3 +5757,1646 @@ Interpretation:
   overlapped contention. The promising direction is adaptive materialized
   shallow continuation, probably `M2`, gated by observed preview-hit rate rather
   than blindly running continuation on every cycle.
+
+### 2026-05-17 Longer Native/Continuation Evidence
+
+Studio artifact:
+
+- Long CLI matrix: `/tmp/ds4-native-long512-20260517_051350`
+- Representative quality/TPS slice:
+  `/tmp/ds4-native-contm3-quality50-20260517_051819`
+
+Long CLI settings:
+
+- `--ctx 2048 --nothink -sys "" --temp 0 -n 512`
+- Native settings: `DS4_MTP_NATIVE=1 DS4_MTP_NATIVE_TIMING=1
+  DS4_MTP_NATIVE_VERIFY_OPT=smallm DS4_MTP_NATIVE_CACHE_MODE=owned`
+- Continuation settings add `DS4_MTP_NATIVE_TARGET_FIRST_CONT=1` and
+  `DS4_MTP_NATIVE_SCHED2_CONT_M=2|3|4`
+- `--mtp-draft 4`
+
+Long CLI matrix:
+
+| Prompt | Mode | stdout | t/s | continuation used | stored | dropped | cycles | avg accepted |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | oracle | 34.97 | - | - | - | - | - |
+| count | native | match | 40.84 | 0 | 0 | 0 | 122 | 3.279 |
+| count | cont M2 | match | 39.47 | 0 | 0 | 102 | 122 | 3.279 |
+| count | cont M3 | match | 38.67 | 0 | 0 | 102 | 122 | 3.279 |
+| count | cont M4 | match | 38.19 | 0 | 0 | 102 | 122 | 3.279 |
+| explain | serial | oracle | 35.78 | - | - | - | - | - |
+| explain | native | match | 33.72 | 0 | 0 | 0 | 151 | 2.099 |
+| explain | cont M2 | match | 32.53 | 20 | 20 | 68 | 157 | 2.019 |
+| explain | cont M3 | match | 31.70 | 21 | 21 | 64 | 156 | 2.032 |
+| explain | cont M4 | match | 31.35 | 21 | 21 | 64 | 156 | 2.032 |
+| code | serial | oracle | 35.56 | - | - | - | - | - |
+| code | native | match | 32.57 | 0 | 0 | 0 | 281 | 1.819 |
+| code | cont M2 | match | 32.99 | 4 | 4 | 11 | 269 | 1.900 |
+| code | cont M3 | match | 34.23 | 58 | 58 | 83 | 232 | 2.207 |
+| code | cont M4 | match | 33.68 | 58 | 58 | 83 | 232 | 2.207 |
+
+Quality/TPS settings:
+
+- HumanEval first 50 with EvalPlus scoring.
+- GSM8K first 50 from
+  `/tmp/ds4-smallm-gsm8k20-20260516_033442/gsm8k_test.jsonl`.
+- Modes: serial, native K4, native K4 with target-first `cont_m=3`.
+
+HumanEval first-50:
+
+| Mode | base pass@1 | plus pass@1 | tokens | elapsed | agg t/s | mean t/s | median t/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| serial | 0.940 | 0.900 | 4212 | 155.94 s | 27.01 | 25.13 | 25.96 |
+| native K4 | 0.940 | 0.900 | 4212 | 150.90 s | 27.91 | 25.90 | 26.79 |
+| native K4 cont M3 | 0.940 | 0.900 | 4212 | 158.29 s | 26.61 | 24.77 | 26.07 |
+
+GSM8K first-50:
+
+| Mode | accuracy | correct | failed | tokens | elapsed | agg t/s | mean t/s | median t/s |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| serial | 0.980 | 49/50 | 8 | 6673 | 217.01 s | 30.75 | 29.82 | 29.93 |
+| native K4 | 0.980 | 49/50 | 8 | 6673 | 218.70 s | 30.51 | 29.73 | 29.62 |
+| native K4 cont M3 | 0.980 | 49/50 | 8 | 6673 | 227.82 s | 29.29 | 28.55 | 28.56 |
+
+Interpretation:
+
+- The long `-n 512` matrix is more representative than the earlier `-n 64`
+  smoke and changes the continuation conclusion. Continuation reuse is real and
+  sometimes helps a code-shaped stream, but it is not a broad win yet. `cont_m=3`
+  improves long `code` versus native K4 (`34.23` vs `32.57` t/s) but remains
+  below serial (`35.56` t/s) and hurts `count`/`explain`.
+- Plain native K4 is stronger than the smoke-only framing suggested. It beats
+  serial on long `count` and on HumanEval first-50 aggregate TPS, while
+  preserving the same HumanEval base/plus pass rates as serial. It is roughly
+  neutral on GSM8K first-50 and still below serial on long `explain`/`code`.
+- The quality slices show no observed quality regression for native K4 or
+  continuation on these exact-temp-0 runs: HumanEval failed task sets are
+  identical, and GSM8K has the same single failed index (`8`) in all modes.
+- Continuation should not be treated as promoted. Its current safe queue
+  contract is correct, but target/MTP contention plus preview-hit variability
+  make blind continuation negative on representative slices. The next
+  continuation work should be adaptive gating or a cheaper continuation kernel,
+  not deeper blind `cont_m`.
+
+### 2026-05-17 Continuation Raw-Cache Copy A/B
+
+Implementation:
+
+- Replaced the target-first continuation probe's full MTP raw-cache clone with a
+  bounded live-prefix/ring-slice copy.
+- Added `DS4_MTP_NATIVE_CONT_FULL_RAW_CLONE=1` as the A/B rollback flag for the
+  previous full-copy behavior.
+- Added timing/drop fields:
+  - `sched2_cont_raw_copy_bytes`
+  - `native_cont_drop_stale`
+  - `native_cont_drop_unfinished`
+  - `native_cont_drop_partial`
+  - `native_cont_drop_preview_miss`
+  - `native_cont_drop_no_payload`
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: same build and Metal harness checks in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Studio artifact:
+
+- `/tmp/ds4-cont-rawcopy-20260517_090633`
+
+Settings:
+
+- `--ctx 2048 --nothink -sys "" --temp 0 -n 512`
+- Native settings: `DS4_MTP_NATIVE=1 DS4_MTP_NATIVE_TIMING=1
+  DS4_MTP_NATIVE_VERIFY_OPT=smallm DS4_MTP_NATIVE_CACHE_MODE=owned`
+- Continuation settings add `DS4_MTP_NATIVE_TARGET_FIRST_CONT=1` and
+  `DS4_MTP_NATIVE_SCHED2_CONT_M=2|3`
+- `live` uses the new ring-slice copy; `full` sets
+  `DS4_MTP_NATIVE_CONT_FULL_RAW_CLONE=1`.
+- All continuation stdout matched serial.
+
+| Prompt | Mode | stdout | t/s | cycles | avg accepted | used | stored | dropped | avg copied raw bytes | avg MTP GPU | avg target GPU | avg overlap |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | cont M2 live | match | 38.34 | 117 | 3.419 | 0 | 0 | 106 | 202,770 | 50.701 ms | 47.827 ms | 47.813 ms |
+| count | cont M2 full | match | 38.23 | 117 | 3.419 | 0 | 0 | 106 | 3,799,968 | 50.953 ms | 48.084 ms | 48.067 ms |
+| count | cont M3 live | match | 37.67 | 117 | 3.419 | 0 | 0 | 106 | 202,770 | 52.350 ms | 48.068 ms | 48.018 ms |
+| count | cont M3 full | match | 37.68 | 117 | 3.419 | 0 | 0 | 106 | 3,799,968 | 52.260 ms | 47.985 ms | 47.932 ms |
+| explain | cont M2 live | match | 32.37 | 129 | 1.992 | 17 | 17 | 52 | 96,780 | 24.093 ms | 22.395 ms | 22.382 ms |
+| explain | cont M2 full | match | 32.32 | 129 | 1.992 | 17 | 17 | 52 | 2,243,465 | 24.126 ms | 22.429 ms | 22.415 ms |
+| explain | cont M3 live | match | 31.81 | 131 | 1.962 | 16 | 16 | 54 | 97,913 | 24.935 ms | 22.404 ms | 22.371 ms |
+| explain | cont M3 full | match | 31.74 | 131 | 1.962 | 16 | 16 | 54 | 2,241,231 | 24.986 ms | 22.448 ms | 22.415 ms |
+| code | cont M2 live | match | 34.29 | 238 | 2.147 | 59 | 58 | 83 | 133,000 | 26.702 ms | 24.815 ms | 24.801 ms |
+| code | cont M2 full | match | 34.28 | 238 | 2.147 | 59 | 58 | 83 | 2,502,484 | 26.727 ms | 24.841 ms | 24.829 ms |
+| code | cont M3 live | match | 33.59 | 236 | 2.169 | 58 | 58 | 83 | 116,615 | 27.928 ms | 25.110 ms | 25.079 ms |
+| code | cont M3 full | match | 33.49 | 236 | 2.169 | 58 | 58 | 83 | 2,505,919 | 27.955 ms | 25.135 ms | 25.101 ms |
+
+Interpretation:
+
+- The live-prefix/ring-slice copy reduced continuation raw-cache copy volume by
+  roughly `10x` to `20x`.
+- TPS and GPU spans barely moved. Representative examples: `count` M2 improved
+  only `38.23 -> 38.34` t/s, `explain` M2 `32.32 -> 32.37` t/s, and `code` M2
+  `34.28 -> 34.29` t/s.
+- The full raw-cache clone was wasteful, but it was not the dominant
+  continuation bottleneck.
+- Do not spend more effort on copy slicing. A future no-clone attempt must be a
+  real committed-prefix plus speculative-tail cache overlay; direct writes into
+  committed `g->mtp_raw_cache` are unsafe because partial accepts can leave
+  overwritten ring rows live.
+
+Decision:
+
+- Keep the live-prefix/ring-slice copy as the default because it is correct and
+  cheaper.
+- Drop copy-only optimization as a throughput track. Continue with a
+  continuation-specific cache/kernel rewrite: fused/specialized MTP row work,
+  explicit speculative tail state, and avoidance of full-logit/materialized
+  cache overhead where exact top-id drafting permits it.
+
+### 2026-05-17 Continuation Kernel Track: MTP Output/Final-Top Work
+
+Implementation:
+
+- Added `DS4_MTP_NATIVE_MTP_TOP1_ONLY=1` as a gated native MTP draft-output
+  probe. When enabled, MTP draft rows emit exact top ids directly from the Q8
+  output projection instead of materializing a full vocab logits row and then
+  running a separate top-1 reduction.
+- Added `DS4_MTP_NATIVE_CONT_STAGE_PROFILE=1`, a diagnostic-only continuation
+  stage profiler. It intentionally splits and waits the MTP async command buffer
+  at stage boundaries, so its timings are cost-attribution evidence, not
+  throughput numbers.
+- Added `DS4_MTP_NATIVE_CONT_SKIP_FINAL_TOP=1` as a gated continuation-specific
+  kernel-contract probe. The continuation still decodes/materializes the final
+  speculative tail row state, but it skips the final row's unused output
+  head/top-id. The safe queue stores `preview + tokens[0..depth-2]`; the last
+  output token was only a future preview and was not consumed by the transaction.
+- Added `sched2_cont_output_tokens` to the timing line so row depth and emitted
+  continuation output-token count are visible separately.
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: same build and Metal harness checks in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Top1-only long matrix:
+
+- Artifact: `/tmp/ds4-native-mtp-top1-long512-20260517_091837`
+- Settings: `--ctx 2048 --nothink -sys "" --temp 0 -n 512`,
+  native small-M K4, target-first continuation `M=2|3`.
+- All tested native/continuation stdout matched serial.
+
+| Prompt | Mode | stdout | t/s | avg MTP GPU | avg target GPU | avg draft | avg verify |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| count | native | match | 39.57 | - | - | 6.847 ms | 50.437 ms |
+| count | native top1 | match | 39.56 | - | - | 6.769 ms | 50.570 ms |
+| count | cont M2 | match | 38.23 | 50.929 ms | 48.053 ms | 6.824 ms | 53.469 ms |
+| count | cont M2 top1 | match | 38.24 | 50.922 ms | 48.082 ms | 6.776 ms | 53.491 ms |
+| explain | native | match | 33.56 | - | - | 5.270 ms | 30.412 ms |
+| explain | native top1 | match | 33.55 | - | - | 5.229 ms | 30.474 ms |
+| explain | cont M2 | match | 32.38 | 24.086 ms | 22.389 ms | 4.576 ms | 28.952 ms |
+| explain | cont M2 top1 | match | 32.45 | 24.022 ms | 22.348 ms | 4.521 ms | 28.875 ms |
+| code | native | match | 35.70 | - | - | 5.235 ms | 36.099 ms |
+| code | native top1 | match | 35.70 | - | - | 5.190 ms | 36.132 ms |
+| code | cont M2 | match | 34.23 | 26.790 ms | 24.906 ms | 3.945 ms | 30.523 ms |
+| code | cont M2 top1 | match | 34.27 | 26.726 ms | 24.864 ms | 3.906 ms | 30.461 ms |
+
+Interpretation:
+
+- Exact MTP top1-only output is correctness-clean on the long stdout matrix, but
+  it barely moves throughput or continuation GPU span.
+- This means full-logit materialization inside MTP draft rows was some waste,
+  but not enough by itself. The Q8 vocab scan still dominates the output stage
+  even when it writes only the top id.
+
+Continuation stage profile:
+
+- Target-first contention artifact:
+  `/tmp/ds4-native-cont-stage-profile-20260517_092732`
+- Serialized/intrinsic artifact:
+  `/tmp/ds4-native-cont-stage-profile-serialized-20260517_092836`
+- Output-head split artifact:
+  `/tmp/ds4-native-cont-output-stage-profile-20260517_093108`
+
+Serialized `code`, continuation M2, per-row intrinsic stage cost:
+
+| Stage | avg | median |
+| --- | ---: | ---: |
+| raw copy | 0.201 ms | 0.189 ms |
+| embed/eproj | 0.272 ms | 0.267 ms |
+| hproj/add | 0.291 ms | 0.286 ms |
+| decode layer | 0.920 ms | 0.914 ms |
+| output HC/norm | 0.284 ms | 0.289 ms |
+| output vocab logits | 0.999 ms | 0.987 ms |
+| top reduce | 0.262 ms | 0.256 ms |
+| output vocab top1-only | 1.042 ms | 1.030 ms |
+
+Target-first profile caveat:
+
+- In target-first continuation, row 0's first MTP stage is stretched by target
+  verifier contention. For `code`, cont M2 row-0 `embed_eproj` averaged about
+  `42.3 ms`, while row-1 `embed_eproj` averaged about `0.27 ms`.
+- That is not intrinsic embed/eproj work; it is the target verifier occupying
+  the GPU while the continuation command begins. This is why scheduler overlap
+  alone is not enough: the continuation must be cheap enough that its non-overlapped
+  tail and resource contention are lower than the draft work it replaces.
+
+Skip-final-output long matrix:
+
+- Long artifact: `/tmp/ds4-native-cont-skipfinal-long512-20260517_093542`
+- Audit artifact: `/tmp/ds4-native-cont-skipfinal-audit-20260517_094044`
+- All long-matrix stdout matched serial.
+- Audit run with `DS4_MTP_NATIVE_OUTPUT_FUSED_TOP1_AUDIT=1`, `cont_m=2`,
+  `DS4_MTP_NATIVE_CONT_SKIP_FINAL_TOP=1`, `-n 96` matched serial stdout on
+  count/explain/code and reported `0` verifier audit mismatches.
+
+| Prompt | Mode | stdout | t/s | used | stored | dropped | avg emitted cont tokens | avg MTP GPU | avg target GPU |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | native | match | 39.65 | 0 | 0 | 0 | - | - | - |
+| count | cont M2 | match | 38.32 | 0 | 0 | 106 | 1.812 | 50.801 ms | 47.925 ms |
+| count | cont M2 skip-final | match | 38.60 | 0 | 0 | 106 | 0.906 | 50.157 ms | 48.062 ms |
+| count | cont M2 skip-final top1 | match | 38.70 | 0 | 0 | 106 | 0.906 | 49.978 ms | 47.900 ms |
+| count | cont M3 | match | 37.67 | 0 | 0 | 106 | 2.718 | 52.286 ms | 48.006 ms |
+| count | cont M3 skip-final | match | 38.04 | 0 | 0 | 106 | 1.812 | 51.452 ms | 47.962 ms |
+| explain | native | match | 33.63 | 0 | 0 | 0 | - | - | - |
+| explain | cont M2 | match | 32.24 | 17 | 17 | 52 | 1.070 | 24.206 ms | 22.504 ms |
+| explain | cont M2 skip-final | match | 32.55 | 17 | 17 | 52 | 0.535 | 23.675 ms | 22.437 ms |
+| explain | cont M2 skip-final top1 | match | 32.56 | 17 | 17 | 52 | 0.535 | 23.719 ms | 22.486 ms |
+| explain | cont M3 | match | 31.75 | 16 | 16 | 54 | 1.603 | 24.956 ms | 22.434 ms |
+| explain | cont M3 skip-final | match | 31.98 | 16 | 16 | 54 | 1.069 | 24.498 ms | 22.424 ms |
+| code | native | match | 35.64 | 0 | 0 | 0 | - | - | - |
+| code | cont M2 | match | 34.30 | 58 | 59 | 83 | 1.193 | 26.702 ms | 24.820 ms |
+| code | cont M2 skip-final | match | 34.50 | 58 | 59 | 83 | 0.597 | 26.243 ms | 24.867 ms |
+| code | cont M2 skip-final top1 | match | 34.57 | 58 | 59 | 83 | 0.597 | 26.197 ms | 24.833 ms |
+| code | cont M3 | match | 33.34 | 58 | 58 | 83 | 1.792 | 28.126 ms | 25.304 ms |
+| code | cont M3 skip-final | match | 33.69 | 58 | 58 | 83 | 1.195 | 27.536 ms | 25.224 ms |
+
+Interpretation:
+
+- Skip-final-output is a real continuation-kernel win: it reduces emitted
+  continuation output-token work by roughly one row per started continuation,
+  cuts MTP GPU span by about `0.45` to `0.85 ms`, and improves continuation TPS
+  consistently across count/explain/code.
+- It is still not enough to promote target-first continuation. The best
+  continuation row in this matrix, `code cont M2 skip-final top1`, reaches
+  `34.57` t/s versus current native `35.64` t/s and serial `35.41` t/s. On
+  count and explain, continuation remains below native.
+- Keep `DS4_MTP_NATIVE_CONT_SKIP_FINAL_TOP=1` as a correct gated improvement for
+  continuation experiments. Do not promote continuation broadly until the next
+  rewrite reduces the remaining per-row costs or makes the speculative-tail
+  cache profitable enough to beat current native K4.
+
+Next implementation direction:
+
+- The remaining exact per-row intrinsic cost is mostly:
+  - MTP vocab projection/top-id (`~1.25 ms` for logits+top or `~1.04 ms` for
+    top1-only);
+  - the MTP decode block (`~0.9 ms`);
+  - MTP input projections (`~0.55 ms`).
+- A true fused continuation row path would need to combine the input projection
+  sequence and decode row work, or introduce a stronger speculative-tail cache
+  overlay that avoids starting continuation when row-0 work will only be delayed
+  behind the target verifier.
+
+### 2026-05-17 Continuation Broadcast-Add Fusion
+
+Context:
+
+- The DeepSeek-V4 paper did not introduce a new MTP acceptance algorithm; it
+  reinforced the implementation lesson that matters here: cache layout and
+  kernels have to be co-designed. For DS4 native continuation, that means
+  explicit speculative tail state and fewer materialized intermediate tensors,
+  not more scheduler-only variants.
+- Track 1 is now closed as evidence. Live-prefix/ring-slice raw-copy reduced
+  raw bytes by roughly `10x` to `20x`, but did not materially move TPS or GPU
+  spans. Do not spend more effort on copy slicing. A no-clone path only makes
+  sense as a real committed-prefix plus speculative-tail overlay.
+
+Implementation:
+
+- Added `DS4_MTP_NATIVE_CONT_BROADCAST_ADD=1`.
+- Added `ds4_gpu_hc_add_broadcast_tensor()` and
+  `kernel_dsv4_hc_add_broadcast`.
+- In the continuation row path, this skips materializing `mtp_eproj_hc` by
+  replacing `repeat_hc(e_proj)` plus `add(eproj_hc, hproj_hc)` with a single
+  broadcast-add into `mtp_input_hc`.
+- The optimization is continuation-gated. Non-continuation MTP paths keep the
+  existing row construction.
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: same build and Metal harness checks in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Artifacts:
+
+- Long matrix:
+  `/tmp/ds4-native-cont-broadcast-long512-20260517_095306`
+- Intrinsic continuation stage A/B:
+  `/tmp/ds4-native-cont-broadcast-stage-20260517_095735`
+- Validate-mode top-id/stdout pass:
+  `/tmp/ds4-native-cont-broadcast-validate-20260517_095813`
+
+Validation:
+
+- Long `-n 512` count/explain/code stdout matched serial for all tested modes.
+- Validate-mode `-n 96` count/explain/code for `cont_m=2` skip-final top1
+  broadcast-add matched serial stdout and reported `mismatch_sum=0`,
+  `max_delta=0`.
+
+Long `-n 512` matrix:
+
+| Prompt | Mode | stdout | t/s | used | stored | dropped | partial drops | preview misses | avg emitted cont tokens | avg MTP GPU | avg target GPU | avg overlap |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | match | 35.70 | - | - | - | - | - | - | - | - | - |
+| count | native K4 | match | 39.68 | 0 | 0 | 0 | 0 | 0 | - | - | - | - |
+| count | cont M2 skip-final top1 | match | 38.68 | 0 | 0 | 106 | 32 | 74 | 0.906 | 50.024 ms | 47.946 ms | 47.931 ms |
+| count | cont M2 broadcast | match | 38.67 | 0 | 0 | 106 | 32 | 74 | 0.906 | 50.011 ms | 48.000 ms | 47.984 ms |
+| count | cont M3 skip-final top1 | match | 38.12 | 0 | 0 | 106 | 32 | 74 | 1.812 | 51.298 ms | 47.835 ms | 47.788 ms |
+| count | cont M3 broadcast | match | 38.22 | 0 | 0 | 106 | 32 | 74 | 1.812 | 51.124 ms | 47.757 ms | 47.711 ms |
+| explain | serial | match | 35.79 | - | - | - | - | - | - | - | - | - |
+| explain | native K4 | match | 33.70 | 0 | 0 | 0 | 0 | 0 | - | - | - | - |
+| explain | cont M2 skip-final top1 | match | 32.74 | 17 | 17 | 52 | 26 | 26 | 0.535 | 23.523 ms | 22.297 ms | 22.287 ms |
+| explain | cont M2 broadcast | match | 32.70 | 17 | 17 | 52 | 26 | 26 | 0.535 | 23.541 ms | 22.351 ms | 22.339 ms |
+| explain | cont M3 skip-final top1 | match | 32.06 | 16 | 16 | 54 | 29 | 25 | 1.069 | 24.447 ms | 22.405 ms | 22.372 ms |
+| explain | cont M3 broadcast | match | 32.12 | 16 | 16 | 54 | 29 | 25 | 1.069 | 24.324 ms | 22.336 ms | 22.304 ms |
+| code | serial | match | 35.66 | - | - | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.85 | 0 | 0 | 0 | 0 | 0 | - | - | - | - |
+| code | cont M2 skip-final top1 | match | 34.70 | 58 | 59 | 83 | 33 | 50 | 0.597 | 26.106 ms | 24.743 ms | 24.730 ms |
+| code | cont M2 broadcast | match | 34.56 | 58 | 59 | 83 | 33 | 50 | 0.597 | 26.170 ms | 24.847 ms | 24.835 ms |
+| code | cont M3 skip-final top1 | match | 33.67 | 58 | 58 | 83 | 37 | 46 | 1.195 | 27.484 ms | 25.189 ms | 25.157 ms |
+| code | cont M3 broadcast | match | 33.69 | 58 | 58 | 83 | 37 | 46 | 1.195 | 27.462 ms | 25.233 ms | 25.200 ms |
+
+Intrinsic stage A/B, `code`, non-target-first continuation M2, `-n 128`:
+
+| Row | Stage | Base avg | Broadcast avg | Delta |
+| --- | --- | ---: | ---: | ---: |
+| 0 | embed/eproj | 0.268 ms | 0.261 ms | -0.007 ms |
+| 0 | hproj/add | 0.290 ms | 0.259 ms | -0.031 ms |
+| 0 | decode layer | 0.906 ms | 0.914 ms | +0.008 ms |
+| 0 | output vocab top1 | 1.048 ms | 1.037 ms | -0.011 ms |
+| 1 | embed/eproj | 0.293 ms | 0.286 ms | -0.007 ms |
+| 1 | hproj/add | 0.284 ms | 0.269 ms | -0.015 ms |
+| 1 | decode layer | 0.911 ms | 0.924 ms | +0.013 ms |
+
+Decision:
+
+- Broadcast-add is correct and does reduce the intended micro-stage, especially
+  `hproj/add`, but the win is only about `0.02` to `0.03 ms` per continuation
+  row and disappears in end-to-end TPS.
+- Keep the flag as a measured micro-optimization, but do not treat it as a
+  promotable continuation path.
+- This candidate is not promising enough for HumanEval/GSM because it is
+  exact-output clean yet slower than current native K4 on the long matrix.
+
+Next step:
+
+- Stop pursuing small materialization removals in isolation. The remaining
+  high-cost continuation work is still the autoregressive MTP decode row
+  (`~0.9 ms`) and exact vocab top-id (`~1.0 ms` per emitted row).
+- The next real Track 2 attempt should be either:
+  - a fused continuation row kernel that collapses input projection,
+    decode-layer glue, and state write for MTP-only rows; or
+  - a speculative-tail cache overlay that stores committed MTP prefix plus
+    tail rows explicitly, so continuation can be started/stored only when its
+    tail state will be promotable instead of repeatedly producing discarded
+    queue payloads.
+
+### 2026-05-17 Continuation Embed HC1 Direct Fetch
+
+Context:
+
+- After the DeepSeek-V4 cache-layout/kernel-co-design pass, Track 1 is treated
+  as completed evidence: live-prefix/ring-slice copy reduced raw bytes by
+  roughly `10x` to `20x` but barely moved TPS/GPU spans. Copy slicing is no
+  longer the throughput track.
+- The next inspected row-path inefficiency was MTP token embedding. Native MTP
+  continuation calls the HC embedding helpers with `n_hc=1`, but the old helper
+  still fetched the token embedding into `g_embed_rows_buffer` and then launched
+  a repeat-HC kernel. For HC1 this repeat is pure overhead.
+
+Implementation:
+
+- `ds4_gpu_embed_token_hc_tensor()` and `ds4_gpu_embed_tokens_hc_tensor()` now
+  write `n_hc=1` embedding rows directly into the output tensor.
+- Added diagnostic fallback `DS4_METAL_EMBED_HC1_REPEAT=1` to force the old
+  scratch-plus-repeat path for A/B attribution. Default is the direct path.
+- This is a general Metal embedding cleanup and affects native MTP draft rows,
+  including target-first continuation rows. It does not change CUDA.
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: same build and Metal harness checks in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Artifacts:
+
+- Long `-n 512` A/B matrix:
+  `/tmp/ds4-native-embedhc1-long512-20260517_101502`
+- Validate-mode top-id/stdout pass:
+  `/tmp/ds4-native-embedhc1-validate-20260517_102140`
+- Intrinsic continuation stage A/B:
+  `/tmp/ds4-native-embedhc1-stage-20260517_102235`
+
+Validation:
+
+- Long `-n 512` count/explain/code stdout matched serial for all tested modes.
+- Validate-mode `-n 96` count/explain/code for target-first `cont_m=2`
+  reported `mismatches=0`, `max_delta=0`, and stdout matched serial.
+
+Long `-n 512` matrix:
+
+| Prompt | Mode | stdout | t/s | avg accepted | used | stored | dropped | partial drops | preview misses | avg MTP GPU | avg target GPU | avg overlap | avg draft | avg verify |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | match | 35.89 | - | - | - | - | - | - | - | - | - | - | - |
+| count | native K4 direct | match | 39.99 | 3.419 | 0 | 0 | 0 | 0 | 0 | - | - | - | 6.752 ms | 49.952 ms |
+| count | native K4 repeat | match | 39.97 | 3.419 | 0 | 0 | 0 | 0 | 0 | - | - | - | 6.789 ms | 49.930 ms |
+| count | cont M2 direct | match | 39.24 | 3.419 | 0 | 0 | 106 | 32 | 74 | 49.170 ms | 47.137 ms | 47.116 ms | 6.676 ms | 51.758 ms |
+| count | cont M2 repeat | match | 39.10 | 3.419 | 0 | 0 | 106 | 32 | 74 | 49.358 ms | 47.311 ms | 47.287 ms | 6.715 ms | 51.939 ms |
+| count | cont M3 direct | match | 38.29 | 3.419 | 0 | 0 | 106 | 32 | 74 | 51.070 ms | 47.657 ms | 47.595 ms | 6.683 ms | 53.640 ms |
+| count | cont M3 repeat | match | 38.57 | 3.419 | 0 | 0 | 106 | 32 | 74 | 50.624 ms | 47.197 ms | 47.139 ms | 6.685 ms | 53.249 ms |
+| explain | serial | match | 35.98 | - | - | - | - | - | - | - | - | - | - | - |
+| explain | native K4 direct | match | 33.66 | 2.142 | 0 | 0 | 0 | 0 | 0 | - | - | - | 5.255 ms | 30.295 ms |
+| explain | native K4 repeat | match | 33.69 | 2.142 | 0 | 0 | 0 | 0 | 0 | - | - | - | 5.256 ms | 30.312 ms |
+| explain | cont M2 direct | match | 32.92 | 1.992 | 17 | 17 | 52 | 26 | 26 | 23.388 ms | 22.181 ms | 22.163 ms | 4.492 ms | 28.194 ms |
+| explain | cont M2 repeat | match | 33.00 | 1.992 | 17 | 17 | 52 | 26 | 26 | 23.340 ms | 22.127 ms | 22.111 ms | 4.502 ms | 28.130 ms |
+| explain | cont M3 direct | match | 32.28 | 1.962 | 16 | 16 | 54 | 29 | 25 | 24.219 ms | 22.203 ms | 22.165 ms | 4.524 ms | 28.313 ms |
+| explain | cont M3 repeat | match | 32.30 | 1.962 | 16 | 16 | 54 | 29 | 25 | 24.276 ms | 22.246 ms | 22.200 ms | 4.530 ms | 28.367 ms |
+| code | serial | match | 35.76 | - | - | - | - | - | - | - | - | - | - | - |
+| code | native K4 direct | match | 35.78 | 2.498 | 0 | 0 | 0 | 0 | 0 | - | - | - | 5.201 ms | 36.022 ms |
+| code | native K4 repeat | match | 35.77 | 2.498 | 0 | 0 | 0 | 0 | 0 | - | - | - | 5.220 ms | 36.006 ms |
+| code | cont M2 direct | match | 34.53 | 2.147 | 58 | 59 | 83 | 33 | 50 | 26.236 ms | 24.880 ms | 24.869 ms | 3.904 ms | 29.985 ms |
+| code | cont M2 repeat | match | 34.54 | 2.147 | 58 | 59 | 83 | 33 | 50 | 26.224 ms | 24.855 ms | 24.845 ms | 3.928 ms | 29.966 ms |
+| code | cont M3 direct | match | 33.74 | 2.169 | 58 | 58 | 83 | 37 | 46 | 27.439 ms | 25.160 ms | 25.130 ms | 3.936 ms | 32.057 ms |
+| code | cont M3 repeat | match | 33.70 | 2.169 | 58 | 58 | 83 | 37 | 46 | 27.457 ms | 25.173 ms | 25.142 ms | 3.948 ms | 32.073 ms |
+
+Intrinsic stage A/B, `code`, non-target-first continuation M2, `-n 128`:
+
+| Row | Stage | Direct avg | Repeat avg | Delta |
+| --- | --- | ---: | ---: | ---: |
+| raw copy | raw_copy | 0.204 ms | 0.198 ms | +0.006 ms |
+| 0 | embed/eproj | 0.258 ms | 0.269 ms | -0.011 ms |
+| 0 | hproj/add | 0.293 ms | 0.290 ms | +0.003 ms |
+| 0 | decode layer | 0.914 ms | 0.924 ms | -0.010 ms |
+| 0 | output HC/norm | 0.288 ms | 0.286 ms | +0.002 ms |
+| 0 | output vocab top1 | 1.039 ms | 1.045 ms | -0.006 ms |
+| 1 | embed/eproj | 0.291 ms | 0.288 ms | +0.003 ms |
+| 1 | hproj/add | 0.293 ms | 0.288 ms | +0.005 ms |
+| 1 | decode layer | 0.909 ms | 0.920 ms | -0.011 ms |
+
+Decision:
+
+- Keep direct HC1 embedding as a small cleanup because it is exact and removes a
+  provably redundant dispatch.
+- Do not treat it as a promotable throughput path. End-to-end movement is
+  noise-level: native K4 changed by at most `0.03` t/s across the matrix, and
+  target-first continuation still trails current native K4/serial in the
+  representative prompts where it matters.
+- No HumanEval/GSM slice was run for this candidate because the long matrix did
+  not produce a promising throughput candidate.
+
+Next step:
+
+- Stop spending time on isolated micro-materialization removals. The measured
+  continuation bottlenecks are still the autoregressive MTP decode row
+  (`~0.9 ms` intrinsic) and exact vocab top-id (`~1.0 ms` per emitted row),
+  plus target/verifier contention in the target-first schedule.
+- The remaining high-upside Track 2 work is a real fused/specialized native MTP
+  continuation row kernel or a true committed-prefix/speculative-tail cache
+  overlay that changes when continuation is produced and stored, not another
+  copy-only or scheduler-only variant.
+
+### 2026-05-17 MTP Output-HC Norm Fusion
+
+Implementation:
+
+- Added gated `DS4_MTP_NATIVE_MTP_OUTPUT_FUSED_NORM=1`.
+- Added `ds4_gpu_output_hc_norm_fused_tensor()` and
+  `kernel_dsv4_output_hc_norm`.
+- The fused kernel targets the MTP output-head HC stage only. It combines:
+  output HC weight activation, HC weighted sum, and weighted RMS norm into one
+  Metal dispatch for the small HC bundle, then the existing exact vocab top1
+  scan runs unchanged.
+- Added `mtp_output_fused_norm` to the native timing line.
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: same build and Metal harness checks in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Artifacts:
+
+- Validate-mode top-id/stdout pass:
+  `/tmp/ds4-native-outputfused-validate-20260517_102943`
+- Intrinsic continuation stage A/B:
+  `/tmp/ds4-native-outputfused-stage-20260517_103041`
+- Long `-n 512` base-vs-fused matrix:
+  `/tmp/ds4-native-outputfused-long512-20260517_103130`
+
+Validation:
+
+- Validate-mode `-n 96` count/explain/code for target-first `cont_m=2`
+  reported `mismatches=0`, `max_delta=0`, and stdout matched serial.
+- Long `-n 512` count/explain/code stdout matched serial for all tested modes.
+
+Intrinsic stage A/B, `code`, non-target-first continuation M2, `-n 128`:
+
+| Row | Stage | Base avg | Fused avg | Delta |
+| --- | --- | ---: | ---: | ---: |
+| raw copy | raw_copy | 0.201 ms | 0.200 ms | -0.001 ms |
+| 0 | embed/eproj | 0.271 ms | 0.268 ms | -0.003 ms |
+| 0 | hproj/add | 0.296 ms | 0.291 ms | -0.005 ms |
+| 0 | decode layer | 0.923 ms | 0.926 ms | +0.003 ms |
+| 0 | output HC/norm | 0.293 ms | 0.305 ms | +0.012 ms |
+| 0 | output vocab top1 | 1.045 ms | 1.035 ms | -0.010 ms |
+| 1 | embed/eproj | 0.287 ms | 0.294 ms | +0.007 ms |
+| 1 | hproj/add | 0.295 ms | 0.294 ms | -0.001 ms |
+| 1 | decode layer | 0.927 ms | 0.922 ms | -0.005 ms |
+
+Long `-n 512` matrix:
+
+| Prompt | Mode | stdout | t/s | avg accepted | used | stored | dropped | partial drops | preview misses | avg MTP GPU | avg target GPU | avg overlap | avg draft | avg verify |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | match | 35.59 | - | - | - | - | - | - | - | - | - | - | - |
+| count | native K4 | match | 39.61 | 3.419 | 0 | 0 | 0 | 0 | 0 | - | - | - | 6.805 ms | 50.482 ms |
+| count | cont M2 base | match | 38.73 | 3.419 | 0 | 0 | 106 | 32 | 74 | 49.907 ms | 47.854 ms | 47.840 ms | 6.719 ms | 52.484 ms |
+| count | cont M2 output-fused | match | 38.72 | 3.419 | 0 | 0 | 106 | 32 | 74 | 49.950 ms | 47.883 ms | 47.871 ms | 6.753 ms | 52.501 ms |
+| count | cont M3 base | match | 38.12 | 3.419 | 0 | 0 | 106 | 32 | 74 | 51.291 ms | 47.850 ms | 47.804 ms | 6.711 ms | 53.897 ms |
+| count | cont M3 output-fused | match | 38.04 | 3.419 | 0 | 0 | 106 | 32 | 74 | 51.479 ms | 48.020 ms | 47.972 ms | 6.747 ms | 54.037 ms |
+| explain | serial | match | 35.64 | - | - | - | - | - | - | - | - | - | - | - |
+| explain | native K4 | match | 33.64 | 2.142 | 0 | 0 | 0 | 0 | 0 | - | - | - | 5.241 ms | 30.319 ms |
+| explain | cont M2 base | match | 32.62 | 1.992 | 17 | 17 | 52 | 26 | 26 | 23.667 ms | 22.448 ms | 22.436 ms | 4.503 ms | 28.518 ms |
+| explain | cont M2 output-fused | match | 32.58 | 1.992 | 17 | 17 | 52 | 26 | 26 | 23.693 ms | 22.470 ms | 22.458 ms | 4.525 ms | 28.504 ms |
+| explain | cont M3 base | match | 32.05 | 1.962 | 16 | 16 | 54 | 29 | 25 | 24.465 ms | 22.422 ms | 22.388 ms | 4.560 ms | 28.612 ms |
+| explain | cont M3 output-fused | match | 32.06 | 1.962 | 16 | 16 | 54 | 29 | 25 | 24.424 ms | 22.376 ms | 22.342 ms | 4.572 ms | 28.581 ms |
+| code | serial | match | 35.40 | - | - | - | - | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.64 | 2.498 | 0 | 0 | 0 | 0 | 0 | - | - | - | 5.192 ms | 36.208 ms |
+| code | cont M2 base | match | 34.51 | 2.147 | 58 | 59 | 83 | 33 | 50 | 26.290 ms | 24.940 ms | 24.926 ms | 3.894 ms | 30.018 ms |
+| code | cont M2 output-fused | match | 34.43 | 2.147 | 58 | 59 | 83 | 33 | 50 | 26.348 ms | 24.988 ms | 24.976 ms | 3.913 ms | 30.066 ms |
+| code | cont M3 base | match | 33.70 | 2.169 | 58 | 58 | 83 | 37 | 46 | 27.468 ms | 25.197 ms | 25.164 ms | 3.934 ms | 32.078 ms |
+| code | cont M3 output-fused | match | 33.68 | 2.169 | 58 | 58 | 83 | 37 | 46 | 27.494 ms | 25.213 ms | 25.183 ms | 3.938 ms | 32.097 ms |
+
+Decision:
+
+- Drop the fused output-HC norm candidate as a throughput path. It is exact, but
+  not faster: stage timing shows the fused HC/norm dispatch slightly slower
+  (`0.293 -> 0.305 ms`) while vocab top1 improves only enough to cancel that
+  locally, and the long matrix is flat-to-negative.
+- Keep the code gated as measured evidence for now. It is not promotable and
+  should not be enabled by default.
+- No HumanEval/GSM slice was run because the long matrix did not produce a
+  promising candidate.
+
+Next step:
+
+- MTP continuation still spends too much in the same places:
+  autoregressive decode row and exact vocab top1. The failed HC/norm fusion says
+  the useful kernel rewrite has to attack the vocab top1 or decode row itself,
+  not just surrounding HC materialization.
+  Candidate directions:
+  fused/specialized MTP row decode stages, a faster exact top1 output projection
+  for one-row draft shapes, or a real speculative-tail cache overlay that avoids
+  generating continuation rows likely to be discarded.
+
+### 2026-05-17 Exact Top1 NR4 Projection Probe
+
+Context:
+
+- This continues the DeepSeek-V4/MTPLX-inspired pivot: throughput has to come
+  from cache-layout/kernel co-design, not more scheduler-only or copy-only
+  work.
+- Track 1 live-prefix/ring-slice copy is closed as evidence. It reduced
+  continuation raw-cache copy bytes by roughly one order of magnitude or more,
+  but barely moved TPS or GPU spans. Full raw-cache clone was wasteful, but not
+  the dominant bottleneck. Further no-clone work should be a real committed
+  prefix plus speculative-tail/cache-overlay contract, not unsafe direct writes
+  into committed `g->mtp_raw_cache`.
+
+Implementation:
+
+- Added gated `DS4_METAL_Q8_TOP1_NR4=1`.
+- Added exact Q8 output top1 kernels
+  `kernel_mul_mv_q8_0_f32_rows{1..4}_top1_final_r4`.
+- The math is unchanged. The variant changes the top1 projection geometry from
+  two vocab rows per threadgroup to four rows per threadgroup, halving scratch
+  candidates for the second-pass reducer.
+- Wired both `ds4_gpu_matmul_q8_0_top1_only_tensor()` and
+  `ds4_gpu_matmul_q8_0_top1_final_tensor()` to select the NR4 kernels under the
+  flag.
+- Added `mtp_q8_top1_nr4` to the native timing line.
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: same build and Metal harness checks in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Artifacts:
+
+- Validate-mode top-id/stdout pass:
+  `/tmp/ds4-native-top1nr4-validate-20260517_104500`
+- Target-first continuation stage A/B:
+  `/tmp/ds4-native-top1nr4-stage-20260517_104615`
+- Intrinsic non-target-first continuation stage A/B:
+  `/tmp/ds4-native-top1nr4-stage-intrinsic-20260517_105236`
+- Long `-n 512` matrix:
+  `/tmp/ds4-native-top1nr4-long512-20260517_104737`
+
+Validation:
+
+- Validate-mode `-n 96` count/explain/code for target-first `cont_m=2`
+  reported `mismatches=0`, `max_delta=0`, stdout matched serial, and
+  `mtp_q8_top1_nr4=1` was present on all native timing lines.
+- Long `-n 512` count/explain/code stdout matched serial for all tested modes.
+
+Intrinsic stage A/B, `code`, non-target-first continuation M2, `-n 128`:
+
+| Row | Stage | Base avg | NR4 avg | Delta |
+| --- | --- | ---: | ---: | ---: |
+| raw copy | raw_copy | 0.198 ms | 0.198 ms | +0.001 ms |
+| 0 | embed/eproj | 0.267 ms | 0.260 ms | -0.007 ms |
+| 0 | hproj/add | 0.299 ms | 0.293 ms | -0.005 ms |
+| 0 | decode layer | 0.915 ms | 0.924 ms | +0.010 ms |
+| 0 | output HC/norm | 0.296 ms | 0.286 ms | -0.010 ms |
+| 0 | output vocab top1 | 1.042 ms | 1.030 ms | -0.012 ms |
+| 1 | embed/eproj | 0.290 ms | 0.285 ms | -0.005 ms |
+| 1 | hproj/add | 0.299 ms | 0.295 ms | -0.004 ms |
+| 1 | decode layer | 0.917 ms | 0.923 ms | +0.006 ms |
+
+Long `-n 512` matrix:
+
+| Prompt | Mode | stdout | t/s | avg accepted | used | stored | dropped | partial drops | preview misses | avg MTP GPU | avg target GPU | avg overlap |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | match | 35.52 | - | - | - | - | - | - | - | - | - |
+| count | native K4 | match | 39.65 | 3.419 | 0 | 0 | 0 | 0 | 0 | - | - | - |
+| count | cont M2 | match | 38.75 | 3.419 | 0 | 0 | 106 | 32 | 74 | 49.900 ms | 47.847 ms | 47.834 ms |
+| count | cont M2 NR4 | match | 38.69 | 3.419 | 0 | 0 | 106 | 32 | 74 | 49.992 ms | 47.939 ms | 47.924 ms |
+| count | cont M3 | match | 38.01 | 3.419 | 0 | 0 | 106 | 32 | 74 | 51.497 ms | 48.050 ms | 48.001 ms |
+| count | cont M3 NR4 | match | 38.17 | 3.419 | 0 | 0 | 106 | 32 | 74 | 51.240 ms | 47.821 ms | 47.771 ms |
+| explain | serial | match | 35.78 | - | - | - | - | - | - | - | - | - |
+| explain | native K4 | match | 33.68 | 2.142 | 0 | 0 | 0 | 0 | 0 | - | - | - |
+| explain | cont M2 | match | 32.64 | 1.992 | 17 | 17 | 52 | 26 | 26 | 23.610 ms | 22.390 ms | 22.378 ms |
+| explain | cont M2 NR4 | match | 32.61 | 1.992 | 17 | 17 | 52 | 26 | 26 | 23.681 ms | 22.472 ms | 22.459 ms |
+| explain | cont M3 | match | 32.08 | 1.962 | 16 | 16 | 54 | 29 | 25 | 24.429 ms | 22.394 ms | 22.362 ms |
+| explain | cont M3 NR4 | match | 32.08 | 1.962 | 16 | 16 | 54 | 29 | 25 | 24.413 ms | 22.389 ms | 22.357 ms |
+| code | serial | match | 35.60 | - | - | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.75 | 2.498 | 0 | 0 | 0 | 0 | 0 | - | - | - |
+| code | cont M2 | match | 34.53 | 2.147 | 58 | 59 | 83 | 33 | 50 | 26.229 ms | 24.873 ms | 24.863 ms |
+| code | cont M2 NR4 | match | 34.54 | 2.147 | 58 | 59 | 83 | 33 | 50 | 26.266 ms | 24.916 ms | 24.906 ms |
+| code | cont M3 | match | 33.68 | 2.169 | 58 | 58 | 83 | 37 | 46 | 27.538 ms | 25.262 ms | 25.232 ms |
+| code | cont M3 NR4 | match | 33.70 | 2.169 | 58 | 58 | 83 | 37 | 46 | 27.496 ms | 25.230 ms | 25.198 ms |
+
+Decision:
+
+- Drop NR4 as a promotable Track 2 throughput candidate. It is exact, but its
+  intrinsic top1 gain is only about `0.012 ms` per emitted continuation row and
+  the long matrix is flat-to-negative versus the current native K4 baseline.
+- No HumanEval/GSM slice was run because this candidate did not beat the long
+  count/explain/code matrix.
+- Keep the code gated for now as measured evidence and as a possible scaffold
+  for a more serious output-head rewrite, but do not enable it by default.
+
+Next step:
+
+- Stop small geometry tweaks around the output head. They do not change the
+  continuation economics enough.
+- The next useful implementation should be one of:
+  a fused/specialized native MTP row kernel that attacks the autoregressive
+  decode row itself, or a real speculative-tail cache overlay that avoids
+  producing continuation rows that are later dropped due partial accept or
+  preview mismatch.
+
+### 2026-05-17 Lazy Continuation Tail Materialization
+
+Context:
+
+- This is the first speculative-tail/cache-overlay version after closing Track
+  1 copy slicing. It does not write directly into committed `g->mtp_raw_cache`.
+  The target-first continuation still drafts into the async MTP transaction, but
+  it no longer materializes the final non-emitting MTP state row up front when
+  `DS4_MTP_NATIVE_CONT_SKIP_FINAL_TOP=1`.
+- If the queued continuation is later accepted deeply enough to need that
+  missing state row, the runtime materializes the tail row just before
+  committing the async runahead state. If the queued work is dropped, the final
+  state row was never produced.
+
+Implementation:
+
+- Added gated `DS4_MTP_NATIVE_CONT_LAZY_TAIL=1`.
+- Added `mtp_runahead_native_state_depth` to the session ledger so queued native
+  continuation payloads track how many MTP state rows were actually produced.
+- Extended the target-first continuation probe to report
+  `produced_state_rows`.
+- Added `ds4_mtp_native_materialize_async_runahead_tail()` and made
+  `ds4_mtp_native_commit_async_runahead()` materialize missing accepted tail
+  rows only on commit.
+- Added timing fields:
+  - `target_first_cont_lazy_tail`
+  - `sched2_cont_state_rows`
+  - `native_cont_tail_materialized`
+  - `native_cont_tail_materialize`
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: same build and Metal harness checks in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Artifacts:
+
+- Long `-n 512` matrix:
+  `/tmp/ds4-native-lazytail-long512-20260517_110201`
+- Parsed long-matrix summary:
+  `/tmp/ds4-native-lazytail-long512-20260517_110201/summary.tsv`
+- Validate-mode top-id/stdout pass:
+  `/tmp/ds4-native-lazytail-validate-20260517_110944`
+
+Validation:
+
+- Long `-n 512` count/explain/code stdout matched serial for all tested modes.
+- Validate-mode `-n 96` count/explain/code for target-first `cont_m=2` lazy
+  tail reported `mismatches=0`, `max_delta=0`, and stdout matched serial.
+
+Long `-n 512` matrix:
+
+| Prompt | Mode | stdout | t/s | avg accepted | used | stored | dropped | partial drops | preview misses | avg state rows/cycle | avg emitted cont tokens/cycle | avg MTP GPU | avg target GPU | avg overlap | tail materialized |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | match | 35.55 | - | - | - | - | - | - | - | - | - | - | - | - |
+| count | native K4 | match | 39.65 | 3.419 | 0 | 0 | 0 | 0 | 0 | - | - | - | - | - | 0 |
+| count | cont M2 | match | 38.76 | 3.419 | 0 | 0 | 106 | 32 | 74 | 1.812 | 0.906 | 55.054 ms | 52.788 ms | 52.772 ms | 0 |
+| count | cont M2 lazy | match | 38.99 | 3.419 | 0 | 0 | 106 | 32 | 74 | 0.906 | 0.906 | 54.510 ms | 52.936 ms | 52.935 ms | 0 |
+| count | cont M3 | match | 38.20 | 3.419 | 0 | 0 | 106 | 32 | 74 | 2.718 | 1.812 | 56.495 ms | 52.703 ms | 52.647 ms | 0 |
+| count | cont M3 lazy | match | 38.40 | 3.419 | 0 | 0 | 106 | 32 | 74 | 1.812 | 1.812 | 56.018 ms | 52.906 ms | 52.888 ms | 0 |
+| explain | serial | match | 35.71 | - | - | - | - | - | - | - | - | - | - | - | - |
+| explain | native K4 | match | 33.77 | 2.142 | 0 | 0 | 0 | 0 | 0 | - | - | - | - | - | 0 |
+| explain | cont M2 | match | 32.77 | 1.992 | 17 | 17 | 52 | 26 | 26 | 1.070 | 0.535 | 44.009 ms | 41.742 ms | 41.716 ms | 0 |
+| explain | cont M2 lazy | match | 32.90 | 1.992 | 17 | 17 | 52 | 26 | 26 | 0.535 | 0.535 | 43.346 ms | 41.769 ms | 41.767 ms | 3 cycles, 1.086 ms avg |
+| explain | cont M3 | match | 32.24 | 1.962 | 16 | 16 | 54 | 29 | 25 | 1.603 | 1.069 | 45.454 ms | 41.650 ms | 41.589 ms | 0 |
+| explain | cont M3 lazy | match | 32.34 | 1.962 | 16 | 16 | 54 | 29 | 25 | 1.069 | 1.069 | 44.928 ms | 41.816 ms | 41.792 ms | 2 cycles, 1.089 ms avg |
+| code | serial | match | 35.50 | - | - | - | - | - | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.76 | 2.498 | 0 | 0 | 0 | 0 | 0 | - | - | - | - | - | 0 |
+| code | cont M2 | match | 34.60 | 2.147 | 58 | 59 | 83 | 33 | 50 | 1.193 | 0.597 | 43.899 ms | 41.626 ms | 41.607 ms | 0 |
+| code | cont M2 lazy | match | 34.64 | 2.124 | 59 | 59 | 83 | 34 | 49 | 0.589 | 0.589 | 43.349 ms | 41.779 ms | 41.775 ms | 15 cycles, 1.074 ms avg |
+| code | cont M3 | match | 33.67 | 2.169 | 58 | 58 | 83 | 37 | 46 | 1.792 | 1.195 | 46.118 ms | 42.307 ms | 42.256 ms | 0 |
+| code | cont M3 lazy | match | 33.85 | 2.169 | 58 | 58 | 83 | 37 | 46 | 1.195 | 1.195 | 45.426 ms | 42.314 ms | 42.288 ms | 4 cycles, 1.051 ms avg |
+
+Interpretation:
+
+- Lazy-tail materialization is correctness-clean and moves the right metrics:
+  materialized continuation state rows drop by exactly one row per started
+  continuation when the queue is not consumed deeply enough.
+- The win is real but small. `cont_m=2` lazy improves `count` from `38.76` to
+  `38.99` t/s, `explain` from `32.77` to `32.90` t/s, and `code` from `34.60`
+  to `34.64` t/s. `cont_m=3` lazy similarly improves every prompt but remains
+  slower than `cont_m=2`.
+- Tail materialization is rare in this matrix because most queued continuations
+  are either dropped or consumed shallowly. When it happens, it costs about
+  `1.05` to `1.09 ms`, which is acceptable, but the saved upfront state row is
+  not large enough to overcome the remaining continuation overhead.
+- This confirms the speculative-tail direction is safer and cleaner than
+  copy-only no-clone, but the current continuation path still spends too much
+  in target-first contention, autoregressive decode-row work, and exact top-id
+  projection.
+
+Decision:
+
+- Keep `DS4_MTP_NATIVE_CONT_LAZY_TAIL=1` as a correct gated continuation
+  improvement and as the preferred cache-contract shape for future continuation
+  experiments.
+- Do not promote target-first continuation on this result. The best lazy-tail
+  continuation row is still below current native K4 on count/explain/code, and
+  below serial on explain/code.
+- No HumanEval/GSM slice was run because the long matrix did not produce a
+  candidate that beats the current native K4 baseline.
+
+Next step:
+
+- The remaining Track 2 work has to attack the decode row or continuation
+  scheduling policy itself. The most plausible next candidates are a genuinely
+  fused/specialized native MTP row kernel, or a smarter speculation gate that
+  starts/stores continuation only when the queued tail has a high chance of
+  being used. More copy slicing or output-head geometry tweaks should stay out
+  of the critical path unless they are part of that larger row/kernel rewrite.
+
+### 2026-05-17 Adaptive Continuation Gate
+
+Context:
+
+- Lazy tail made each started continuation cheaper, but blind target-first
+  continuation still starts work on many cycles where the tail is later dropped
+  for partial accept or preview mismatch.
+- This candidate does not claim to be the final fused row kernel. It is a
+  continuation-cache policy guard: only start speculative continuation while the
+  recent tail history says the async transaction is likely to be stored or used.
+
+Implementation:
+
+- Added gated `DS4_MTP_NATIVE_CONT_ADAPTIVE_GATE=1`.
+- Added optional tuning:
+  - `DS4_MTP_NATIVE_CONT_GATE_BASE_BACKOFF`, default `2`
+  - `DS4_MTP_NATIVE_CONT_GATE_MAX_BACKOFF`, default `16`
+- The gate affects only the start of new target-first continuation work. It
+  never blocks consuming an already queued native continuation.
+- On partial/preview-miss/unfinished/no-payload continuation drops, the gate
+  increments a bad streak and sets an exponential backoff. On stored or useful
+  consumed continuation, it clears the backoff.
+- Added timing fields:
+  - `target_first_cont_gate`
+  - `target_first_cont_gate_allow`
+  - `target_first_cont_gate_skip`
+  - `target_first_cont_gate_backoff`
+  - `target_first_cont_gate_bad`
+
+Local/Studio checks:
+
+- Local: `make ds4_test ds4`, `./ds4_test --metal-kernels`,
+  `./ds4_test --metal-sched2`, `./ds4_test --metal-block-verifier`,
+  `./ds4_test --metal-mtp-cache-contract`, `git diff --check`.
+- Studio: `make ds4_test ds4`, `make ds4-server`, the same Metal harnesses,
+  and `git diff --check` in
+  `/Users/studio/git/.worktrees/antirez/ds4/mtp-native-cache-contract`.
+
+Artifacts:
+
+- Validate-mode top-id/stdout pass:
+  `/tmp/ds4-native-contgate-validate-20260517_112527`
+- Default gate long matrix:
+  `/tmp/ds4-native-contgate-long512-20260517_112527`
+- Backoff sweep:
+  `/tmp/ds4-native-contgate-sweep-long512-20260517_113048`
+- HumanEval first-50:
+  `/tmp/ds4-contgate-quality50-20260517_113422`
+- GSM8K first-50:
+  `/tmp/ds4-contgate-gsm8k50-20260517_114509`
+
+Validation:
+
+- Validate-mode `-n 96` count/explain/code for gated `cont_m=2` and `cont_m=3`
+  matched serial stdout with `mismatches=0` and `max_delta=0`.
+- Long `-n 512` count/explain/code stdout matched serial for all tested gated
+  and ungated modes.
+
+Default adaptive gate, long `-n 512`:
+
+| Prompt | Mode | stdout | t/s | used | stored | dropped | gate skips | starts | avg MTP GPU | avg target GPU |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | match | 35.52 | - | - | - | - | - | - | - |
+| count | native K4 | match | 39.62 | 0 | 0 | 0 | 0 | 0 | - | - |
+| count | cont M2 lazy | match | 38.92 | 0 | 0 | 106 | 0 | 106 | 54.595 ms | 53.015 ms |
+| count | cont M2 gated | match | 39.52 | 0 | 0 | 9 | 106 | 9 | 54.482 ms | 52.874 ms |
+| count | cont M3 lazy | match | 38.32 | 0 | 0 | 106 | 0 | 106 | 56.092 ms | 52.970 ms |
+| count | cont M3 gated | match | 39.54 | 0 | 0 | 9 | 106 | 9 | 56.023 ms | 52.871 ms |
+| explain | serial | match | 35.65 | - | - | - | - | - | - | - |
+| explain | native K4 | match | 33.67 | 0 | 0 | 0 | 0 | 0 | - | - |
+| explain | cont M2 lazy | match | 32.76 | 17 | 17 | 52 | 0 | 69 | 43.532 ms | 41.954 ms |
+| explain | cont M2 gated | match | 32.91 | 1 | 1 | 11 | 99 | 12 | 44.604 ms | 42.992 ms |
+| explain | cont M3 lazy | match | 32.23 | 16 | 16 | 54 | 0 | 70 | 45.096 ms | 41.963 ms |
+| explain | cont M3 gated | match | 32.80 | 1 | 1 | 11 | 99 | 12 | 46.145 ms | 42.993 ms |
+| code | serial | match | 35.44 | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.70 | 0 | 0 | 0 | 0 | 0 | - | - |
+| code | cont M2 lazy | match | 34.63 | 59 | 59 | 83 | 0 | 142 | 43.307 ms | 41.738 ms |
+| code | cont M2 gated | match | 35.25 | 26 | 27 | 25 | 122 | 52 | 43.476 ms | 41.895 ms |
+| code | cont M3 lazy | match | 33.90 | 58 | 58 | 83 | 0 | 141 | 45.309 ms | 42.194 ms |
+| code | cont M3 gated | match | 34.67 | 11 | 11 | 21 | 156 | 32 | 47.971 ms | 44.861 ms |
+
+Backoff sweep, `cont_m=2`, long `-n 512`:
+
+| Prompt | Gate backoff | stdout | t/s | used | stored | dropped | gate skips | starts |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | base 1 / max 4 | match | 39.45 | 0 | 0 | 24 | 91 | 24 |
+| count | base 1 / max 8 | match | 39.49 | 0 | 0 | 15 | 101 | 15 |
+| count | base 4 / max 16 | match | 39.55 | 0 | 0 | 8 | 108 | 8 |
+| explain | base 1 / max 4 | match | 33.09 | 10 | 10 | 23 | 61 | 33 |
+| explain | base 1 / max 8 | match | 33.12 | 8 | 8 | 18 | 77 | 26 |
+| explain | base 4 / max 16 | match | 33.11 | 5 | 5 | 11 | 93 | 16 |
+| code | base 1 / max 4 | match | 35.09 | 31 | 31 | 46 | 95 | 77 |
+| code | base 1 / max 8 | match | 35.05 | 26 | 26 | 40 | 114 | 66 |
+| code | base 4 / max 16 | match | 35.84 | 14 | 14 | 21 | 155 | 35 |
+
+Representative HumanEval first-50:
+
+| Mode | base pass@1 | plus pass@1 | failed base | failed plus | tokens | elapsed | agg t/s | mean t/s | median t/s |
+| --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| serial | 0.980 | 0.920 | HumanEval/32 | HumanEval/22, HumanEval/32, HumanEval/39, HumanEval/49 | 5975 | 205.59 s | 29.06 | 27.37 | 28.07 |
+| native K4 | 0.980 | 0.920 | HumanEval/32 | HumanEval/22, HumanEval/32, HumanEval/39, HumanEval/49 | 5975 | 198.92 s | 30.04 | 28.38 | 29.34 |
+| cont M2 gate b4/m16 | 0.980 | 0.920 | HumanEval/32 | HumanEval/22, HumanEval/32, HumanEval/39, HumanEval/49 | 5975 | 200.60 s | 29.79 | 28.19 | 29.14 |
+
+Representative GSM8K first-50:
+
+| Mode | accuracy | correct | failed | tokens | elapsed | agg t/s | mean t/s | median t/s |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| serial | 1.000 | 50/50 | none | 5536 | 184.58 s | 29.99 | 29.41 | 29.64 |
+| native K4 | 1.000 | 50/50 | none | 5536 | 185.42 s | 29.86 | 29.44 | 29.64 |
+| cont M2 gate b4/m16 | 1.000 | 50/50 | none | 5536 | 186.69 s | 29.65 | 29.21 | 29.35 |
+
+Interpretation:
+
+- The adaptive gate fixes the biggest blind-continuation waste. On count, it
+  reduces started continuation from `106` cycles to `8-24` cycles depending on
+  backoff, recovering almost all of the ungated TPS loss. On code, the stricter
+  `base=4/max=16` setting reaches `35.84` t/s, beating both same-run serial
+  (`35.44`) and native K4 (`35.70`) on that one long prompt.
+- The representative slices do not confirm a promotable win. HumanEval first-50
+  is quality-identical, but gated continuation is slower than native K4
+  (`29.79` vs `30.04` aggregate t/s). GSM8K first-50 is also quality-identical,
+  but gated continuation trails both serial and native K4.
+- The gate is therefore useful as a guardrail for continuation experiments and
+  as evidence that continuation should be conditional, not blind. It is not by
+  itself the throughput architecture.
+
+Decision:
+
+- Keep `DS4_MTP_NATIVE_CONT_ADAPTIVE_GATE=1` gated and documented.
+- Do not promote target-first continuation based on adaptive gating. It improves
+  continuation versus the blind scheduler, but the current native K4 baseline
+  remains better on representative HumanEval/GSM and on two of the three long
+  CLI prompts.
+- The next Track 2 implementation should return to the actual row economics:
+  a fused/specialized MTP continuation row path or a dual-source speculative
+  tail cache that avoids copying/materializing committed prefix while preserving
+  exact rollback.
+
+### 2026-05-17 Fused Continuation Input Prototype
+
+Goal:
+
+- Start the actual fused/specialized continuation track, rather than another
+  scheduler-only or cache-policy-only variant.
+- First target the smallest safe row-level fusion in
+  `metal_graph_encode_mtp_draft_from_input_hc()`: replace the continuation
+  `embed -> RMSNorm(enorm)` staging pair with one Metal kernel that writes the
+  normalized embedding directly into `g->mtp_enorm`.
+
+Implementation:
+
+- Added `DS4_MTP_NATIVE_CONT_FUSED_INPUT=1`.
+- Added `kernel_dsv4_embed_token_norm_f16_f32` and
+  `ds4_gpu_embed_token_norm_tensor()`.
+- The fused input path supports both the first continuation token supplied as a
+  CPU token id and later continuation rows supplied from the GPU top-id tensor.
+- The path is used only by target-first continuation and lazy tail
+  materialization when explicitly enabled.
+- Added `target_first_cont_fused_input` to the native timing line.
+- Added `tools/mtp_continuation_matrix.sh` so continuation matrices are
+  reproducible instead of being one-off shell snippets.
+
+Checks:
+
+- Local:
+  - `git diff --check`
+  - `make ds4_test ds4`
+  - `make ds4-server`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+- Studio:
+  - `make ds4_test ds4 ds4-server`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+  - `git diff --check`
+
+Artifacts:
+
+- Validate-mode native verifier pass:
+  `/tmp/ds4-native-fusedinput-validate-20260517_121030`
+- Long production matrix:
+  `/tmp/ds4-native-fusedinput-long512-20260517_121254`
+- Continuation stage profile:
+  `/tmp/ds4-native-fusedinput-stage2-20260517_121838`
+
+Correctness:
+
+- Validate-mode `-n 96` count/explain/code matched serial stdout with
+  `mismatches=0` for native K4 and fused-input modes.
+- Validation mode does not exercise the target-first async continuation queue
+  (`cont_started=0`), so continuation correctness was judged from production
+  stdout on the long matrix.
+- Production `-n 512` count/explain/code matched serial stdout for all tested
+  native K4, continuation baseline, and fused-input continuation modes.
+
+Long `-n 512` production matrix:
+
+| Prompt | Mode | stdout | t/s | cycles | avg accepted | cont starts | cont stored | cont used | cont dropped | avg MTP GPU |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | oracle | 34.37 | - | - | - | - | - | - | - |
+| count | native K4 | match | 38.28 | 116 | 3.440 | 0 | 0 | 0 | 0 | - |
+| count | cont M2 base | match | 37.63 | 116 | 3.440 | 105 | 0 | 0 | 105 | 52.699 ms |
+| count | cont M2 fused input | match | 37.81 | 116 | 3.440 | 105 | 0 | 0 | 105 | 52.435 ms |
+| count | cont M3 base | match | 37.15 | 116 | 3.440 | 105 | 0 | 0 | 105 | 53.911 ms |
+| count | cont M3 fused input | match | 37.10 | 116 | 3.440 | 105 | 0 | 0 | 105 | 53.962 ms |
+| explain | serial | oracle | 34.41 | - | - | - | - | - | - | - |
+| explain | native K4 | match | 32.96 | 136 | 2.199 | 0 | 0 | 0 | 0 | - |
+| explain | cont M2 base | match | 30.47 | 150 | 1.993 | 85 | 23 | 23 | 62 | 25.193 ms |
+| explain | cont M2 fused input | match | 32.06 | 150 | 1.993 | 85 | 23 | 23 | 62 | 25.288 ms |
+| explain | cont M3 base | match | 31.34 | 150 | 1.993 | 85 | 23 | 23 | 62 | 26.348 ms |
+| explain | cont M3 fused input | match | 31.64 | 150 | 1.993 | 85 | 23 | 23 | 62 | 26.015 ms |
+| code | serial | oracle | 34.53 | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.76 | 126 | 2.635 | 0 | 0 | 0 | 0 | - |
+| code | cont M2 base | match | 35.08 | 147 | 2.265 | 89 | 43 | 43 | 46 | 27.137 ms |
+| code | cont M2 fused input | match | 34.87 | 147 | 2.265 | 89 | 43 | 43 | 46 | 27.269 ms |
+| code | cont M3 base | match | 34.09 | 149 | 2.235 | 86 | 46 | 46 | 40 | 27.017 ms |
+| code | cont M3 fused input | match | 34.21 | 149 | 2.235 | 86 | 46 | 46 | 40 | 26.976 ms |
+
+Stage profile:
+
+- Row 0 `embed_eproj` is polluted by target-first scheduling wait in the
+  stage-profile harness, so it is not a clean row-cost measurement.
+- Row 1 in `cont_m=3` is a cleaner look at continuation row input work:
+
+| Prompt | Mode | row | embed_eproj | hproj_add | decode_layer | output_hc_norm | output_vocab_top1 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| explain | cont M3 base | 1 | 0.285 ms | 0.284 ms | 0.921 ms | 0.284 ms | 1.035 ms |
+| explain | cont M3 fused input | 1 | 0.275 ms | 0.289 ms | 0.926 ms | 0.278 ms | 1.029 ms |
+| code | cont M3 base | 1 | 0.292 ms | 0.291 ms | 0.927 ms | 0.290 ms | 1.056 ms |
+| code | cont M3 fused input | 1 | 0.283 ms | 0.296 ms | 0.928 ms | 0.291 ms | 1.044 ms |
+
+Interpretation:
+
+- The fused input kernel is correct, but it attacks too small a slice. It saves
+  only about `0.009-0.010 ms` on the clean row-1 `embed_eproj` measurement.
+- Continuation remains dominated by the MTP decode row and exact output top-id
+  projection. In the clean row-1 samples, `decode_layer` is about `0.92 ms` and
+  `output_vocab_top1` is about `1.03-1.06 ms`; together they swamp the input
+  fusion.
+- The long matrix does not justify HumanEval/GSM follow-up. Fused input does
+  not beat current native K4 on any of the three long prompts.
+
+Decision:
+
+- Keep `DS4_MTP_NATIVE_CONT_FUSED_INPUT=1` as a correct gated probe and stage
+  profile tool, not as a promoted path.
+- The fused/specialized continuation goal remains open. The next kernel-level
+  target should be either:
+  - a continuation output-top1 rewrite that reduces the exact full-vocab
+    argmax cost, or
+  - a continuation decode-row rewrite that removes or fuses work inside the
+    one-layer MTP decode, especially KV/raw-store and output-side transitions.
+
+### 2026-05-17 State-Only Continuation Probe
+
+Goal:
+
+- Test whether the continuation output/top-id work is worth skipping when we
+  only need speculative MTP state for the known target preview token.
+- This is still part of the fused/specialized continuation track: it changes
+  the continuation contract to produce hidden/state rows without materializing
+  future proposal token ids.
+
+Implementation:
+
+- Added `DS4_MTP_NATIVE_CONT_STATE_ONLY=1`.
+- Target-first continuation now supports `sched2_cont_output_tokens=0` and
+  `sched2_cont_state_rows=1`.
+- Added a wait-only completion path for async MTP continuation work so the
+  runtime does not read unproduced token ids from `comp_selected`.
+- A one-token state-only queue can be stored and later committed as speculative
+  MTP state if the target accepts the preview token.
+- Added `target_first_cont_state_only` to the native timing line.
+- Extended `tools/mtp_continuation_matrix.sh` with:
+  - `cont_m2_state_only`
+  - `cont_m2_state_only_fused_input`
+  - `cont_m3_state_only`
+  - `cont_m3_state_only_fused_input`
+
+Checks:
+
+- Local:
+  - `git diff --check`
+  - `bash -n tools/mtp_continuation_matrix.sh`
+  - `make ds4_test ds4`
+  - `make ds4-server`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+- Studio:
+  - `make ds4_test ds4 ds4-server`
+  - `git diff --check`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+
+Artifacts:
+
+- Script-sync mistake smoke, old script only:
+  `/tmp/ds4-native-stateonly-shakeout-20260517_123623`
+- Correct state-only shakeout:
+  `/tmp/ds4-native-stateonly-shakeout2-20260517_123720`
+- Validate-mode native verifier pass:
+  `/tmp/ds4-native-stateonly-validate-20260517_125058`
+- Long production matrix:
+  `/tmp/ds4-native-stateonly-long512-20260517_123854`
+- Targeted stage profile:
+  `/tmp/ds4-native-stateonly-stage-20260517_124613`
+
+Correctness:
+
+- The corrected state-only shakeout matched serial stdout.
+- Validate-mode `-n 96` count/explain/code matched serial stdout with
+  `mismatches=0`; as expected, validate mode did not start async continuation
+  (`cont_started=0`).
+- The long `-n 512` count/explain/code matrix matched serial stdout for all
+  modes, including state-only and state-only+fused-input.
+- No `DS4_MTP_NATIVE_VALIDATE=1` long run was used as promotion evidence here:
+  validation mode still does not exercise the target-first async continuation
+  queue. Production stdout equality is the relevant continuation correctness
+  check for this probe.
+
+Long `-n 512` production matrix:
+
+| Prompt | Mode | stdout | t/s | cycles | avg accepted | cont starts | cont stored | cont used | cont dropped | avg MTP GPU |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | oracle | 34.42 | - | - | - | - | - | - | - |
+| count | native K4 | match | 38.31 | 116 | 3.440 | 0 | 0 | 0 | 0 | - |
+| count | cont M2 base | match | 37.73 | 116 | 3.440 | 105 | 0 | 0 | 105 | 52.533 ms |
+| count | cont M2 fused input | match | 37.63 | 116 | 3.440 | 105 | 0 | 0 | 105 | 52.695 ms |
+| count | cont M2 state only | match | 38.08 | 116 | 3.440 | 105 | 0 | 0 | 105 | 51.704 ms |
+| count | cont M2 state only + fused input | match | 37.99 | 116 | 3.440 | 105 | 0 | 0 | 105 | 51.849 ms |
+| count | cont M3 base | match | 37.10 | 116 | 3.440 | 105 | 0 | 0 | 105 | 54.034 ms |
+| count | cont M3 fused input | match | 37.03 | 116 | 3.440 | 105 | 0 | 0 | 105 | 54.025 ms |
+| count | cont M3 state only | match | 37.92 | 116 | 3.440 | 105 | 0 | 0 | 105 | 51.926 ms |
+| count | cont M3 state only + fused input | match | 37.89 | 116 | 3.440 | 105 | 0 | 0 | 105 | 51.947 ms |
+| explain | serial | oracle | 34.20 | - | - | - | - | - | - | - |
+| explain | native K4 | match | 32.71 | 136 | 2.199 | 0 | 0 | 0 | 0 | - |
+| explain | cont M2 base | match | 31.79 | 150 | 1.993 | 85 | 23 | 23 | 62 | 25.517 ms |
+| explain | cont M2 fused input | match | 31.71 | 150 | 1.993 | 85 | 23 | 23 | 62 | 25.599 ms |
+| explain | cont M2 state only | match | 32.23 | 148 | 2.020 | 86 | 20 | 20 | 66 | 25.682 ms |
+| explain | cont M2 state only + fused input | match | 32.11 | 148 | 2.020 | 86 | 20 | 20 | 66 | 25.784 ms |
+| explain | cont M3 base | match | 31.10 | 150 | 1.993 | 85 | 23 | 23 | 62 | 26.497 ms |
+| explain | cont M3 fused input | match | 31.08 | 150 | 1.993 | 85 | 23 | 23 | 62 | 26.577 ms |
+| explain | cont M3 state only | match | 32.15 | 148 | 2.020 | 86 | 20 | 20 | 66 | 25.736 ms |
+| explain | cont M3 state only + fused input | match | 32.10 | 148 | 2.020 | 86 | 20 | 20 | 66 | 25.835 ms |
+| code | serial | oracle | 34.32 | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.57 | 126 | 2.635 | 0 | 0 | 0 | 0 | - |
+| code | cont M2 base | match | 34.84 | 147 | 2.265 | 89 | 43 | 43 | 46 | 27.242 ms |
+| code | cont M2 fused input | match | 34.88 | 147 | 2.265 | 89 | 43 | 43 | 46 | 27.232 ms |
+| code | cont M2 state only | match | 34.74 | 156 | 2.135 | 94 | 46 | 46 | 48 | 26.740 ms |
+| code | cont M2 state only + fused input | match | 34.81 | 156 | 2.135 | 94 | 46 | 46 | 48 | 26.641 ms |
+| code | cont M3 base | match | 34.14 | 149 | 2.235 | 86 | 46 | 46 | 40 | 27.016 ms |
+| code | cont M3 fused input | match | 34.10 | 149 | 2.235 | 86 | 46 | 46 | 40 | 27.029 ms |
+| code | cont M3 state only | match | 34.74 | 156 | 2.135 | 94 | 46 | 46 | 48 | 26.736 ms |
+| code | cont M3 state only + fused input | match | 34.76 | 156 | 2.135 | 94 | 46 | 46 | 48 | 26.702 ms |
+
+Stage profile:
+
+- The targeted stage profile compared `cont_m=2` base vs state-only on explain
+  with `DS4_MTP_NATIVE_CONT_STAGE_PROFILE=1` and
+  `DS4_MTP_NATIVE_MTP_TOP1_ONLY=1`.
+- Row 0 `embed_eproj` is again polluted by the target-first wait, so it is not
+  used as a clean row-cost number.
+- State-only removes the `output_hc_norm` and `output_vocab_top1` stages from
+  the async continuation row.
+- The long-run GPU-span effect is modest:
+  - count M2 base `52.533 ms` -> state-only `51.704 ms`
+  - explain M2 base `25.517 ms` -> state-only `25.682 ms`
+  - code M2 base `27.242 ms` -> state-only `26.740 ms`
+
+Interpretation:
+
+- State-only is correct and does remove future proposal top-id materialization
+  from the async continuation graph.
+- It is not enough to promote because it changes the queue economics: the next
+  cycle can commit the precomputed MTP state for the preview token, but it does
+  not carry a second proposal token. That increases cycles or lowers effective
+  accepted depth on the prompts where continuation is actually reused.
+- The best state-only result is still below native K4 on all long prompts:
+  - count: native K4 `38.31 t/s`, best state-only `38.08 t/s`
+  - explain: native K4 `32.71 t/s`, best state-only `32.23 t/s`
+  - code: native K4 `35.57 t/s`, best state-only `34.81 t/s`
+- Because no state-only candidate beats native K4 on the long matrix, no
+  HumanEval/GSM follow-up was run.
+
+Decision:
+
+- Keep `DS4_MTP_NATIVE_CONT_STATE_ONLY=1` as a diagnostic/profiling probe, not
+  as a promoted path.
+- Do not treat this as a drop of fused continuation overall. It says only that
+  "skip output top-id and store one state row" is not enough.
+- Next kernel-level rewrite target:
+  - either a proposal-output-from-precomputed-state path that can reuse the
+    one state-only row while still producing a second proposal cheaply enough
+    to preserve accepted-depth economics, or
+  - a real continuation decode-row specialization that attacks the remaining
+    `decode_layer` cost rather than only trimming the output/top-id tail.
+
+### 2026-05-17 State-Reuse Proposal Chain Probe
+
+Goal:
+
+- Test the direct follow-up to state-only continuation: reuse the hidden/state
+  row computed for the preview token, but still emit a proposal chain in the
+  next cycle so accepted-depth economics are not reduced to a one-token queue.
+
+Implementation:
+
+- Added `DS4_MTP_NATIVE_CONT_REUSE_STATE_DRAFT=1`.
+- When a state-only continuation queue is consumed, the runtime can now start
+  from `g->mtp_async->branch_state_hc[0]`, emit the first proposal through the
+  MTP output head, then continue the remaining proposal rows through
+  `metal_graph_encode_mtp_draft_from_input_hc()`.
+- The resumed chain updates `s->mtp_runahead_depth`,
+  `s->mtp_runahead_tokens[]`, and `s->mtp_runahead_native_state_depth` before
+  target verification, so `ds4_mtp_native_commit_async_runahead()` can commit
+  the accepted prefix from the async speculative tail.
+- Added timing fields:
+  - `target_first_cont_reuse_state_draft`
+  - `native_cont_reuse_state_draft`
+  - `native_cont_reuse_state_tokens`
+- Extended `tools/mtp_continuation_matrix.sh` with:
+  - `cont_m2_state_reuse`
+  - `cont_m2_state_reuse_fused_input`
+  - `cont_m3_state_reuse`
+  - `cont_m3_state_reuse_fused_input`
+
+Checks:
+
+- Local:
+  - `git diff --check`
+  - `bash -n tools/mtp_continuation_matrix.sh`
+  - `make ds4_test ds4`
+  - `make ds4-server`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+- Studio:
+  - `make ds4_test ds4 ds4-server`
+  - `git diff --check`
+  - `bash -n tools/mtp_continuation_matrix.sh`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+
+Artifacts:
+
+- Count shakeout, stdout match but no stored continuation queues:
+  `/tmp/ds4-native-state-reuse-shakeout-20260517_125832`
+- Explain shakeout, stdout match and reuse path exercised:
+  `/tmp/ds4-native-state-reuse-explain-shakeout-20260517_130011`
+- Validate-mode native verifier pass:
+  `/tmp/ds4-native-state-reuse-validate-20260517_131206`
+- Long production matrix:
+  `/tmp/ds4-native-state-reuse-long512-20260517_130223`
+
+Correctness:
+
+- Short production shakeouts matched serial stdout.
+- Validate-mode `-n 96` count/explain/code matched serial stdout with
+  `mismatches=0`; validate mode still does not exercise target-first async
+  continuation (`cont_started=0`).
+- Long `-n 512` count/explain/code matched serial stdout for all modes,
+  including state-reuse and state-reuse+fused-input.
+
+Long `-n 512` production matrix, selected rows:
+
+| Prompt | Mode | stdout | t/s | cycles | avg accepted | cont starts | cont stored | cont used | cont dropped | avg MTP GPU |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | oracle | 34.27 | - | - | - | - | - | - | - |
+| count | native K4 | match | 38.23 | 116 | 3.440 | 0 | 0 | 0 | 0 | - |
+| count | cont M2 state only | match | 37.93 | 116 | 3.440 | 105 | 0 | 0 | 105 | 51.867 ms |
+| count | cont M2 state reuse | match | 37.97 | 116 | 3.440 | 105 | 0 | 0 | 105 | 51.703 ms |
+| count | cont M3 state reuse | match | 37.87 | 116 | 3.440 | 105 | 0 | 0 | 105 | 51.910 ms |
+| explain | serial | oracle | 34.35 | - | - | - | - | - | - | - |
+| explain | native K4 | match | 32.72 | 136 | 2.199 | 0 | 0 | 0 | 0 | - |
+| explain | cont M2 state only | match | 32.10 | 148 | 2.020 | 86 | 20 | 20 | 66 | 25.766 ms |
+| explain | cont M2 state reuse | match | 31.47 | 150 | 1.993 | 85 | 23 | 23 | 62 | 25.132 ms |
+| explain | cont M3 state reuse | match | 31.40 | 150 | 1.993 | 85 | 23 | 23 | 62 | 25.187 ms |
+| code | serial | oracle | 34.14 | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.53 | 126 | 2.635 | 0 | 0 | 0 | 0 | - |
+| code | cont M2 state only | match | 34.75 | 156 | 2.135 | 94 | 46 | 46 | 48 | 26.726 ms |
+| code | cont M2 state reuse | match | 34.28 | 145 | 2.297 | 87 | 44 | 44 | 43 | 26.554 ms |
+| code | cont M3 state reuse | match | 34.30 | 145 | 2.297 | 87 | 44 | 44 | 43 | 26.568 ms |
+
+State-reuse counters:
+
+| Prompt | Mode | reuse cycles | reuse tokens | cont used | avg accepted | avg draft | avg verify | avg MTP GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| explain | cont M2 state only | 0 | 0 | 20 | 2.020 | 4.511 ms | 29.217 ms | 25.766 ms |
+| explain | cont M2 state reuse | 23 | 69 | 23 | 1.993 | 5.079 ms | 29.141 ms | 25.132 ms |
+| code | cont M2 state only | 0 | 0 | 46 | 2.135 | 3.669 ms | 28.162 ms | 26.726 ms |
+| code | cont M2 state reuse | 44 | 133 | 44 | 2.297 | 4.986 ms | 32.475 ms | 26.554 ms |
+
+Interpretation:
+
+- The resumed proposal chain is correct and the new path is definitely being
+  used: `code` reused 44 queues and produced 133 proposal tokens from the
+  saved continuation state.
+- The useful part worked: on `code`, state reuse raised average accepted depth
+  from `2.135` to `2.297` and reduced cycle count from `156` to `145`.
+- The cost moved rather than disappeared. Draft time rose from `3.669 ms` to
+  `4.986 ms`, and verify time rose from `28.162 ms` to `32.475 ms` on `code`.
+  The extra proposal chain creates a larger/less favorable verifier block often
+  enough to erase the accepted-depth gain.
+- On `explain`, state reuse slightly reduces async MTP GPU span, but lowers
+  throughput because effective accepted depth does not improve.
+- The best state-reuse result is still below native K4 on all long prompts:
+  - count: native K4 `38.23 t/s`, best state reuse `37.97 t/s`
+  - explain: native K4 `32.72 t/s`, best state reuse `31.47 t/s`
+  - code: native K4 `35.53 t/s`, best state reuse `34.30 t/s`
+- No HumanEval/GSM follow-up was run because no state-reuse candidate beat
+  native K4 on the long matrix.
+
+Decision:
+
+- Keep `DS4_MTP_NATIVE_CONT_REUSE_STATE_DRAFT=1` as a correct diagnostic probe,
+  not as a promoted path.
+- This narrows the next real target: continuation scheduling/copy policy is no
+  longer the dominant blocker. Even when a precomputed state row preserves
+  proposal depth, target verification cost grows enough to dominate.
+- The next kernel-level rewrite should attack verifier economics again, but
+  specifically for the native continuation/depth distribution:
+  - reduce small-M verifier decode cost for the accepted continuation-derived
+    blocks, or
+  - add an adaptive verifier-depth contract that verifies only the proposal
+    rows whose continuation acceptance odds justify the extra verifier span.
+
+### 2026-05-17 Continuation Reuse Verify-Cap Probe
+
+Goal:
+
+- Test a narrow exact verifier-depth contract for state-reuse continuation
+  cycles.
+- The previous state-reuse probe proved that saved continuation state can
+  preserve proposal depth, but the larger verifier block erased the accepted
+  depth gain. This probe keeps the resumed proposal chain, but caps how many
+  continuation-derived rows are verified in the current cycle.
+
+Implementation:
+
+- Added `DS4_MTP_NATIVE_CONT_REUSE_VERIFY_CAP=N`.
+- The cap applies only after `DS4_MTP_NATIVE_CONT_REUSE_STATE_DRAFT=1`
+  successfully resumes from a saved state-only continuation row.
+- The cap is exact: rows beyond the cap are not accepted. The next generated
+  proposal becomes a preview, and commit still only promotes verifier-accepted
+  MTP state rows.
+- Added timing fields:
+  - `target_first_cont_reuse_verify_cap`
+  - `native_cont_reuse_verify_cap_applied`
+
+Checks:
+
+- Local:
+  - `git diff --check`
+  - `make ds4_test ds4`
+  - `make ds4-server`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+- Studio:
+  - `make ds4_test ds4 ds4-server`
+  - `git diff --check`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+
+Artifacts:
+
+- Validate-mode native verifier pass:
+  `/tmp/ds4-native-reuse-cap-validate-20260517_132312`
+- Targeted long `-n 512` matrix:
+  `/tmp/ds4-native-reuse-cap-long512-20260517_131751`
+
+Correctness:
+
+- Validate-mode `-n 96` count/explain/code matched serial stdout with
+  `mismatches=0`; validate mode still does not exercise target-first async
+  continuation (`cont_started=0`).
+- Long `-n 512` count/explain/code matched serial stdout for all tested modes.
+
+Long `-n 512` production matrix, selected rows:
+
+| Prompt | Mode | stdout | t/s | cycles |
+| --- | --- | --- | ---: | ---: |
+| count | serial | oracle | 34.38 | - |
+| count | native K4 | match | 38.27 | 116 |
+| count | cont M2 state only | match | 38.01 | 116 |
+| count | cont M2 reuse | match | 38.01 | 116 |
+| count | cont M2 reuse cap2 | match | 38.00 | 116 |
+| count | cont M3 reuse | match | 38.07 | 116 |
+| count | cont M3 reuse cap2 | match | 38.03 | 116 |
+| explain | serial | oracle | 34.41 | - |
+| explain | native K4 | match | 32.80 | 136 |
+| explain | cont M2 state only | match | 32.30 | 148 |
+| explain | cont M2 reuse | match | 31.60 | 150 |
+| explain | cont M2 reuse cap2 | match | 31.74 | 150 |
+| explain | cont M3 reuse | match | 31.44 | 150 |
+| explain | cont M3 reuse cap2 | match | 31.63 | 150 |
+| code | serial | oracle | 34.23 | - |
+| code | native K4 | match | 35.55 | 126 |
+| code | cont M2 state only | match | 34.69 | 156 |
+| code | cont M2 reuse | match | 34.28 | 145 |
+| code | cont M2 reuse cap2 | match | 34.47 | 147 |
+| code | cont M3 reuse | match | 34.34 | 145 |
+| code | cont M3 reuse cap2 | match | 34.46 | 147 |
+
+Reuse/cap timing details:
+
+| Prompt | Mode | cycles | avg accepted | avg draft | avg verify | cont used | cont stored | cont dropped | reuse cycles | cap applied sum | avg MTP GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| explain | cont M2 state only | 148 | 2.020 | 4.497 ms | 29.000 ms | 20 | 20 | 66 | 0 | 0 | 25.642 ms |
+| explain | cont M2 reuse | 150 | 1.993 | 5.073 ms | 29.005 ms | 23 | 23 | 62 | 23 | 0 | 25.072 ms |
+| explain | cont M2 reuse cap2 | 150 | 1.993 | 5.093 ms | 28.571 ms | 23 | 23 | 62 | 23 | 46 | 25.040 ms |
+| code | cont M2 state only | 156 | 2.135 | 3.672 ms | 28.176 ms | 46 | 46 | 48 | 0 | 0 | 26.733 ms |
+| code | cont M2 reuse | 145 | 2.297 | 4.972 ms | 32.491 ms | 44 | 44 | 43 | 44 | 0 | 26.598 ms |
+| code | cont M2 reuse cap2 | 147 | 2.265 | 4.978 ms | 31.134 ms | 43 | 43 | 46 | 43 | 86 | 26.724 ms |
+
+Interpretation:
+
+- The cap is active and exact. On `code`, cap2 applied in 43 reuse cycles
+  (`cap_applied sum=86`, because cap value `2` is reported per capped cycle).
+- Cap2 did reduce verifier cost for continuation-reuse cycles:
+  - explain M2 reuse `29.005 ms` -> cap2 `28.571 ms`
+  - code M2 reuse `32.491 ms` -> cap2 `31.134 ms`
+- The saved verifier time did not translate into promotion. Cap2 also reduces
+  accepted depth and increases cycle count versus uncapped reuse:
+  - code M2 reuse: `145` cycles, avg accepted `2.297`, `34.28 t/s`
+  - code M2 cap2: `147` cycles, avg accepted `2.265`, `34.47 t/s`
+- Cap2 is a small improvement over uncapped reuse on `explain` and `code`, but
+  remains below both state-only and native K4. It is evidence that verifier span
+  is the right bottleneck, not a sufficient fix.
+- No HumanEval/GSM follow-up was run because no cap candidate beat native K4 on
+  the long matrix.
+
+Decision:
+
+- Keep `DS4_MTP_NATIVE_CONT_REUSE_VERIFY_CAP` as a diagnostic exact policy
+  probe, not a promoted path.
+- The continuation track now has three consistent measurements:
+  - skipping output token generation saves too little and hurts queue economics;
+  - reusing saved state preserves proposal depth but raises verifier cost;
+  - capping verifier depth reduces verifier cost but gives back accepted depth.
+- The next implementation should be a real small-M verifier decode rewrite for
+  the continuation/native K4 distribution, not another continuation policy
+  variant. The highest-value target is reducing verifier decode cost for
+  `suffix_n=2..3` without lowering accepted depth.
+
+### 2026-05-17 Fixed-Chain Fused Continuation Prototype
+
+Goal:
+
+- Stop treating continuation as another cache-policy probe and build a concrete
+  fixed-depth MTP continuation path.
+- Target `cont_m=2` first, with the same code path supporting `cont_m=3` after
+  correctness.
+
+Implementation:
+
+- Added `DS4_MTP_NATIVE_CONT_FUSED_CHAIN=1`.
+- Added `kernel_top1_pair_embed_norm_f16_f32` and
+  `ds4_gpu_matmul_q8_0_top1_embed_norm_tensor()`.
+  The kernel replaces the second pass of exact output top1 with a reducer that
+  also prepares the next MTP input row: it writes the selected token id and the
+  MTP `enorm(token_embedding)` row needed by the dependent continuation row.
+- Split `metal_graph_encode_mtp_draft_from_input_hc()` so the fixed chain can
+  start a dependent row from a prepared normalized embedding via
+  `metal_graph_encode_mtp_draft_from_enorm_hc()`, avoiding the generic token
+  embed/norm dispatch for that row.
+- In fused-chain mode, lazy tail is overridden for the fixed continuation depth:
+  `cont_m=2` emits one proposal token and materializes the second speculative
+  state row; `cont_m=3` emits two proposal tokens and materializes the third
+  state row. This is an explicit fixed-depth continuation contract, not a
+  direct write into committed MTP cache.
+- The queue still commits only verified accepted rows. Rollback discards the
+  speculative tail through the existing async runahead transaction.
+
+Checks:
+
+- Local:
+  - `git diff --check`
+  - `bash -n tools/mtp_continuation_matrix.sh`
+  - `make ds4_test ds4`
+  - `make ds4-server`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+- Studio:
+  - `make ds4_test ds4 ds4-server`
+  - `git diff --check`
+  - `./ds4_test --metal-kernels`
+  - `./ds4_test --metal-sched2`
+  - `./ds4_test --metal-block-verifier`
+  - `./ds4_test --metal-mtp-cache-contract`
+
+Artifacts:
+
+- Correctness/stdout and validate-mode top-id check:
+  `/tmp/ds4-native-fusedchain-validate-20260517_134231`
+- Long `-n 512` production matrix:
+  `/tmp/ds4-native-fusedchain-long512-20260517_134446`
+- Stage profile:
+  `/tmp/ds4-native-fusedchain-stage-20260517_134907`
+
+Correctness:
+
+- Production fused-chain `cont_m=2` matched serial stdout on count, explain, and
+  code at `-n 128`.
+- Validate-mode count/explain/code reported `max_delta=0` and `mismatches=0`
+  in the sampled verifier rows. As before, validate mode does not exercise the
+  target-first async continuation path (`sched2_cont_started=0`), so production
+  stdout matching is the continuation correctness evidence.
+- Long `-n 512` production runs matched serial stdout for every tested mode.
+
+Long `-n 512` production matrix:
+
+| Prompt | Mode | stdout | t/s | cycles | avg accepted | cont used | cont stored | cont dropped | avg MTP GPU | avg verify | tail materialized |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| count | serial | oracle | 34.40 | - | - | - | - | - | - | - | - |
+| count | native K4 | match | 38.43 | 116 | 3.440 | 0 | 0 | 0 | - | 53.051 ms | 0 |
+| count | cont M2 base | match | 37.79 | 116 | 3.440 | 0 | 0 | 105 | 52.401 ms | 54.550 ms | 0 |
+| count | cont M3 base | match | 37.15 | 116 | 3.440 | 0 | 0 | 105 | 53.900 ms | 56.073 ms | 0 |
+| count | cont M2 fused-chain | match | 37.42 | 116 | 3.440 | 0 | 0 | 105 | 53.224 ms | 55.370 ms | 0 |
+| count | cont M3 fused-chain | match | 36.93 | 116 | 3.440 | 0 | 0 | 105 | 54.436 ms | 56.600 ms | 0 |
+| explain | serial | oracle | 34.45 | - | - | - | - | - | - | - | - |
+| explain | native K4 | match | 32.73 | 136 | 2.199 | 0 | 0 | 0 | - | 32.803 ms | 0 |
+| explain | cont M2 base | match | 31.78 | 150 | 1.993 | 23 | 23 | 62 | 25.677 ms | 29.152 ms | 4 |
+| explain | cont M3 base | match | 31.24 | 150 | 1.993 | 23 | 23 | 62 | 26.424 ms | 30.342 ms | 0 |
+| explain | cont M2 fused-chain | match | 31.61 | 150 | 1.993 | 23 | 23 | 62 | 26.034 ms | 29.519 ms | 0 |
+| explain | cont M3 fused-chain | match | 30.97 | 150 | 1.993 | 23 | 23 | 62 | 26.863 ms | 30.841 ms | 0 |
+| code | serial | oracle | 34.65 | - | - | - | - | - | - | - | - |
+| code | native K4 | match | 35.66 | 126 | 2.635 | 0 | 0 | 0 | - | 39.207 ms | 0 |
+| code | cont M2 base | match | 34.85 | 147 | 2.265 | 43 | 43 | 46 | 27.211 ms | 31.647 ms | 14 |
+| code | cont M3 base | match | 34.11 | 149 | 2.235 | 46 | 46 | 40 | 27.029 ms | 32.434 ms | 5 |
+| code | cont M2 fused-chain | match | 34.73 | 147 | 2.265 | 43 | 43 | 46 | 27.533 ms | 31.979 ms | 0 |
+| code | cont M3 fused-chain | match | 33.85 | 150 | 2.220 | 47 | 47 | 39 | 27.175 ms | 32.605 ms | 0 |
+
+Stage profile, `code`, target-first `cont_m=2`, `-n 128`:
+
+| Mode | Row | Stage | avg | median |
+| --- | ---: | --- | ---: | ---: |
+| base | raw | raw_copy | 0.235 ms | 0.234 ms |
+| base | 0 | embed_eproj | 43.294 ms | 42.903 ms |
+| base | 0 | hproj_add | 0.331 ms | 0.319 ms |
+| base | 0 | decode_layer | 0.920 ms | 0.912 ms |
+| base | 0 | output_hc_norm | 0.275 ms | 0.278 ms |
+| base | 0 | output_vocab_logits | 1.003 ms | 0.999 ms |
+| base | 0 | top_reduce | 0.266 ms | 0.268 ms |
+| fused-chain | raw | raw_copy | 0.241 ms | 0.237 ms |
+| fused-chain | 0 | embed_eproj | 43.505 ms | 43.153 ms |
+| fused-chain | 0 | hproj_add | 0.322 ms | 0.314 ms |
+| fused-chain | 0 | decode_layer | 0.925 ms | 0.918 ms |
+| fused-chain | 0 | output_hc_norm | 0.288 ms | 0.281 ms |
+| fused-chain | 0 | output_top1_next_input | 1.058 ms | 1.046 ms |
+| fused-chain | 1 | embed_eproj | 0.277 ms | 0.275 ms |
+| fused-chain | 1 | hproj_add | 0.293 ms | 0.283 ms |
+| fused-chain | 1 | decode_layer | 0.929 ms | 0.919 ms |
+
+Interpretation:
+
+- The fixed-chain path is doing the intended real work: the later tail
+  materialization counts dropped to zero on explain/code because the continuation
+  command now materializes the fixed speculative state rows up front.
+- The top1+next-input fusion is exact, but it is not cheap enough to pay for the
+  extra fixed tail row. On `code`, base `cont_m=2` spends `27.211 ms` average MTP
+  GPU and `34.85 t/s`; fused-chain `cont_m=2` spends `27.533 ms` and drops to
+  `34.73 t/s`.
+- The dominant stage is not the token embed/norm boundary anymore. The remaining
+  fixed-chain tail row still pays about `0.93 ms` for MTP `decode_layer`, about
+  `0.29 ms` for `hproj_add`, and about `0.28 ms` for e-projection even after
+  using the prepared normalized embedding. The exact vocab top1 scan remains
+  about `1.05 ms` when an output token is emitted.
+- `row=0 embed_eproj` in target-first stage profiling is still polluted by target
+  verifier occupancy; the useful intrinsic row-cost numbers are the later row
+  and output stages.
+- `cont_m=3` is worse than `cont_m=2`: more fixed tail work and deeper
+  verification reduce throughput on all three prompts.
+- No HumanEval/GSM slice was run because neither fused-chain candidate beat
+  current native K4 or serial on the long matrix.
+
+Decision:
+
+- Keep `DS4_MTP_NATIVE_CONT_FUSED_CHAIN=1` as a correct diagnostic prototype, not
+  a promoted path.
+- This is a real fused/specialized continuation implementation, and it shows the
+  fixed-tail hypothesis cleanly: avoiding later tail materialization helps the
+  ledger, but the up-front dependent MTP decode row costs more than it saves.
+- The next kernel-level target should be the MTP continuation decode row itself,
+  not another cache/scheduler policy:
+  - specialize the one-layer MTP decode row to reduce the `decode_layer` stage;
+  - or attack exact MTP output top1 with a materially faster one-row vocab scan;
+  - only revisit fixed-chain continuation after one of those two stages moves
+    enough to make the extra speculative row cheap.

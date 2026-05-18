@@ -114,6 +114,20 @@ int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_embed_token_norm_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *token_tensor,
+        const void             *embed_model_map,
+        uint64_t                embed_model_size,
+        const void             *norm_model_map,
+        uint64_t                norm_model_size,
+        uint64_t                embed_offset,
+        uint64_t                norm_offset,
+        uint32_t                n_vocab,
+        uint32_t                token,
+        uint32_t                n_embd,
+        float                   eps);
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -207,6 +221,26 @@ int ds4_gpu_matmul_q8_0_top1_only_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+int ds4_gpu_matmul_q8_0_top1_embed_norm_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *next_norm,
+        const void             *output_model_map,
+        uint64_t                output_model_size,
+        uint64_t                output_weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        const void             *embed_model_map,
+        uint64_t                embed_model_size,
+        const void             *norm_model_map,
+        uint64_t                norm_model_size,
+        uint64_t                embed_offset,
+        uint64_t                norm_offset,
+        uint32_t                n_vocab,
+        uint32_t                n_embd,
+        float                   eps);
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
@@ -825,6 +859,13 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_hc_add_broadcast_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hc,
+        const ds4_gpu_tensor *row,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
 /* Release decode fused HC pre-sublayer operation: split the HC mixer and
  * immediately reduce four HC streams into the active 4096-wide sublayer row. */
 int ds4_gpu_hc_split_weighted_sum_tensor(
@@ -867,6 +908,20 @@ int ds4_gpu_output_hc_weights_tensor(
         uint64_t                base_offset,
         uint32_t                n_hc,
         float                   eps);
+
+int ds4_gpu_output_hc_norm_fused_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *pre,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        float                   eps,
+        float                   norm_eps);
 
 int ds4_gpu_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,

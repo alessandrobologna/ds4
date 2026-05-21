@@ -489,6 +489,22 @@ generated tokens, pass/fail state, the model answer, and the correct answer.
 ./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
 ```
 
+To run the same embedded questions through the HTTP server instead of the
+in-process session path, start `ds4-server` and use `ds4-eval-http`. The
+`--parallel` value controls concurrent client requests, so it is useful for
+exercising `ds4-server --max-slots N` behavior with the normal chat endpoint:
+
+```sh
+./ds4-server -m ds4flash.gguf --max-slots 4 --batch-backend shared-decode
+./ds4-eval-http --parallel 4 --questions 8 --nothink --tokens 512 \
+  --trace /tmp/ds4-eval-http.txt
+```
+
+`ds4-eval-http` records per-case latency, token usage, response bytes, and
+aggregate prompt/completion/total token throughput. Add `--stream` to request
+SSE responses and capture client-visible TTFT from the first streamed content
+or reasoning chunk.
+
 The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
 `</think>` budget cutoff so the model has room to produce a visible answer.
 `ds4-eval` sizes the context internally from the largest selected prompt plus
@@ -604,14 +620,51 @@ Start a local OpenAI/Anthropic-compatible server:
 Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
-The server keeps one mutable backend/KV checkpoint in memory,
+By default the server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
-Request parsing and sockets run in client threads, but inference itself is
-serialized through one graph worker. The current server does not batch multiple
-independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+Experimental public batch mode is available with `--max-slots N`. The current
+portable backend is `session-slots`: each occupied slot owns an ordinary
+`ds4_session`, preserving the existing Metal/CUDA/CPU session behavior while
+keeping batch state compartmentalized. `--max-slots 1` preserves the upstream
+single-session worker path. Multi-slot mode can use disk KV cache per slot, but
+is not currently compatible with MTP. `--batch-backend shared-decode` enables
+the experimental private storage-slot backend through the same public slot API:
+slots share one graph/workspace while each slot's KV state remains isolated.
+With MTP and `--max-slots 1`, the server falls back to the ordinary
+single-session path so single-session speculative decoding keeps its normal
+behavior. `--experimental-batched-prefill` routes concurrent prompt segments
+through the public batch prefill API. Shared prefix fanout is implemented with
+public slot snapshots, and divergent prompts use the segmented prefill entry
+point when the live slot frontier is safe to extend. Equal-length prefill
+segments are grouped through one private backend command sequence; uneven
+segments fall back to the interleaved row-batched path.
+
+To capture local batch-efficiency metrics, run:
+
+```sh
+make server-batch-metrics
+```
+
+The metrics harness starts `ds4-server` for `--max-slots 1,2,4` and reports
+observed request throughput, token throughput, latency, TTFT, speedup, and
+slot efficiency. It is intentionally separate from the smoke tests because the
+numbers depend on local hardware, residency, and current system load. Override
+the sweep from Make with variables such as `DS4_BATCH_METRIC_SLOTS=1,2,4,8`,
+`DS4_BATCH_METRIC_REQUESTS=16`, `DS4_BATCH_METRIC_CONCURRENCY=8`, and
+`DS4_BATCH_METRIC_JSON=batch-metrics.json`.
+
+For the older label/workload benchmark shape, run:
+
+```sh
+make server-batch-benchmark
+```
+
+That target calls `tests/server_batch_smoke.py benchmark` and defaults to a
+short shared-prefix prefill check with fanout assertions. Override
+`DS4_BATCH_BENCH_WORKLOAD`, `DS4_BATCH_BENCH_CLIENTS`,
+`DS4_BATCH_BENCH_LABELS`, and `DS4_BATCH_BENCH_TRIALS` for broader sweeps.
 
 Supported endpoints:
 

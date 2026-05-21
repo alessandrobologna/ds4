@@ -241,6 +241,12 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval_many(ds4_session **sessions, const int *tokens,
+                          int n_sessions, char *err, size_t errlen);
+int ds4_session_eval_top(ds4_session *s, int token, int *top_token, char *err, size_t errlen);
+int ds4_session_eval_top_many(ds4_session **sessions, const int *tokens,
+                              int n_sessions, int *top_tokens,
+                              char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -309,5 +315,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
+
+#include "ds4_batch.h"
 
 #endif

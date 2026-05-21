@@ -1509,6 +1509,343 @@ static void test_metal_mpp_equivalence(void) {
     for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
 }
 
+static void test_batch_api_session_slots(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    char err[256];
+    ds4_batch *shared = NULL;
+    ds4_batch_options shared_opt = {
+        .ctx_size = 32768,
+        .max_slots = 2,
+        .backend = DS4_BATCH_BACKEND_SHARED_DECODE,
+    };
+    TEST_ASSERT(ds4_batch_create_with_options(&shared, engine, &shared_opt,
+                                              err, sizeof(err)) == 0);
+    TEST_ASSERT(shared != NULL);
+    TEST_ASSERT(!strcmp(ds4_batch_backend_name(shared), "shared-decode"));
+    ds4_batch_free(shared);
+
+    ds4_tokens prompt_a = {0};
+    ds4_tokens prompt_b = {0};
+    ds4_encode_chat_prompt(engine, "", "Reply with the next token after alpha.", DS4_THINK_NONE, &prompt_a);
+    ds4_encode_chat_prompt(engine, "", "Reply with the next token after beta.", DS4_THINK_NONE, &prompt_b);
+    TEST_ASSERT(prompt_a.len > 0);
+    TEST_ASSERT(prompt_b.len > 0);
+
+    ds4_session *single = NULL;
+    TEST_ASSERT(ds4_session_create(&single, engine, 32768) == 0);
+    TEST_ASSERT(single != NULL);
+    if (single) TEST_ASSERT(ds4_session_sync(single, &prompt_a, err, sizeof(err)) == 0);
+    ds4_session *single_b = NULL;
+    TEST_ASSERT(ds4_session_create(&single_b, engine, 32768) == 0);
+    TEST_ASSERT(single_b != NULL);
+    if (single_b) TEST_ASSERT(ds4_session_sync(single_b, &prompt_b, err, sizeof(err)) == 0);
+
+    ds4_batch *batch = NULL;
+    ds4_batch_options opt = {
+        .ctx_size = 32768,
+        .max_slots = 2,
+        .backend = DS4_BATCH_BACKEND_SESSION_SLOTS,
+    };
+    TEST_ASSERT(ds4_batch_create_with_options(&batch, engine, &opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(batch != NULL);
+    if (!batch || !single || !single_b) {
+        ds4_batch_free(batch);
+        ds4_session_free(single_b);
+        ds4_session_free(single);
+        ds4_tokens_free(&prompt_a);
+        ds4_tokens_free(&prompt_b);
+        return;
+    }
+    TEST_ASSERT(ds4_batch_max_slots(batch) == 2);
+    TEST_ASSERT(!strcmp(ds4_batch_backend_name(batch), "session-slots"));
+
+    ds4_batch_claim_slot(batch, 0);
+    ds4_batch_claim_slot(batch, 1);
+    uint64_t gen0 = ds4_batch_slot_generation(batch, 0);
+    TEST_ASSERT(gen0 > 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 0, &prompt_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 1, &prompt_b, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_pos(batch, 0) == prompt_a.len);
+    TEST_ASSERT(ds4_batch_pos(batch, 1) == prompt_b.len);
+    TEST_ASSERT(ds4_batch_common_prefix(batch, 0, &prompt_a) == prompt_a.len);
+    TEST_ASSERT(ds4_batch_slot_logits_valid(batch, 0));
+    TEST_ASSERT(ds4_batch_slot_payload_valid(batch, 0));
+    ds4_batch_rewind_slot(batch, 1, prompt_b.len - 1);
+    TEST_ASSERT(ds4_batch_pos(batch, 1) == prompt_b.len - 1);
+    TEST_ASSERT(!ds4_batch_slot_logits_valid(batch, 1));
+    TEST_ASSERT(ds4_batch_sync(batch, 1, &prompt_b, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_pos(batch, 1) == prompt_b.len);
+
+    uint64_t rng_single = 7;
+    uint64_t rng_batch = 7;
+    int single_token = ds4_session_sample(single, 0.0f, 0, 1.0f, 0.0f, &rng_single);
+    int batch_token = ds4_batch_sample(batch, 0, 0.0f, 0, 1.0f, 0.0f, &rng_batch);
+    TEST_ASSERT(single_token == batch_token);
+    uint64_t rng_single_b = 11;
+    uint64_t rng_batch_b = 11;
+    int single_token_b = ds4_session_sample(single_b, 0.0f, 0, 1.0f, 0.0f, &rng_single_b);
+    int batch_token_b = ds4_batch_sample(batch, 1, 0.0f, 0, 1.0f, 0.0f, &rng_batch_b);
+    TEST_ASSERT(single_token_b == batch_token_b);
+
+    ds4_batch_step full_steps[2] = {
+        { .slot = 0, .token = batch_token },
+        { .slot = 1, .token = batch_token_b },
+    };
+    TEST_ASSERT(ds4_batch_eval(batch, full_steps, 2, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(single, single_token, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(single_b, single_token_b, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_argmax(batch, 0) == ds4_session_argmax(single));
+    TEST_ASSERT(ds4_batch_argmax(batch, 1) == ds4_session_argmax(single_b));
+    TEST_ASSERT(ds4_batch_slot_logits_valid(batch, 0));
+    TEST_ASSERT(ds4_batch_slot_payload_valid(batch, 0));
+
+    int segment_tokens_a[2];
+    int segment_tokens_b[1];
+    segment_tokens_a[0] = ds4_session_argmax(single);
+    TEST_ASSERT(ds4_session_eval(single, segment_tokens_a[0], err, sizeof(err)) == 0);
+    segment_tokens_a[1] = ds4_session_argmax(single);
+    TEST_ASSERT(ds4_session_eval(single, segment_tokens_a[1], err, sizeof(err)) == 0);
+    segment_tokens_b[0] = ds4_session_argmax(single_b);
+    TEST_ASSERT(ds4_session_eval(single_b, segment_tokens_b[0], err, sizeof(err)) == 0);
+    ds4_batch_prefill_segment segments[2] = {
+        {
+            .slot = 0,
+            .tokens = segment_tokens_a,
+            .n_tokens = 2,
+            .refresh_logits = 1,
+        },
+        {
+            .slot = 1,
+            .tokens = segment_tokens_b,
+            .n_tokens = 1,
+            .refresh_logits = 1,
+        },
+    };
+    TEST_ASSERT(ds4_batch_prefill_segments(batch, segments, 2, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_argmax(batch, 0) == ds4_session_argmax(single));
+    TEST_ASSERT(ds4_batch_argmax(batch, 1) == ds4_session_argmax(single_b));
+
+    rng_single = 17;
+    rng_batch = 17;
+    single_token = ds4_session_sample(single, 0.0f, 0, 1.0f, 0.0f, &rng_single);
+    batch_token = ds4_batch_sample(batch, 0, 0.0f, 0, 1.0f, 0.0f, &rng_batch);
+    TEST_ASSERT(single_token == batch_token);
+
+    ds4_batch_step step = { .slot = 0, .token = batch_token };
+    int batch_top = -1;
+    TEST_ASSERT(ds4_batch_eval_top(batch, NULL, 1, &batch_top, err, sizeof(err)) != 0);
+    TEST_ASSERT(ds4_batch_eval_top(batch, &step, 1, NULL, err, sizeof(err)) != 0);
+    TEST_ASSERT(ds4_batch_eval_top(batch, &step, 1, &batch_top, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(single, single_token, err, sizeof(err)) == 0);
+    TEST_ASSERT(batch_top == ds4_session_argmax(single));
+    TEST_ASSERT(!ds4_batch_slot_logits_valid(batch, 0));
+    TEST_ASSERT(!ds4_batch_slot_payload_valid(batch, 0));
+    TEST_ASSERT(!ds4_batch_slot_can_save(batch, 0));
+
+    ds4_session_snapshot snap = {0};
+    TEST_ASSERT(ds4_batch_save_slot_snapshot(batch, 1, &snap, err, sizeof(err)) == 0);
+    TEST_ASSERT(snap.len > 0);
+    ds4_batch_invalidate_slot(batch, 1);
+    TEST_ASSERT(!ds4_batch_slot_payload_valid(batch, 1));
+    TEST_ASSERT(ds4_batch_load_slot_snapshot(batch, 1, &snap, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_slot_can_save(batch, 1));
+    TEST_ASSERT(ds4_batch_tokens(batch, 1)->len == ds4_batch_pos(batch, 1));
+    ds4_session_snapshot_free(&snap);
+
+    uint64_t payload_bytes = ds4_batch_slot_payload_bytes(batch, 1);
+    TEST_ASSERT(payload_bytes > 0);
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(ds4_batch_save_slot_payload(batch, 1, fp, err, sizeof(err)) == 0);
+        rewind(fp);
+        ds4_batch_release_slot(batch, 1);
+        TEST_ASSERT(!ds4_batch_slot_occupied(batch, 1));
+        ds4_batch_invalidate_slot(batch, 1);
+        TEST_ASSERT(ds4_batch_load_slot_payload(batch, 1, fp, payload_bytes, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_batch_slot_can_save(batch, 1));
+        TEST_ASSERT(ds4_batch_tokens(batch, 1)->len == ds4_batch_pos(batch, 1));
+        fclose(fp);
+    }
+    FILE *bad = tmpfile();
+    TEST_ASSERT(bad != NULL);
+    if (bad) {
+        fputs("not a valid payload", bad);
+        rewind(bad);
+        TEST_ASSERT(ds4_batch_load_slot_payload(batch, 1, bad, 17, err, sizeof(err)) != 0);
+        TEST_ASSERT(!ds4_batch_slot_payload_valid(batch, 1));
+        fclose(bad);
+    }
+
+    ds4_batch_release_slot(batch, 1);
+    ds4_batch_free(batch);
+    ds4_session_free(single_b);
+    ds4_session_free(single);
+    ds4_tokens_free(&prompt_a);
+    ds4_tokens_free(&prompt_b);
+}
+
+static void test_batch_api_shared_decode(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    char err[256];
+    ds4_tokens prompt_a = {0};
+    ds4_tokens prompt_b = {0};
+    ds4_encode_chat_prompt(engine, "", "Reply with the next token after north.", DS4_THINK_NONE, &prompt_a);
+    ds4_encode_chat_prompt(engine, "", "Reply with the next token after south.", DS4_THINK_NONE, &prompt_b);
+    TEST_ASSERT(prompt_a.len > 0);
+    TEST_ASSERT(prompt_b.len > 0);
+
+    ds4_session *single_a = NULL;
+    ds4_session *single_b = NULL;
+    TEST_ASSERT(ds4_session_create(&single_a, engine, 32768) == 0);
+    TEST_ASSERT(ds4_session_create(&single_b, engine, 32768) == 0);
+    if (single_a) TEST_ASSERT(ds4_session_sync(single_a, &prompt_a, err, sizeof(err)) == 0);
+    if (single_b) TEST_ASSERT(ds4_session_sync(single_b, &prompt_b, err, sizeof(err)) == 0);
+
+    ds4_batch *batch = NULL;
+    ds4_batch_options opt = {
+        .ctx_size = 32768,
+        .max_slots = 3,
+        .backend = DS4_BATCH_BACKEND_SHARED_DECODE,
+    };
+    TEST_ASSERT(ds4_batch_create_with_options(&batch, engine, &opt, err, sizeof(err)) == 0);
+    TEST_ASSERT(batch != NULL);
+    if (!batch || !single_a || !single_b) {
+        ds4_batch_free(batch);
+        ds4_session_free(single_b);
+        ds4_session_free(single_a);
+        ds4_tokens_free(&prompt_a);
+        ds4_tokens_free(&prompt_b);
+        return;
+    }
+    TEST_ASSERT(ds4_batch_max_slots(batch) == 3);
+    TEST_ASSERT(!strcmp(ds4_batch_backend_name(batch), "shared-decode"));
+
+    ds4_batch_claim_slot(batch, 2);
+    ds4_batch_claim_slot(batch, 0);
+    ds4_batch_claim_slot(batch, 1);
+    TEST_ASSERT(ds4_batch_sync(batch, 2, &prompt_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_sync(batch, 0, &prompt_b, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_pos(batch, 2) == prompt_a.len);
+    TEST_ASSERT(ds4_batch_pos(batch, 0) == prompt_b.len);
+    TEST_ASSERT(ds4_batch_slot_logits_valid(batch, 2));
+    TEST_ASSERT(ds4_batch_slot_payload_valid(batch, 0));
+
+    uint64_t rng_single_a = 101;
+    uint64_t rng_batch_a = 101;
+    uint64_t rng_single_b = 202;
+    uint64_t rng_batch_b = 202;
+    int token_a = ds4_session_sample(single_a, 0.0f, 0, 1.0f, 0.0f, &rng_single_a);
+    int token_a_batch = ds4_batch_sample(batch, 2, 0.0f, 0, 1.0f, 0.0f, &rng_batch_a);
+    int token_b = ds4_session_sample(single_b, 0.0f, 0, 1.0f, 0.0f, &rng_single_b);
+    int token_b_batch = ds4_batch_sample(batch, 0, 0.0f, 0, 1.0f, 0.0f, &rng_batch_b);
+    TEST_ASSERT(token_a == token_a_batch);
+    TEST_ASSERT(token_b == token_b_batch);
+
+    ds4_batch_step steps[2] = {
+        { .slot = 0, .token = token_b_batch },
+        { .slot = 2, .token = token_a_batch },
+    };
+    TEST_ASSERT(ds4_batch_eval(batch, steps, 2, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(single_a, token_a, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(single_b, token_b, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_argmax(batch, 2) == ds4_session_argmax(single_a));
+    TEST_ASSERT(ds4_batch_argmax(batch, 0) == ds4_session_argmax(single_b));
+
+    int equal_a[2];
+    int equal_b[2];
+    equal_a[0] = ds4_session_argmax(single_a);
+    TEST_ASSERT(ds4_session_eval(single_a, equal_a[0], err, sizeof(err)) == 0);
+    equal_a[1] = ds4_session_argmax(single_a);
+    TEST_ASSERT(ds4_session_eval(single_a, equal_a[1], err, sizeof(err)) == 0);
+    equal_b[0] = ds4_session_argmax(single_b);
+    TEST_ASSERT(ds4_session_eval(single_b, equal_b[0], err, sizeof(err)) == 0);
+    equal_b[1] = ds4_session_argmax(single_b);
+    TEST_ASSERT(ds4_session_eval(single_b, equal_b[1], err, sizeof(err)) == 0);
+    ds4_batch_prefill_segment equal_segments[2] = {
+        { .slot = 2, .tokens = equal_a, .n_tokens = 2, .refresh_logits = 1 },
+        { .slot = 0, .tokens = equal_b, .n_tokens = 2, .refresh_logits = 1 },
+    };
+    TEST_ASSERT(ds4_batch_prefill_segments(batch, equal_segments, 2, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_argmax(batch, 2) == ds4_session_argmax(single_a));
+    TEST_ASSERT(ds4_batch_argmax(batch, 0) == ds4_session_argmax(single_b));
+
+    int seg_a[2];
+    int seg_b[1];
+    seg_a[0] = ds4_session_argmax(single_a);
+    TEST_ASSERT(ds4_session_eval(single_a, seg_a[0], err, sizeof(err)) == 0);
+    seg_a[1] = ds4_session_argmax(single_a);
+    TEST_ASSERT(ds4_session_eval(single_a, seg_a[1], err, sizeof(err)) == 0);
+    seg_b[0] = ds4_session_argmax(single_b);
+    TEST_ASSERT(ds4_session_eval(single_b, seg_b[0], err, sizeof(err)) == 0);
+    ds4_batch_prefill_segment segments[2] = {
+        { .slot = 2, .tokens = seg_a, .n_tokens = 2, .refresh_logits = 1 },
+        { .slot = 0, .tokens = seg_b, .n_tokens = 1, .refresh_logits = 1 },
+    };
+    TEST_ASSERT(ds4_batch_prefill_segments(batch, segments, 2, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_batch_argmax(batch, 2) == ds4_session_argmax(single_a));
+    TEST_ASSERT(ds4_batch_argmax(batch, 0) == ds4_session_argmax(single_b));
+
+    const uint64_t payload_bytes = ds4_batch_slot_payload_bytes(batch, 2);
+    TEST_ASSERT(payload_bytes > 0);
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(ds4_batch_save_slot_payload(batch, 2, fp, err, sizeof(err)) == 0);
+        rewind(fp);
+        TEST_ASSERT(ds4_batch_load_slot_payload(batch, 1, fp, payload_bytes,
+                                                err, sizeof(err)) == 0);
+        const ds4_tokens *slot2_tokens = ds4_batch_tokens(batch, 2);
+        TEST_ASSERT(slot2_tokens != NULL);
+        TEST_ASSERT(ds4_batch_common_prefix(batch, 1, slot2_tokens) == slot2_tokens->len);
+        uint64_t rng_src = 303;
+        uint64_t rng_dst = 303;
+        TEST_ASSERT(ds4_batch_sample(batch, 2, 0.0f, 0, 1.0f, 0.0f, &rng_src) ==
+                    ds4_batch_sample(batch, 1, 0.0f, 0, 1.0f, 0.0f, &rng_dst));
+        fclose(fp);
+    }
+
+    FILE *bad = tmpfile();
+    TEST_ASSERT(bad != NULL);
+    if (bad) {
+        fputs("not a valid payload", bad);
+        rewind(bad);
+        TEST_ASSERT(ds4_batch_load_slot_payload(batch, 0, bad, 17,
+                                                err, sizeof(err)) != 0);
+        TEST_ASSERT(!ds4_batch_slot_payload_valid(batch, 0));
+        TEST_ASSERT(ds4_batch_slot_payload_valid(batch, 2));
+        fclose(bad);
+    }
+
+    uint64_t rng_top = 404;
+    uint64_t rng_single_top = 404;
+    int top_token = ds4_batch_sample(batch, 2, 0.0f, 0, 1.0f, 0.0f, &rng_top);
+    int single_top_token = ds4_session_sample(single_a, 0.0f, 0, 1.0f, 0.0f, &rng_single_top);
+    TEST_ASSERT(top_token == single_top_token);
+    ds4_batch_step top_step = { .slot = 2, .token = top_token };
+    int top_id = -1;
+    TEST_ASSERT(ds4_batch_eval_top(batch, &top_step, 1, &top_id, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(single_a, single_top_token, err, sizeof(err)) == 0);
+    TEST_ASSERT(top_id == ds4_session_argmax(single_a));
+    TEST_ASSERT(!ds4_batch_slot_logits_valid(batch, 2));
+    TEST_ASSERT(!ds4_batch_slot_payload_valid(batch, 2));
+
+    ds4_batch_free(batch);
+    ds4_session_free(single_b);
+    ds4_session_free(single_a);
+    ds4_tokens_free(&prompt_a);
+    ds4_tokens_free(&prompt_b);
+}
+
+static void test_batch_api_all(void) {
+    test_batch_api_session_slots();
+    test_batch_api_shared_decode();
+}
+
 static const char *test_tool_call_request_json(void) {
     return
         "{"
@@ -1615,6 +1952,8 @@ static const ds4_test_entry test_entries[] = {
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
+    {"--batch-api", "batch-api", "public batch API contract", test_batch_api_all},
+    {"--batch-shared", "batch-shared", "public batch API shared-decode contract", test_batch_api_shared_decode},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif

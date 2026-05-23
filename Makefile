@@ -27,6 +27,7 @@ DS4_BATCH_BENCH_TRIALS ?= 1
 DS4_BATCH_BENCH_CTX ?= 512
 DS4_BATCH_BENCH_PREFILL_REPEATS ?= 6
 DS4_BATCH_BENCH_EXTRA ?= --prefill-unique-suffix --expect-prefill-fanout --expect-prefill-batch --expect-prefill-chunk
+DS4_BATCH_BENCH_OUT ?= /tmp/ds4-batch-bench
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -48,7 +49,7 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test server-batch-smoke server-batch-metrics server-batch-benchmark cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test server-batch-smoke server-batch-metrics server-batch-metrics-decode-medium server-batch-metrics-mixed-medium server-batch-metrics-mixed-shared-medium server-batch-benchmark server-batch-benchmark-compare server-batch-benchmark-stress cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-eval-http ds4-agent
@@ -62,8 +63,18 @@ help:
 	@echo "                    Run experimental server batch integration checks"
 	@echo "  make server-batch-metrics"
 	@echo "                    Capture experimental server batch efficiency metrics"
+	@echo "  make server-batch-metrics-decode-medium"
+	@echo "                    Capture slots 1/2/4/8 decode-heavy metrics"
+	@echo "  make server-batch-metrics-mixed-medium"
+	@echo "                    Capture slots 1/2/4/8 mixed prefill+decode metrics"
+	@echo "  make server-batch-metrics-mixed-shared-medium"
+	@echo "                    Capture shared-decode mixed prefill+decode metrics"
 	@echo "  make server-batch-benchmark"
 	@echo "                    Run old-style batch benchmark labels/workloads"
+	@echo "  make server-batch-benchmark-compare"
+	@echo "                    Compare serialized vs shared-decode for decode and prefill"
+	@echo "  make server-batch-benchmark-stress"
+	@echo "                    Run a heavier mixed prefill stress benchmark"
 	@echo "  make clean        Remove build outputs"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -107,8 +118,18 @@ help:
 	@echo "  make server-batch-smoke  Run experimental server batch integration checks"
 	@echo "  make server-batch-metrics"
 	@echo "                          Capture experimental server batch efficiency metrics"
+	@echo "  make server-batch-metrics-decode-medium"
+	@echo "                          Capture slots 1/2/4/8 decode-heavy metrics"
+	@echo "  make server-batch-metrics-mixed-medium"
+	@echo "                          Capture slots 1/2/4/8 mixed prefill+decode metrics"
+	@echo "  make server-batch-metrics-mixed-shared-medium"
+	@echo "                          Capture shared-decode mixed prefill+decode metrics"
 	@echo "  make server-batch-benchmark"
 	@echo "                          Run old-style batch benchmark labels/workloads"
+	@echo "  make server-batch-benchmark-compare"
+	@echo "                          Compare serialized vs shared-decode for decode and prefill"
+	@echo "  make server-batch-benchmark-stress"
+	@echo "                          Run a heavier mixed prefill stress benchmark"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
@@ -247,8 +268,28 @@ server-batch-smoke: ds4-server
 server-batch-metrics: ds4-server
 	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --backend "$(DS4_BATCH_METRIC_BACKEND)" --slots "$(DS4_BATCH_METRIC_SLOTS)" --tokens "$(DS4_BATCH_METRIC_TOKENS)" $(if $(strip $(DS4_BATCH_METRIC_CONCURRENCY)),--concurrency "$(DS4_BATCH_METRIC_CONCURRENCY)") $(if $(strip $(DS4_BATCH_METRIC_REQUESTS)),--requests "$(DS4_BATCH_METRIC_REQUESTS)") $(if $(strip $(DS4_BATCH_METRIC_JSON)),--json-out "$(DS4_BATCH_METRIC_JSON)")
 
+server-batch-metrics-decode-medium: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)/logs-decode-medium"
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 512 --backend session-slots --slots 1,2,4,8 --tokens 64 --prompt-mode long-decode --requests 16 --warmup-requests 1 --request-timeout 600 --json-out "$(DS4_BATCH_BENCH_OUT)/decode-medium.json" --log-dir "$(DS4_BATCH_BENCH_OUT)/logs-decode-medium"
+
+server-batch-metrics-mixed-medium: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)/logs-mixed-medium"
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 2048 --backend session-slots --slots 1,2,4,8 --tokens 32 --prompt-mode mixed --prefill-repeats 30 --experimental-batched-prefill --requests 16 --warmup-requests 1 --request-timeout 600 --json-out "$(DS4_BATCH_BENCH_OUT)/mixed-medium.json" --log-dir "$(DS4_BATCH_BENCH_OUT)/logs-mixed-medium"
+
+server-batch-metrics-mixed-shared-medium: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)/logs-mixed-shared-medium"
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 2048 --backend shared-decode --slots 1,2,4,8 --tokens 32 --prompt-mode mixed --prefill-repeats 30 --experimental-batched-prefill --requests 16 --warmup-requests 1 --request-timeout 600 --json-out "$(DS4_BATCH_BENCH_OUT)/mixed-shared-medium.json" --log-dir "$(DS4_BATCH_BENCH_OUT)/logs-mixed-shared-medium"
+
 server-batch-benchmark: ds4-server
 	python3 tests/server_batch_smoke.py benchmark --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx "$(DS4_BATCH_BENCH_CTX)" --workload "$(DS4_BATCH_BENCH_WORKLOAD)" --clients "$(DS4_BATCH_BENCH_CLIENTS)" --labels "$(DS4_BATCH_BENCH_LABELS)" --trials "$(DS4_BATCH_BENCH_TRIALS)" --prefill-repeats "$(DS4_BATCH_BENCH_PREFILL_REPEATS)" $(DS4_BATCH_BENCH_EXTRA)
+
+server-batch-benchmark-compare: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)"
+	python3 tests/server_batch_smoke.py benchmark --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 2048 --workload both --clients 2,4 --labels serialized,shared-decode --trials 1 --max-tokens 64 --prefill-repeats 30 --prefill-max-tokens 1 --prefill-unique-suffix --request-timeout 600 --progress | tee "$(DS4_BATCH_BENCH_OUT)/benchmark-compare.txt"
+
+server-batch-benchmark-stress: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)/logs-mixed-stress"
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 4096 --backend shared-decode --slots 1,2,4,8 --tokens 32 --prompt-mode mixed --prefill-repeats 80 --experimental-batched-prefill --requests 16 --warmup-requests 1 --request-timeout 900 --json-out "$(DS4_BATCH_BENCH_OUT)/mixed-stress.json" --log-dir "$(DS4_BATCH_BENCH_OUT)/logs-mixed-stress"
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-eval-http ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

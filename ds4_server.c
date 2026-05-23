@@ -11360,7 +11360,7 @@ static int batch_prefill_step_limit_tokens(void) {
         long v = strtol(env, &end, 10);
         if (end != env && *end == '\0' && v > 0 && v <= INT_MAX) return (int)v;
     }
-    return 512;
+    return INT_MAX;
 }
 
 static int batch_prefill_fanout_min_tokens(void) {
@@ -11371,6 +11371,11 @@ static int batch_prefill_fanout_min_tokens(void) {
         if (end != env && *end == '\0' && v >= 0 && v <= INT_MAX) return (int)v;
     }
     return 512;
+}
+
+static bool batch_session_segmented_prefill_enabled(void) {
+    const char *env = getenv("DS4_BATCH_SESSION_SEGMENTED_PREFILL");
+    return env && env[0] && strcmp(env, "0") != 0;
 }
 
 static int batch_prefill_stop_at_checkpoint(server *s, generation_state *g,
@@ -11890,6 +11895,10 @@ static bool batch_admit_job(server *s, batch_request *reqs, job *j) {
         }
     }
 
+    if (cached == 0 && !strcmp(ds4_batch_backend_name(s->batch), "shared-decode")) {
+        ds4_batch_invalidate_slot(s->batch, slot);
+    }
+
     reqs[slot].phase = BATCH_REQ_PREFILL;
     j->slot = slot;
     generation_state_begin(s, &reqs[slot].gen, j, slot, cached,
@@ -12110,6 +12119,10 @@ static bool batch_prefill_many(server *s, batch_request *reqs) {
     if (!s->experimental_batched_prefill || !s->batch) return false;
     if (batch_decode_ready_count(reqs, s->batch_slots) > 0) return false;
     if (batch_prefill_shared_prefix_many(s, reqs)) return true;
+    if (strcmp(ds4_batch_backend_name(s->batch), "shared-decode") &&
+        !batch_session_segmented_prefill_enabled()) {
+        return false;
+    }
 
     int candidates[DS4_BATCH_MAX_SLOTS];
     int n_candidates = 0;

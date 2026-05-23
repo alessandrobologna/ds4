@@ -587,15 +587,34 @@ def run_batched_prefill(args: argparse.Namespace) -> None:
     env.setdefault("DS4_BATCH_PREFILL_FANOUT_MIN_TOKENS", "16")
     env.setdefault("DS4_BATCH_PREFILL_STEP_LIMIT_TOKENS", "256")
     env.setdefault("DS4_BATCH_PREFILL_WAIT_US", "100000")
+    env["DS4_BATCH_SESSION_SEGMENTED_PREFILL"] = "0"
     try:
         def make_argv(port: int) -> list[str]:
             return server_argv(args, port, 2)
 
+        segment_prompts = [
+            make_prefill_prompt("prefill alpha"),
+            make_prefill_prompt("prefill beta"),
+        ]
         with server_with_retries(make_argv, env=env) as (server, port):
-            segment_prompts = [
-                make_prefill_prompt("prefill alpha"),
-                make_prefill_prompt("prefill beta"),
-            ]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(run_completion, port, prompt, 1, args.request_timeout)
+                    for prompt in segment_prompts
+                ]
+                results = resolve_futures(futures, server, "segmented prefill")
+            segment_logs = count_logs(server.lines, "prefill=segment")
+            if segment_logs > 0:
+                raise CheckError(
+                    "session-slots default unexpectedly used segmented prefill:\n"
+                    + "\n".join(server.lines[-80:])
+                )
+            if any(r["completion_tokens"] <= 0 for r in results):
+                raise CheckError(f"default prefill requests did not complete: {results}")
+
+        segmented_env = env.copy()
+        segmented_env["DS4_BATCH_SESSION_SEGMENTED_PREFILL"] = "1"
+        with server_with_retries(make_argv, env=segmented_env) as (server, port):
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 futures = [
                     pool.submit(run_completion, port, prompt, 1, args.request_timeout)
@@ -605,11 +624,37 @@ def run_batched_prefill(args: argparse.Namespace) -> None:
             segment_logs = count_logs(server.lines, "prefill=segment")
             if segment_logs <= 0:
                 raise CheckError(
-                    "experimental batched prefill did not use segment API:\n"
+                    "opt-in session-slots batched prefill did not use segment API:\n"
                     + "\n".join(server.lines[-80:])
                 )
             if any(r["completion_tokens"] <= 0 for r in results):
-                raise CheckError(f"batched prefill requests did not complete: {results}")
+                raise CheckError(f"opt-in batched prefill requests did not complete: {results}")
+
+        def make_shared_argv(port: int) -> list[str]:
+            return server_argv(args, port, 2, backend="shared-decode")
+
+        with server_with_retries(make_shared_argv, env=env) as (server, port):
+            previous_segments = 0
+            for label in ("first", "reused"):
+                prompts = [
+                    make_prefill_prompt(f"shared {label} gamma"),
+                    make_prefill_prompt(f"shared {label} delta"),
+                ]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [
+                        pool.submit(run_completion, port, prompt, 1, args.request_timeout)
+                        for prompt in prompts
+                    ]
+                    shared_results = resolve_futures(futures, server, f"{label} shared prefill")
+                shared_segments = count_logs(server.lines, "prefill=segment")
+                if shared_segments <= previous_segments:
+                    raise CheckError(
+                        f"{label} shared-decode batched prefill did not use segment API:\n"
+                        + "\n".join(server.lines[-80:])
+                    )
+                if any(r["completion_tokens"] <= 0 for r in shared_results):
+                    raise CheckError(f"{label} shared-decode prefill requests did not complete")
+                previous_segments = shared_segments
 
         with server_with_retries(make_argv, env=env) as (server, port):
             shared = make_prefill_prompt("shared prefill fanout")

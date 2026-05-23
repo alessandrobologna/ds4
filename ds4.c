@@ -19227,7 +19227,8 @@ static bool batch_shared_make_slot_graph_view(ds4_batch_private_shared_decode *s
         if (ratio == 0) continue;
 
         const uint64_t attn_comp_bytes =
-            (uint64_t)base->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+            (uint64_t)base->layer_comp_cap[il] *
+            metal_graph_attn_comp_cache_row_bytes();
         const uint64_t attn_state_bytes = batch_shared_attn_state_bytes(ratio);
         out->layer_attn_comp_cache[il] =
             ds4_gpu_tensor_view(base->layer_attn_comp_cache[il],
@@ -20411,13 +20412,15 @@ static bool metal_graph_update_compressor_session_rows(
         ds4_gpu_tensor *comp_cache = indexer ?
             slot_g->layer_index_comp_cache[il] :
             slot_g->layer_attn_comp_cache[il];
+        ds4_gpu_tensor *comp_update_target = indexer ?
+            comp_cache : metal_graph_attn_comp_update_target(slot_g, il);
 
         ok = kv_view && score_view &&
              ds4_gpu_compressor_update_tensor(kv_view,
                                               score_view,
                                               state_kv,
                                               state_score,
-                                              comp_cache,
+                                              comp_update_target,
                                               model->map,
                                               model->size,
                                               ape_offset,
@@ -20427,7 +20430,8 @@ static bool metal_graph_update_compressor_session_rows(
                                               head_dim,
                                               ratio,
                                               pos,
-                                              comp_row,
+                                              indexer ? comp_row :
+                                              metal_graph_attn_comp_update_row(comp_row),
                                               n_rot,
                                               n_ctx_orig,
                                               freq_base,
@@ -20442,10 +20446,11 @@ static bool metal_graph_update_compressor_session_rows(
         if (!ok) break;
 
         if (emit) {
-            ds4_gpu_tensor *comp_view = ds4_gpu_tensor_view(
-                    comp_cache,
-                    (uint64_t)comp_row * head_dim * sizeof(float),
-                    (uint64_t)head_dim * sizeof(float));
+            ds4_gpu_tensor *comp_view = indexer ?
+                ds4_gpu_tensor_view(comp_cache,
+                                    (uint64_t)comp_row * head_dim * sizeof(float),
+                                    (uint64_t)head_dim * sizeof(float)) :
+                metal_graph_attn_comp_row_view(slot_g, il, comp_row);
             ok = comp_view != NULL;
             if (ok) {
                 ok = indexer ?
@@ -20453,6 +20458,7 @@ static bool metal_graph_update_compressor_session_rows(
                     ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_view, 1, head_dim, DS4_N_ROT) != 0;
             }
             ds4_gpu_tensor_free(comp_view);
+            if (ok && !indexer) ok = metal_graph_commit_attn_comp_stage(slot_g, il, comp_row, 1);
             if (ok) (*counter)++;
         }
         if (row_counts) row_counts[i] = *counter;
@@ -20486,6 +20492,7 @@ static bool metal_graph_encode_segmented_session_rows_attention(
         const uint32_t      *row_n_comp,
         const uint32_t      *row_n_index_comp) {
     if (!work || !e || !sessions || n_sessions <= 1 || !work->batch_attn_rows ||
+        DS4_GPU_ATTN_COMP_CACHE_F16 ||
         getenv("DS4_BATCH_DISABLE_SEGMENTED_DIRECT_ATTENTION") != NULL) {
         return false;
     }
@@ -21461,9 +21468,21 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                     fprintf(stderr, "ds4: Metal shared prefill compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
+                if (ok && !is_indexer && DS4_GPU_ATTN_COMP_CACHE_F16 &&
+                    n_comp > slot_g->attn_comp_stage_cap) {
+                    fprintf(stderr, "ds4: Metal shared prefill compressed KV staging capacity exceeded at layer %u\n", il);
+                    ok = false;
+                }
+                ds4_gpu_tensor *comp_target = NULL;
+                if (ok) {
+                    comp_target = is_indexer ?
+                        comp_cache :
+                        metal_graph_attn_comp_prefill_target(slot_g, il, 0, n_comp);
+                    if (!comp_target) ok = false;
+                }
                 if (ok) {
                     ok = ds4_gpu_compressor_prefill_tensor(
-                            comp_cache,
+                            comp_target,
                             state_kv,
                             state_score,
                             kv_view,
@@ -21489,6 +21508,9 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                             DS4_ROPE_YARN_BETA_SLOW,
                             DS4_RMS_EPS) != 0;
                 }
+                if (ok && !is_indexer) {
+                    ok = metal_graph_commit_attn_comp_stage(slot_g, il, 0, n_comp);
+                }
                 if (ok && ratio == 4 && n_tokens >= 4) {
                     ok = metal_graph_prefill_refresh_ratio4_compressor_state(
                             work,
@@ -21505,6 +21527,9 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                             n_tokens);
                 }
                 if (ok) *counter = n_comp;
+                if (!is_indexer && comp_target) {
+                    metal_graph_attn_comp_prefill_target_free(comp_target);
+                }
             } else if (ok && (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u) {
                 const uint32_t comp_before = *counter;
                 const uint32_t comp_chunk = n_tokens / ratio;
@@ -21512,12 +21537,20 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                     fprintf(stderr, "ds4: Metal shared prefill compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
+                if (ok && !is_indexer && DS4_GPU_ATTN_COMP_CACHE_F16 &&
+                    comp_chunk > slot_g->attn_comp_stage_cap) {
+                    fprintf(stderr, "ds4: Metal shared prefill compressed KV staging capacity exceeded at layer %u\n", il);
+                    ok = false;
+                }
                 ds4_gpu_tensor *comp_view = NULL;
                 if (ok) {
-                    comp_view = ds4_gpu_tensor_view(
-                            comp_cache,
-                            (uint64_t)comp_before * head_dim * sizeof(float),
-                            (uint64_t)comp_chunk * head_dim * sizeof(float));
+                    comp_view = is_indexer ?
+                        ds4_gpu_tensor_view(comp_cache,
+                                            (uint64_t)comp_before * head_dim * sizeof(float),
+                                            (uint64_t)comp_chunk * head_dim * sizeof(float)) :
+                        metal_graph_attn_comp_prefill_target(slot_g, il,
+                                                             comp_before,
+                                                             comp_chunk);
                     ok = comp_view != NULL;
                 }
                 if (ok && ratio == 4) {
@@ -21572,7 +21605,12 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                             attn_factor,
                             DS4_ROPE_YARN_BETA_FAST,
                             DS4_ROPE_YARN_BETA_SLOW,
-                            DS4_RMS_EPS) != 0;
+	                            DS4_RMS_EPS) != 0;
+	                }
+                if (ok && !is_indexer) {
+                    ok = metal_graph_commit_attn_comp_stage(slot_g, il,
+                                                            comp_before,
+                                                            comp_chunk);
                 }
                 if (ok && ratio == 4 && n_tokens >= 4) {
                     ok = metal_graph_prefill_refresh_ratio4_compressor_state(
@@ -21590,7 +21628,11 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                             n_tokens);
                 }
                 if (ok) *counter = comp_before + comp_chunk;
-                ds4_gpu_tensor_free(comp_view);
+                if (is_indexer) {
+                    ds4_gpu_tensor_free(comp_view);
+                } else {
+                    metal_graph_attn_comp_prefill_target_free(comp_view);
+                }
             } else {
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     const uint32_t pos = pos0 + t;
@@ -21609,12 +21651,14 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                                                      (uint32_t)(span->row0 + (int)t),
                                                      width);
                     const uint32_t comp_row = *counter;
+                    ds4_gpu_tensor *comp_update_target = is_indexer ?
+                        comp_cache : metal_graph_attn_comp_update_target(slot_g, il);
                     ok = row_kv && row_sc &&
                          ds4_gpu_compressor_update_tensor(row_kv,
                                                           row_sc,
                                                           state_kv,
                                                           state_score,
-                                                          comp_cache,
+                                                          comp_update_target,
                                                           model->map,
                                                           model->size,
                                                           ape_offset,
@@ -21624,7 +21668,8 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                                                           head_dim,
                                                           ratio,
                                                           pos,
-                                                          comp_row,
+                                                          is_indexer ? comp_row :
+                                                          metal_graph_attn_comp_update_row(comp_row),
                                                           n_rot,
                                                           n_ctx_orig,
                                                           freq_base,
@@ -21635,16 +21680,20 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                                                           DS4_ROPE_YARN_BETA_SLOW,
                                                           DS4_RMS_EPS) != 0;
                     if (ok && emit && quantize_fp8) {
-                        ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
-                                comp_cache,
-                                (uint64_t)comp_row * head_dim * sizeof(float),
-                                (uint64_t)head_dim * sizeof(float));
+                        ds4_gpu_tensor *comp_row_view = is_indexer ?
+                            ds4_gpu_tensor_view(comp_cache,
+                                                (uint64_t)comp_row * head_dim * sizeof(float),
+                                                (uint64_t)head_dim * sizeof(float)) :
+                            metal_graph_attn_comp_row_view(slot_g, il, comp_row);
                         ok = comp_row_view &&
                              ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
                                                                  1,
                                                                  head_dim,
                                                                  n_rot) != 0;
                         ds4_gpu_tensor_free(comp_row_view);
+                        if (ok && !is_indexer) {
+                            ok = metal_graph_commit_attn_comp_stage(slot_g, il, comp_row, 1);
+                        }
                     }
                     if (ok && emit) (*counter)++;
                     ds4_gpu_tensor_free(row_sc);
@@ -21681,6 +21730,8 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
         ds4_gpu_tensor *comp_cache = is_indexer ?
             slot_g->layer_index_comp_cache[il] :
             slot_g->layer_attn_comp_cache[il];
+        ds4_gpu_tensor *comp_update_target = is_indexer ?
+            comp_cache : metal_graph_attn_comp_update_target(slot_g, il);
         const uint32_t pos = rows[i].pos;
         const bool emit = ((pos + 1u) % ratio) == 0u;
         if (emit && *counter >= slot_g->layer_comp_cap[il]) {
@@ -21700,7 +21751,7 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                                               sc_view,
                                               state_kv,
                                               state_score,
-                                              comp_cache,
+                                              comp_update_target,
                                               model->map,
                                               model->size,
                                               ape_offset,
@@ -21710,7 +21761,8 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                                               head_dim,
                                               ratio,
                                               pos,
-                                              comp_row,
+                                              is_indexer ? comp_row :
+                                              metal_graph_attn_comp_update_row(comp_row),
                                               n_rot,
                                               n_ctx_orig,
                                               freq_base,
@@ -21721,16 +21773,20 @@ static bool metal_graph_update_compressor_prefill_rows_or_spans(
                                               DS4_ROPE_YARN_BETA_SLOW,
                                               DS4_RMS_EPS) != 0;
         if (ok && emit && quantize_fp8) {
-            ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
-                    comp_cache,
-                    (uint64_t)comp_row * head_dim * sizeof(float),
-                    (uint64_t)head_dim * sizeof(float));
+            ds4_gpu_tensor *comp_row_view = is_indexer ?
+                ds4_gpu_tensor_view(comp_cache,
+                                    (uint64_t)comp_row * head_dim * sizeof(float),
+                                    (uint64_t)head_dim * sizeof(float)) :
+                metal_graph_attn_comp_row_view(slot_g, il, comp_row);
             ok = comp_row_view &&
                  ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
                                                      1,
                                                      head_dim,
                                                      n_rot) != 0;
             ds4_gpu_tensor_free(comp_row_view);
+            if (ok && !is_indexer) {
+                ok = metal_graph_commit_attn_comp_stage(slot_g, il, comp_row, 1);
+            }
         }
         if (ok && emit) (*counter)++;
         row_counts[i] = *counter;
@@ -22948,15 +23004,25 @@ static bool metal_graph_encode_shared_prefill_rows(
                                                         spans,
                                                         &n_spans);
     bool has_multirow_span = false;
+    bool equal_span_lengths = true;
+    int first_span_rows = 0;
     for (int i = 0; ok && i < n_spans; i++) {
+        if (i == 0) {
+            first_span_rows = spans[i].n_rows;
+        } else if (spans[i].n_rows != first_span_rows) {
+            equal_span_lengths = false;
+        }
         if (spans[i].n_rows > 1) {
             has_multirow_span = true;
-            break;
         }
     }
     const bool can_use_span_attention =
         has_multirow_span &&
+        equal_span_lengths &&
         metal_graph_prefill_spans_can_use_batch_attention(spans, n_spans);
+    const ds4_shared_prefill_span *active_spans =
+        can_use_span_attention ? spans : NULL;
+    const int n_active_spans = can_use_span_attention ? n_spans : 0;
 
     const uint32_t split_after_layers = metal_graph_token_split_layers();
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -22977,8 +23043,8 @@ static bool metal_graph_encode_shared_prefill_rows(
             !use_precomputed_span_attention) {
             ok = metal_graph_encode_prefill_span_attention_batches(work,
                                                                    e,
-                                                                   spans,
-                                                                   n_spans,
+                                                                   active_spans,
+                                                                   n_active_spans,
                                                                    il);
             if (ok) {
                 ds4_gpu_tensor *attn_rows = work->batch_next_hc;
@@ -22998,8 +23064,8 @@ static bool metal_graph_encode_shared_prefill_rows(
                                                            rows,
                                                            n_rows,
                                                            il,
-                                                           spans,
-                                                           n_spans,
+                                                           active_spans,
+                                                           n_active_spans,
                                                            use_segmented_attention);
             if (ok) ok = metal_graph_encode_layer_ffn_batch(work,
                                                             &e->model,
@@ -23190,7 +23256,13 @@ static int ds4_session_eval_many_gpu(ds4_session **sessions, const int *tokens,
     if (getenv("DS4_SHARED_DECODE_LEGACY_LAYER_LOOP") != NULL) {
         return 2;
     }
-    ds4_gpu_graph *work = &sessions[0]->graph;
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 &&
+        getenv("DS4_BATCH_ENABLE_F16_SHARED_DECODE") == NULL) {
+        return 2;
+    }
+    ds4_gpu_graph *work = metal_graph_shared_storage_base_for_sessions(sessions,
+                                                                       n_sessions);
+    if (!work) work = &sessions[0]->graph;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     if ((uint32_t)n_sessions > work->prefill_cap ||
         !metal_graph_ensure_spec_logits(work, (uint32_t)n_sessions)) {
@@ -23477,7 +23549,9 @@ static int ds4_session_prefill_segments_many_gpu(
     }
     if (max_len <= 0) return 0;
 
-    ds4_gpu_graph *work = &sessions[0]->graph;
+    ds4_gpu_graph *work = metal_graph_shared_storage_base_for_sessions(sessions,
+                                                                       n_segments);
+    if (!work) work = &sessions[0]->graph;
     {
         int rc = ds4_session_prefill_segments_many_shared_gpu(sessions,
                                                               tokens,
@@ -23512,7 +23586,10 @@ static int ds4_session_prefill_segments_many_gpu(
             ok = false;
             break;
         }
-        ok = metal_graph_encode_session_decode_rows(&active_sessions[0]->graph,
+        ds4_gpu_graph *active_work =
+            metal_graph_shared_storage_base_for_sessions(active_sessions, n_active);
+        if (!active_work) active_work = &active_sessions[0]->graph;
+        ok = metal_graph_encode_session_decode_rows(active_work,
                                                     e,
                                                     active_sessions,
                                                     active_tokens,
@@ -23522,7 +23599,7 @@ static int ds4_session_prefill_segments_many_gpu(
         for (int k = 0; ok && k < n_active; k++) {
             ok = ds4_gpu_tensor_copy(active_sessions[k]->graph.cur_hc,
                                      0,
-                                     active_sessions[0]->graph.batch_cur_hc,
+                                     active_work->batch_cur_hc,
                                      (uint64_t)k * hc_dim * sizeof(float),
                                      hc_dim * sizeof(float)) != 0;
         }

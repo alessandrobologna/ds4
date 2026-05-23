@@ -706,7 +706,7 @@ int ds4_batch_prefill_segments(ds4_batch *b,
         refresh_logits[i] = segments[i].refresh_logits != 0;
         if (i > 0 && segment_lengths[i] != segment_lengths[0]) equal_lengths = false;
     }
-    if (b->backend == DS4_BATCH_BACKEND_SHARED_DECODE || equal_lengths) {
+    if (equal_lengths) {
         if (ds4_session_prefill_segments_many(sessions,
                                               segment_tokens,
                                               segment_lengths,
@@ -729,17 +729,48 @@ int ds4_batch_prefill_segments(ds4_batch *b,
             ds4_session *active_sessions[DS4_BATCH_MAX_SLOTS] = {0};
             int active_tokens[DS4_BATCH_MAX_SLOTS] = {0};
             int active_index[DS4_BATCH_MAX_SLOTS] = {0};
+            int active_slots[DS4_BATCH_MAX_SLOTS] = {0};
             int n_active = 0;
             for (int i = 0; i < n_segments; i++) {
                 if (offsets[i] >= segments[i].n_tokens) continue;
                 active_sessions[n_active] = sessions[i];
                 active_tokens[n_active] = segments[i].tokens[offsets[i]];
                 active_index[n_active] = i;
+                active_slots[n_active] = segments[i].slot;
                 n_active++;
             }
             if (n_active <= 0) break;
-            if (ds4_session_eval_many(active_sessions, active_tokens, n_active,
-                                      err, errlen) != 0) {
+            if (b->backend != DS4_BATCH_BACKEND_SHARED_DECODE) {
+                for (int i = 1; i < n_active; i++) {
+                    ds4_session *session = active_sessions[i];
+                    int token = active_tokens[i];
+                    int index = active_index[i];
+                    int slot = active_slots[i];
+                    int j = i - 1;
+                    while (j >= 0 && active_slots[j] > slot) {
+                        active_sessions[j + 1] = active_sessions[j];
+                        active_tokens[j + 1] = active_tokens[j];
+                        active_index[j + 1] = active_index[j];
+                        active_slots[j + 1] = active_slots[j];
+                        j--;
+                    }
+                    active_sessions[j + 1] = session;
+                    active_tokens[j + 1] = token;
+                    active_index[j + 1] = index;
+                    active_slots[j + 1] = slot;
+                }
+            }
+            int rc = 0;
+            if (b->backend == DS4_BATCH_BACKEND_SHARED_DECODE) {
+                for (int k = 0; rc == 0 && k < n_active; k++) {
+                    rc = ds4_session_eval(active_sessions[k], active_tokens[k],
+                                          err, errlen);
+                }
+            } else {
+                rc = ds4_session_eval_many(active_sessions, active_tokens, n_active,
+                                           err, errlen);
+            }
+            if (rc != 0) {
                 batch_shared_detach_segments(b, segments, sessions, attached,
                                              n_segments, false);
                 for (int k = 0; k < n_segments; k++) {

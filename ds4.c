@@ -20825,22 +20825,35 @@ static bool metal_graph_encode_session_decode_rows_attention(
             fprintf(stderr, "ds4: batched decode needs attention compressor weights\n");
             ok = false;
         }
-        if (ok) ok = ds4_gpu_matmul_f16_tensor(work->batch_comp_kv,
-                                                 model->map,
-                                                 model->size,
-                                                 layer->attn_compressor_kv->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 comp_width,
-                                                 work->batch_attn_norm,
-                                                 n_tokens) != 0;
-        if (ok) ok = ds4_gpu_matmul_f16_tensor(work->batch_comp_sc,
-                                                 model->map,
-                                                 model->size,
-                                                 layer->attn_compressor_gate->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 comp_width,
-                                                 work->batch_attn_norm,
-                                                 n_tokens) != 0;
+        if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
+            ok = ds4_gpu_matmul_f16_pair_tensor(work->batch_comp_kv,
+                                                  work->batch_comp_sc,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->attn_compressor_kv->abs_offset,
+                                                  layer->attn_compressor_gate->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  comp_width,
+                                                  work->batch_attn_norm,
+                                                  n_tokens) != 0;
+        } else {
+            if (ok) ok = ds4_gpu_matmul_f16_tensor(work->batch_comp_kv,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->attn_compressor_kv->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     comp_width,
+                                                     work->batch_attn_norm,
+                                                     n_tokens) != 0;
+            if (ok) ok = ds4_gpu_matmul_f16_tensor(work->batch_comp_sc,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->attn_compressor_gate->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     comp_width,
+                                                     work->batch_attn_norm,
+                                                     n_tokens) != 0;
+        }
         if (ok) ok = metal_graph_update_compressor_session_rows(
                 model,
                 work->batch_comp_kv,
@@ -20873,22 +20886,35 @@ static bool metal_graph_encode_session_decode_rows_attention(
                 fprintf(stderr, "ds4: batched decode needs indexer compressor weights\n");
                 ok = false;
             }
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(work->batch_comp_kv,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->indexer_compressor_kv->abs_offset,
-                                                     DS4_N_EMBD,
-                                                     index_width,
-                                                     work->batch_attn_norm,
-                                                     n_tokens) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(work->batch_comp_sc,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->indexer_compressor_gate->abs_offset,
-                                                     DS4_N_EMBD,
-                                                     index_width,
-                                                     work->batch_attn_norm,
-                                                     n_tokens) != 0;
+            if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
+                ok = ds4_gpu_matmul_f16_pair_tensor(work->batch_comp_kv,
+                                                      work->batch_comp_sc,
+                                                      model->map,
+                                                      model->size,
+                                                      layer->indexer_compressor_kv->abs_offset,
+                                                      layer->indexer_compressor_gate->abs_offset,
+                                                      DS4_N_EMBD,
+                                                      index_width,
+                                                      work->batch_attn_norm,
+                                                      n_tokens) != 0;
+            } else {
+                if (ok) ok = ds4_gpu_matmul_f16_tensor(work->batch_comp_kv,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->indexer_compressor_kv->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         index_width,
+                                                         work->batch_attn_norm,
+                                                         n_tokens) != 0;
+                if (ok) ok = ds4_gpu_matmul_f16_tensor(work->batch_comp_sc,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->indexer_compressor_gate->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         index_width,
+                                                         work->batch_attn_norm,
+                                                         n_tokens) != 0;
+            }
             if (ok) ok = metal_graph_update_compressor_session_rows(
                     model,
                     work->batch_comp_kv,
@@ -21142,6 +21168,7 @@ static bool metal_graph_encode_session_decode_rows(
 
     const uint32_t split_after_layers = metal_graph_token_split_layers();
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ds4_gpu_push_serial_matmul_rows();
         ok = metal_graph_encode_session_decode_rows_attention(work,
                                                               e,
                                                               sessions,
@@ -21154,6 +21181,7 @@ static bool metal_graph_encode_session_decode_rows(
                                                         il,
                                                         0,
                                                         (uint32_t)n_sessions);
+        ds4_gpu_pop_serial_matmul_rows();
         if (ok) {
             ds4_gpu_tensor *tmp = work->batch_cur_hc;
             work->batch_cur_hc = work->batch_next_hc;
@@ -23254,10 +23282,6 @@ static int ds4_session_eval_many_gpu(ds4_session **sessions, const int *tokens,
                                      char *err, size_t errlen) {
     ds4_engine *e = sessions[0]->engine;
     if (getenv("DS4_SHARED_DECODE_LEGACY_LAYER_LOOP") != NULL) {
-        return 2;
-    }
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 &&
-        getenv("DS4_BATCH_ENABLE_F16_SHARED_DECODE") == NULL) {
         return 2;
     }
     ds4_gpu_graph *work = metal_graph_shared_storage_base_for_sessions(sessions,

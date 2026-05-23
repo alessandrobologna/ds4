@@ -176,6 +176,8 @@ static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
+static int g_force_q8_serial_rows;
+static int g_force_f16_serial_rows;
 
 static uint64_t ds4_gpu_system_memory_bytes(void) {
     uint64_t bytes = 0;
@@ -1450,6 +1452,16 @@ void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
 }
 
+void ds4_gpu_push_serial_matmul_rows(void) {
+    g_force_q8_serial_rows++;
+    g_force_f16_serial_rows++;
+}
+
+void ds4_gpu_pop_serial_matmul_rows(void) {
+    if (g_force_q8_serial_rows > 0) g_force_q8_serial_rows--;
+    if (g_force_f16_serial_rows > 0) g_force_f16_serial_rows--;
+}
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
@@ -2096,6 +2108,16 @@ static ds4_gpu_f16_matvec_args ds4_gpu_make_f16_mv_args(uint64_t in_dim, uint64_
         .r2 = 1,
         .r3 = 1,
     };
+}
+
+static void ds4_gpu_mv_args_set_batch_rows(
+        ds4_gpu_q8_0_matvec_args *args,
+        uint64_t                  in_dim,
+        uint64_t                  n_tok) {
+    args->ne11 = (int32_t)n_tok;
+    args->ne1 = (int32_t)n_tok;
+    args->nb12 = in_dim * n_tok * sizeof(float);
+    args->nb13 = in_dim * n_tok * sizeof(float);
 }
 
 static ds4_gpu_q8_0_matvec_args ds4_gpu_make_f32_mv_args(
@@ -5641,6 +5663,37 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             return 1;
         }
 
+        if (n_tok <= 16 &&
+            (g_force_q8_serial_rows > 0 ||
+             getenv("DS4_METAL_Q8_BATCH_SERIAL_MV") != NULL)) {
+            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+            if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            mv_args.nr0 = mv_dispatch.nr0;
+            ds4_gpu_mv_args_set_batch_rows(&mv_args, in_dim, n_tok);
+            id<MTLComputePipelineState> pipeline =
+                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+            if (!pipeline) return 0;
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+                                                  (NSUInteger)n_tok,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 tensor serial batch matvec")) {
+                return 0;
+            }
+            return 1;
+        }
+
         if (n_tok <= 8 && (in_dim % 128u) == 0) {
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
@@ -5983,6 +6036,41 @@ int ds4_gpu_matmul_f16_tensor(
             return 1;
         }
 
+        if (n_tok <= 16 &&
+            (g_force_f16_serial_rows > 0 ||
+             getenv("DS4_METAL_F16_BATCH_SERIAL_MV") != NULL)) {
+            ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+            ds4_gpu_mv_dispatch mv_dispatch =
+                ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
+            if (!g_quality_mode && (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
+                mv_dispatch.nr0 = 4;
+                mv_dispatch.smem = 32u * 4u * sizeof(float);
+            }
+            mv_args.nr0 = mv_dispatch.nr0;
+            ds4_gpu_mv_args_set_batch_rows(&mv_args, in_dim, n_tok);
+            id<MTLComputePipelineState> pipeline =
+                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+            if (!pipeline) return 0;
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            if (mv_dispatch.smem) {
+                [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+            }
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+                                                  (NSUInteger)n_tok,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 tensor serial batch matvec")) return 0;
+            return 1;
+        }
+
         if (n_tok <= 8 && (in_dim % 128u) == 0) {
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
@@ -6099,14 +6187,16 @@ int ds4_gpu_matmul_f16_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok != 1 || (in_dim & 3u) != 0) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_tok == 0 || n_tok > UINT32_MAX ||
+        (in_dim & 3u) != 0) return 0;
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outabuf = ds4_gpu_tensor_buffer(out_a);
         id<MTLBuffer> outbbuf = ds4_gpu_tensor_buffer(out_b);
-        const uint64_t x_bytes = in_dim * sizeof(float);
-        const uint64_t out_bytes = out_dim * sizeof(float);
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
         if (!xbuf || !outabuf || !outbbuf ||
             ds4_gpu_tensor_bytes(x) < x_bytes ||
             ds4_gpu_tensor_bytes(out_a) < out_bytes ||
@@ -6138,6 +6228,8 @@ int ds4_gpu_matmul_f16_pair_tensor(
         if (!cb) return 0;
 
         ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+        mv_args.ne11 = (int32_t)n_tok;
+        mv_args.ne1 = (int32_t)n_tok;
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
         if (ds4_gpu_use_compressor_pair_nr4() &&
             (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
@@ -6161,7 +6253,7 @@ int ds4_gpu_matmul_f16_pair_tensor(
             [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
         }
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                              1,
+                                              (NSUInteger)n_tok,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);

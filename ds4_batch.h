@@ -25,6 +25,8 @@ typedef struct {
     int ctx_size;
     int max_slots;
     ds4_batch_backend backend;
+    /* Shared-decode prefill scratch rows. 0 keeps the backend default/env. */
+    int prefill_rows;
 } ds4_batch_options;
 
 typedef struct {

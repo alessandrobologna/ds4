@@ -71,7 +71,7 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * Below that size we keep ordinary thinking to avoid injecting a prompt that
  * asks for a reasoning budget the allocated context is not meant to hold. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
-#define DS4_BATCH_PREFILL_ROW_CAP_MAX 8192u
+#define DS4_BATCH_PREFILL_ROW_CAP_DEFAULT 8192u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
@@ -14850,26 +14850,34 @@ static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len) {
     return ds4_default_prefill_cap_for_prompt(prompt_len);
 }
 
-static uint32_t metal_graph_batch_prefill_cap_for_slots(int ctx_size, int max_slots) {
+static uint32_t metal_graph_batch_prefill_cap_for_slots(int ctx_size, int max_slots,
+                                                        int requested_rows) {
     uint32_t base = metal_graph_prefill_cap_for_prompt(ctx_size);
     if (max_slots <= 1) return base;
+    const uint32_t min_rows = (uint32_t)max_slots;
+
+    if (requested_rows > 0) {
+        uint32_t cap = (uint32_t)requested_rows;
+        if (cap < min_rows) cap = min_rows;
+        return cap;
+    }
 
     const char *env = getenv("DS4_BATCH_PREFILL_ROW_CAP");
     if (env && env[0]) {
         char *endp = NULL;
-        const long v = strtol(env, &endp, 10);
-        if (endp != env && v > 0) {
-            uint32_t cap = v > (long)DS4_BATCH_PREFILL_ROW_CAP_MAX ?
-                DS4_BATCH_PREFILL_ROW_CAP_MAX : (uint32_t)v;
-            if (cap < 1u) cap = 1u;
+        errno = 0;
+        const unsigned long v = strtoul(env, &endp, 10);
+        if (endp != env && *endp == '\0' && errno != ERANGE && v > 0) {
+            uint32_t cap = v > UINT32_MAX ? UINT32_MAX : (uint32_t)v;
+            if (cap < min_rows) cap = min_rows;
             return cap;
         }
     }
 
     uint64_t cap = (uint64_t)base * (uint64_t)max_slots;
-    if (cap > DS4_BATCH_PREFILL_ROW_CAP_MAX) cap = DS4_BATCH_PREFILL_ROW_CAP_MAX;
+    if (cap > DS4_BATCH_PREFILL_ROW_CAP_DEFAULT) cap = DS4_BATCH_PREFILL_ROW_CAP_DEFAULT;
     if (cap > UINT32_MAX) cap = UINT32_MAX;
-    if (cap < 1u) cap = 1u;
+    if (cap < min_rows) cap = min_rows;
     return (uint32_t)cap;
 }
 
@@ -19284,10 +19292,11 @@ int ds4_batch_private_shared_create(ds4_batch_private_shared_decode **out,
                                     ds4_engine *e,
                                     int ctx_size,
                                     int max_slots,
+                                    int prefill_rows,
                                     char *err,
                                     size_t errlen) {
     if (!out || !e || ctx_size <= 0 || max_slots <= 0 ||
-        max_slots > DS4_BATCH_PRIVATE_MAX_SLOTS) {
+        max_slots > DS4_BATCH_PRIVATE_MAX_SLOTS || prefill_rows < 0) {
         payload_set_err(err, errlen, "invalid shared batch options");
         return 1;
     }
@@ -19310,7 +19319,8 @@ int ds4_batch_private_shared_create(ds4_batch_private_shared_decode **out,
     sh->max_slots = max_slots;
 
     const uint32_t slot_prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
-    const uint32_t prefill_cap = metal_graph_batch_prefill_cap_for_slots(ctx_size, max_slots);
+    const uint32_t prefill_cap =
+        metal_graph_batch_prefill_cap_for_slots(ctx_size, max_slots, prefill_rows);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, slot_prefill_cap);
     if (!metal_graph_alloc_raw_cap_slots(&sh->shared_graph,
                                          &e->weights,
@@ -23277,6 +23287,72 @@ static int ds4_session_prefill_segments_many_shared_gpu(
     return 0;
 }
 
+static int ds4_session_prefill_segments_many_shared_gpu_chunked(
+        ds4_session      **sessions,
+        const int *const  *tokens,
+        const int         *n_tokens,
+        const int         *refresh_logits,
+        int                n_segments,
+        uint32_t           row_cap,
+        char              *err,
+        size_t             errlen) {
+    if (!sessions || !tokens || !n_tokens || n_segments <= 0 ||
+        n_segments > 64 || row_cap < (uint32_t)n_segments) {
+        return 2;
+    }
+
+    int offsets[64] = {0};
+    int remaining_segments = n_segments;
+    while (remaining_segments > 0) {
+        int n_active_total = 0;
+        for (int i = 0; i < n_segments; i++) {
+            if (offsets[i] < n_tokens[i]) n_active_total++;
+        }
+        if (n_active_total <= 0) break;
+        if ((uint32_t)n_active_total > row_cap) return 2;
+
+        uint32_t rows_per_segment = row_cap / (uint32_t)n_active_total;
+        if (rows_per_segment == 0) return 2;
+        if (rows_per_segment > (uint32_t)INT_MAX) rows_per_segment = (uint32_t)INT_MAX;
+
+        ds4_session *active_sessions[64] = {0};
+        const int *active_tokens[64] = {0};
+        int active_lengths[64] = {0};
+        int active_refresh[64] = {0};
+        int active_index[64] = {0};
+        int n_active = 0;
+        for (int i = 0; i < n_segments; i++) {
+            const int left = n_tokens[i] - offsets[i];
+            if (left <= 0) continue;
+            int take = left < (int)rows_per_segment ? left : (int)rows_per_segment;
+            if (take <= 0) return 2;
+            active_sessions[n_active] = sessions[i];
+            active_tokens[n_active] = tokens[i] + offsets[i];
+            active_lengths[n_active] = take;
+            active_refresh[n_active] = refresh_logits && refresh_logits[i] &&
+                offsets[i] + take == n_tokens[i];
+            active_index[n_active] = i;
+            n_active++;
+        }
+
+        int rc = ds4_session_prefill_segments_many_shared_gpu(active_sessions,
+                                                              active_tokens,
+                                                              active_lengths,
+                                                              active_refresh,
+                                                              n_active,
+                                                              err,
+                                                              errlen);
+        if (rc != 0) return rc;
+
+        for (int k = 0; k < n_active; k++) {
+            const int i = active_index[k];
+            offsets[i] += active_lengths[k];
+            if (offsets[i] == n_tokens[i]) remaining_segments--;
+        }
+    }
+    return 0;
+}
+
 static int ds4_session_eval_many_gpu(ds4_session **sessions, const int *tokens,
                                      int n_sessions, int *top_tokens,
                                      bool full_logits,
@@ -23568,9 +23644,12 @@ static int ds4_session_prefill_segments_many_gpu(
     ds4_engine *e = sessions[0]->engine;
     int max_len = 0;
     int n_logits = 0;
+    int n_rows = 0;
     for (int i = 0; i < n_segments; i++) {
         if (n_tokens[i] > max_len) max_len = n_tokens[i];
         if (refresh_logits && refresh_logits[i]) n_logits++;
+        if (n_tokens[i] > INT_MAX - n_rows) return 2;
+        n_rows += n_tokens[i];
     }
     if (max_len <= 0) return 0;
 
@@ -23585,6 +23664,21 @@ static int ds4_session_prefill_segments_many_gpu(
                                                               n_segments,
                                                               err,
                                                               errlen);
+        if (rc != 2) return rc;
+        if (err && errlen) err[0] = '\0';
+    }
+    if (work && work->prefill_tokens &&
+        work->prefill_cap >= (uint32_t)n_segments &&
+        n_rows > 0 && (uint32_t)n_rows > work->prefill_cap) {
+        int rc = ds4_session_prefill_segments_many_shared_gpu_chunked(
+                sessions,
+                tokens,
+                n_tokens,
+                refresh_logits,
+                n_segments,
+                work->prefill_cap,
+                err,
+                errlen);
         if (rc != 2) return rc;
         if (err && errlen) err[0] = '\0';
     }

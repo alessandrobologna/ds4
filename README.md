@@ -638,8 +638,12 @@ behavior. `--experimental-batched-prefill` routes concurrent prompt segments
 through the public batch prefill API. Shared prefix fanout is implemented with
 public slot snapshots, and divergent prompts use the segmented prefill entry
 point when the live slot frontier is safe to extend. Equal-length prefill
-segments are grouped through one private backend command sequence; uneven
-segments fall back to the interleaved row-batched path.
+segments are grouped through private backend command sequences, chunked by the
+shared prefill scratch budget when needed; uneven segments fall back to the
+interleaved row-batched path. The shared-decode prefill scratch budget defaults
+to a conservative automatic value and can be raised with
+`--batch-prefill-rows N` or `DS4_BATCH_PREFILL_ROW_CAP=N` on machines with
+enough memory.
 
 To capture local batch-efficiency metrics, run:
 

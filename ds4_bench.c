@@ -36,6 +36,7 @@ typedef struct {
     int gen_tokens;
     int power_percent;
     int batch_sessions;
+    int batch_prefill_rows;
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
@@ -93,6 +94,8 @@ static void usage(FILE *fp) {
         "  --batch-sessions N     Run a multi-session sweep instead of the single-session sweep.\n"
         "  --batch-backend NAME   Batch backend for --batch-sessions. Default: shared-decode\n"
         "      Valid names are session-slots and shared-decode.\n"
+        "  --batch-prefill-rows N\n"
+        "      Shared-decode prefill scratch rows. Default: auto/DS4_BATCH_PREFILL_ROW_CAP.\n"
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
@@ -258,6 +261,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.batch_sessions = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--batch-backend")) {
             c.batch_backend = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--batch-prefill-rows")) {
+            c.batch_prefill_rows = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
@@ -694,6 +699,7 @@ static int bench_batch_multisession(
         .ctx_size = cfg->ctx_alloc,
         .max_slots = cfg->batch_sessions,
         .backend = backend,
+        .prefill_rows = cfg->batch_prefill_rows,
     };
     ds4_batch *batch = NULL;
     if (ds4_batch_create_with_options(&batch, engine, &opt, err, errlen) != 0) {

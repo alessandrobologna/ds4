@@ -12852,6 +12852,7 @@ typedef struct {
     bool enable_cors;
     int max_slots;
     int batch_wait_us;
+    int batch_prefill_rows;
     const char *batch_backend;
     bool experimental_batched_prefill;
 } server_config;
@@ -12978,6 +12979,8 @@ static void usage(FILE *fp) {
         "      Experimental decode coalescing wait in microseconds. Default: 500\n"
         "  --batch-backend NAME\n"
         "      Experimental batch backend: session-slots or shared-decode. Default: session-slots\n"
+        "  --batch-prefill-rows N\n"
+        "      Shared-decode prefill scratch rows. Default: auto/DS4_BATCH_PREFILL_ROW_CAP.\n"
         "  --experimental-batched-prefill\n"
         "      Allow compatible batch backends to coalesce prompt prefill work.\n"
         "\n"
@@ -13139,6 +13142,8 @@ static server_config parse_options(int argc, char **argv) {
                 server_log(DS4_LOG_DEFAULT, "ds4-server: valid batch backends are: session-slots, shared-decode");
                 exit(2);
             }
+        } else if (!strcmp(arg, "--batch-prefill-rows")) {
+            c.batch_prefill_rows = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--experimental-batched-prefill")) {
             c.experimental_batched_prefill = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -13260,6 +13265,7 @@ int main(int argc, char **argv) {
             .ctx_size = cfg.ctx_size,
             .max_slots = cfg.max_slots,
             .backend = backend,
+            .prefill_rows = cfg.batch_prefill_rows,
         };
         char err[160];
         if (ds4_batch_create_with_options(&batch, engine, &opt, err, sizeof(err)) != 0) {
@@ -13269,10 +13275,11 @@ int main(int argc, char **argv) {
             return 1;
         }
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: experimental batch backend=%s slots=%d batch_wait_us=%d batched_prefill=%d",
+                   "ds4-server: experimental batch backend=%s slots=%d batch_wait_us=%d batch_prefill_rows=%d batched_prefill=%d",
                    ds4_batch_backend_name(batch),
                    cfg.max_slots,
                    cfg.batch_wait_us,
+                   ds4_batch_prefill_capacity(batch),
                    cfg.experimental_batched_prefill ? 1 : 0);
     } else {
         if (single_slot_mtp_fallback) {
@@ -17216,11 +17223,13 @@ static void test_batch_options_parse(void) {
         "--max-slots", "4",
         "--batch-wait-us", "250",
         "--batch-backend", "session-slots",
+        "--batch-prefill-rows", "16384",
         "--experimental-batched-prefill",
     };
     server_config c = parse_options((int)(sizeof(argv) / sizeof(argv[0])), argv);
     TEST_ASSERT(c.max_slots == 4);
     TEST_ASSERT(c.batch_wait_us == 250);
+    TEST_ASSERT(c.batch_prefill_rows == 16384);
     TEST_ASSERT(c.batch_backend && !strcmp(c.batch_backend, "session-slots"));
     TEST_ASSERT(c.experimental_batched_prefill);
 
@@ -17228,6 +17237,7 @@ static void test_batch_options_parse(void) {
     c = parse_options(1, defaults);
     TEST_ASSERT(c.max_slots == 1);
     TEST_ASSERT(c.batch_wait_us == 500);
+    TEST_ASSERT(c.batch_prefill_rows == 0);
     TEST_ASSERT(c.batch_backend && !strcmp(c.batch_backend, "session-slots"));
     TEST_ASSERT(!c.experimental_batched_prefill);
 }

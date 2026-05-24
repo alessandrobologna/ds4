@@ -11,6 +11,7 @@ int ds4_batch_private_shared_create(ds4_batch_private_shared_decode **out,
                                     ds4_engine *e,
                                     int ctx_size,
                                     int max_slots,
+                                    int prefill_rows,
                                     char *err,
                                     size_t errlen);
 void ds4_batch_private_shared_free(ds4_batch_private_shared_decode *sh);
@@ -309,6 +310,7 @@ int ds4_batch_create_with_options(ds4_batch **out, ds4_engine *e,
                                                 e,
                                                 b->ctx_size,
                                                 b->max_slots,
+                                                opt->prefill_rows,
                                                 err,
                                                 errlen) != 0) {
                 ds4_batch_free(b);

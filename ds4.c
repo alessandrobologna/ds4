@@ -19325,6 +19325,7 @@ int ds4_batch_private_shared_create(ds4_batch_private_shared_decode **out,
         return 1;
     }
     sh->shared_graph.quality = e->quality;
+    sh->shared_graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&sh->shared_graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,

@@ -41,6 +41,7 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     const char *batch_backend;
+    bool batch_common_prefix;
     bool warm_weights;
     bool quality;
 } bench_config;
@@ -96,6 +97,8 @@ static void usage(FILE *fp) {
         "      Valid names are session-slots and shared-decode.\n"
         "  --batch-prefill-rows N\n"
         "      Shared-decode prefill scratch rows. Default: auto/DS4_BATCH_PREFILL_ROW_CAP.\n"
+        "  --batch-common-prefix\n"
+        "      Use the same prompt prefix for every batch slot instead of distinct slices.\n"
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
@@ -263,6 +266,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.batch_backend = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batch-prefill-rows")) {
             c.batch_prefill_rows = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--batch-common-prefix")) {
+            c.batch_common_prefix = true;
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
@@ -546,6 +551,11 @@ static int bench_batch_slice_starts(
         const bench_config *cfg,
         const ds4_tokens   *prompt,
         int                *starts) {
+    if (cfg->batch_common_prefix) {
+        for (int i = 0; i < cfg->batch_sessions; i++) starts[i] = 0;
+        return 0;
+    }
+
     const int max_start = prompt->len - cfg->ctx_max - cfg->gen_tokens - 1;
     if (max_start < cfg->batch_sessions - 1) {
         fprintf(stderr,
@@ -562,6 +572,10 @@ static int bench_batch_slice_starts(
             (int)(((int64_t)max_start * i) / cfg->batch_sessions);
     }
     return 0;
+}
+
+static const char *bench_batch_slice_label(const bench_config *cfg) {
+    return cfg->batch_common_prefix ? "common-prefix" : "distinct-slices";
 }
 
 static int bench_serialized_multisession(
@@ -665,7 +679,8 @@ static int bench_serialized_multisession(
         const double prefill_sec = prefill_t1 - prefill_t0;
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "serialized,serialized,%d,%d,%d,%d,%.2f,%d,%.2f,%llu\n",
+                "serialized,%s,%d,%d,%d,%d,%.2f,%d,%.2f,%llu\n",
+                bench_batch_slice_label(cfg),
                 cfg->batch_sessions,
                 frontier,
                 frontier - previous,
@@ -797,8 +812,9 @@ static int bench_batch_multisession(
         const double prefill_sec = prefill_t1 - prefill_t0;
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "batch,%s,%d,%d,%d,%d,%.2f,%d,%.2f,%llu\n",
+                "batch,%s:%s,%d,%d,%d,%d,%.2f,%d,%.2f,%llu\n",
                 ds4_batch_backend_name(batch),
+                bench_batch_slice_label(cfg),
                 cfg->batch_sessions,
                 frontier,
                 delta,

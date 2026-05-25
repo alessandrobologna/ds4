@@ -20665,6 +20665,19 @@ static bool metal_graph_encode_session_decode_rows_attention(
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
     uint32_t row_n_comp[64] = {0};
     uint32_t row_n_index_comp[64] = {0};
+    const bool shared_decode_stage_profile =
+        getenv("DS4_METAL_SHARED_DECODE_STAGE_PROFILE") != NULL;
+    double shared_decode_stage_t0 = shared_decode_stage_profile ? now_sec() : 0.0;
+#define DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE(name) do { \
+        if (ok && shared_decode_stage_profile) { \
+            ok = metal_graph_layer_stage_profile_boundary("shared_decode_attn", \
+                                                          (name), \
+                                                          il, \
+                                                          0, \
+                                                          n_tokens, \
+                                                          &shared_decode_stage_t0); \
+        } \
+    } while (0)
 
     ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
             work->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
@@ -20718,6 +20731,7 @@ static bool metal_graph_encode_session_decode_rows_attention(
                                                             DS4_N_HC_SINKHORN_ITER,
                                                             DS4_HC_EPS) != 0;
     }
+    DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE("hc_pre");
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(work->batch_attn_norm,
                                                        work->batch_attn_cur,
                                                        model->map,
@@ -20726,6 +20740,7 @@ static bool metal_graph_encode_session_decode_rows_attention(
                                                        DS4_N_EMBD,
                                                        n_tokens,
                                                        DS4_RMS_EPS) != 0;
+    DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE("attn_norm");
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(work->batch_qr,
                                               model->map,
                                               model->size,
@@ -20765,6 +20780,7 @@ static bool metal_graph_encode_session_decode_rows_attention(
                                                            n_tokens,
                                                            DS4_RMS_EPS) != 0;
     }
+    DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE("q_a_kv_path");
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(work->batch_q,
                                               model->map,
                                               model->size,
@@ -20791,6 +20807,7 @@ static bool metal_graph_encode_session_decode_rows_attention(
                                                      freq_scale,
                                                      ext_factor,
                                                      attn_factor);
+    DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE("q_b_rope");
     if (!qkv_rms_fused) {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(work->batch_kv_raw,
                                                   model->map,
@@ -20827,6 +20844,7 @@ static bool metal_graph_encode_session_decode_rows_attention(
                                                        DS4_N_HEAD_DIM,
                                                        DS4_N_ROT) != 0;
     if (ok) ok = metal_graph_store_raw_kv_session_rows(work, sessions, n_sessions, il);
+    DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE("kv_rope_store");
 
     if (ok && compressed) {
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -20982,6 +21000,7 @@ static bool metal_graph_encode_session_decode_rows_attention(
                                                      n_tokens) != 0;
         }
     }
+    DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE("compressor_indexer");
 
     bool segmented_attention_done = false;
     if (ok) {
@@ -21102,6 +21121,8 @@ static bool metal_graph_encode_session_decode_rows_attention(
         ds4_gpu_tensor_free(heads_view);
         ds4_gpu_tensor_free(q_view);
     }
+    DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE(
+            segmented_attention_done ? "attention_segmented" : "attention_fallback");
 
     if (ok) ok = metal_graph_rope_tail_session_rows(work->batch_heads,
                                                      q_dim,
@@ -21130,6 +21151,7 @@ static bool metal_graph_encode_session_decode_rows_attention(
                                                            DS4_N_EMBD,
                                                            work->batch_heads,
                                                            n_tokens) != 0;
+    DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE("output_proj");
     if (ok && metal_graph_directional_steering_attn_enabled(work)) {
         ok = metal_graph_apply_directional_steering_attn(work, work->batch_attn_out, il, n_tokens);
     }
@@ -21144,6 +21166,7 @@ static bool metal_graph_encode_session_decode_rows_attention(
     ds4_gpu_tensor_free(attn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
+#undef DS4_METAL_PROFILE_SHARED_DECODE_ATTENTION_STAGE
     return ok;
 }
 

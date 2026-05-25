@@ -1,5 +1,6 @@
 #include "ds4.h"
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -733,6 +734,7 @@ int ds4_batch_prefill_segments(ds4_batch *b,
             int active_index[DS4_BATCH_MAX_SLOTS] = {0};
             int active_slots[DS4_BATCH_MAX_SLOTS] = {0};
             int n_active = 0;
+            int min_remaining_tokens = INT_MAX;
             for (int i = 0; i < n_segments; i++) {
                 if (offsets[i] >= segments[i].n_tokens) continue;
                 active_sessions[n_active] = sessions[i];
@@ -740,8 +742,45 @@ int ds4_batch_prefill_segments(ds4_batch *b,
                 active_index[n_active] = i;
                 active_slots[n_active] = segments[i].slot;
                 n_active++;
+                const int rem = segments[i].n_tokens - offsets[i];
+                if (rem < min_remaining_tokens) min_remaining_tokens = rem;
             }
             if (n_active <= 0) break;
+            if (b->backend == DS4_BATCH_BACKEND_SHARED_DECODE &&
+                n_active > 1 && min_remaining_tokens > 1) {
+                const int *active_segment_tokens[DS4_BATCH_MAX_SLOTS] = {0};
+                int active_segment_lengths[DS4_BATCH_MAX_SLOTS] = {0};
+                int active_refresh_logits[DS4_BATCH_MAX_SLOTS] = {0};
+                for (int k = 0; k < n_active; k++) {
+                    const int i = active_index[k];
+                    active_segment_tokens[k] = segments[i].tokens + offsets[i];
+                    active_segment_lengths[k] = min_remaining_tokens;
+                    active_refresh_logits[k] =
+                        segments[i].refresh_logits &&
+                        offsets[i] + min_remaining_tokens == segments[i].n_tokens;
+                }
+                if (ds4_session_prefill_segments_many(active_sessions,
+                                                      active_segment_tokens,
+                                                      active_segment_lengths,
+                                                      active_refresh_logits,
+                                                      n_active,
+                                                      err,
+                                                      errlen) != 0) {
+                    batch_shared_detach_segments(b, segments, sessions, attached,
+                                                 n_segments, false);
+                    for (int k = 0; k < n_segments; k++) {
+                        if (sessions[k]) ds4_session_invalidate(sessions[k]);
+                        batch_mark_slot_invalid(b, segments[k].slot, true);
+                    }
+                    return 1;
+                }
+                for (int k = 0; k < n_active; k++) {
+                    const int i = active_index[k];
+                    offsets[i] += min_remaining_tokens;
+                    if (offsets[i] == segments[i].n_tokens) remaining--;
+                }
+                continue;
+            }
             if (b->backend != DS4_BATCH_BACKEND_SHARED_DECODE) {
                 for (int i = 1; i < n_active; i++) {
                     ds4_session *session = active_sessions[i];

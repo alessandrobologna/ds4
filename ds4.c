@@ -21180,7 +21180,9 @@ static bool metal_graph_encode_session_decode_rows(
     const uint32_t split_after_layers = metal_graph_token_split_layers();
     const char *serial_matmul_env = getenv("DS4_SHARED_DECODE_SERIAL_MATMUL_ROWS");
     const bool force_serial_matmul_rows =
-        !serial_matmul_env || strcmp(serial_matmul_env, "0") != 0;
+        serial_matmul_env ?
+        strcmp(serial_matmul_env, "0") != 0 :
+        n_sessions < 4;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (force_serial_matmul_rows) ds4_gpu_push_serial_matmul_rows();
         ok = metal_graph_encode_session_decode_rows_attention(work,

@@ -93,6 +93,12 @@ def make_prompt(args: argparse.Namespace, index: int) -> str:
     )
     if args.prompt_mode == "short":
         return f"{unique} Answer in one compact sentence."
+    if args.prompt_mode == "shared-prefix":
+        return (
+            f"{make_prefill_body(args.prefill_repeats)}\n\n"
+            f"Unique request suffix {index:03d}: now answer only for {topic}. "
+            "Keep the answer compact and deterministic."
+        )
     if args.prompt_mode == "mixed":
         return f"{unique}\n\n{make_prefill_body(args.prefill_repeats)}\n\n{decode}"
     return decode
@@ -558,9 +564,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument(
         "--prompt-mode",
-        choices=["long-decode", "mixed", "short"],
+        choices=["long-decode", "mixed", "shared-prefix", "short"],
         default="long-decode",
-        help="Prompt shape. long-decode uses different prompts that try to exhaust --tokens.",
+        help=(
+            "Prompt shape. shared-prefix uses a common prefill body with a "
+            "per-request suffix to exercise fanout."
+        ),
     )
     parser.add_argument(
         "--prefill-repeats",

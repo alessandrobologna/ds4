@@ -20503,7 +20503,6 @@ static bool metal_graph_encode_segmented_session_rows_attention(
         const uint32_t      *row_n_comp,
         const uint32_t      *row_n_index_comp) {
     if (!work || !e || !sessions || n_sessions <= 1 || !work->batch_attn_rows ||
-        DS4_GPU_ATTN_COMP_CACHE_F16 ||
         getenv("DS4_BATCH_DISABLE_SEGMENTED_DIRECT_ATTENTION") != NULL) {
         return false;
     }
@@ -20615,6 +20614,7 @@ static bool metal_graph_encode_segmented_session_rows_attention(
                 base->storage_slots,
                 base->raw_cap,
                 compressed ? base->layer_comp_cap[il] : 0,
+                compressed ? metal_graph_attn_comp_cache_is_f16() : 0,
                 segmented_top_k,
                 ratio,
                 DS4_N_HEAD,

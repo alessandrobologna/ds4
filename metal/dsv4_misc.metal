@@ -74,6 +74,7 @@ struct ds4_metal_args_dsv4_segmented_attention {
     uint32_t comp_cap;
     uint32_t top_k;
     uint32_t ratio;
+    uint32_t comp_kv_f16;
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t raw_slot_stride;
@@ -941,9 +942,15 @@ kernel void kernel_dsv4_segmented_mixed_attention_heads8_rb4(
                 for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
                     const uint r = off >> 7;
                     const uint c = off & 127u;
-                    device const float4 *src = (device const float4 *)(comp_kv +
-                        comp_base + (uint64_t)comp_rows[r] * args.comp_row_stride);
-                    kv_shared[off] = src[c];
+                    const uint64_t src_off =
+                        comp_base + (uint64_t)comp_rows[r] * args.comp_row_stride;
+                    if (args.comp_kv_f16 != 0u) {
+                        device const half4 *src = (device const half4 *)(comp_kv + src_off);
+                        kv_shared[off] = (float4)src[c];
+                    } else {
+                        device const float4 *src = (device const float4 *)(comp_kv + src_off);
+                        kv_shared[off] = src[c];
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint r = 0; r < n_rows; r++) {
@@ -963,9 +970,15 @@ kernel void kernel_dsv4_segmented_mixed_attention_heads8_rb4(
                 for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
                     const uint r = off >> 7;
                     const uint c = off & 127u;
-                    device const float4 *src = (device const float4 *)(comp_kv +
-                        comp_base + (uint64_t)(comp0 + r) * args.comp_row_stride);
-                    kv_shared[off] = src[c];
+                    const uint64_t src_off =
+                        comp_base + (uint64_t)(comp0 + r) * args.comp_row_stride;
+                    if (args.comp_kv_f16 != 0u) {
+                        device const half4 *src = (device const half4 *)(comp_kv + src_off);
+                        kv_shared[off] = (float4)src[c];
+                    } else {
+                        device const float4 *src = (device const float4 *)(comp_kv + src_off);
+                        kv_shared[off] = src[c];
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint r = 0; r < n_rows; r++) {

@@ -2999,6 +2999,7 @@ typedef struct {
     uint32_t comp_cap;
     uint32_t top_k;
     uint32_t ratio;
+    uint32_t comp_kv_f16;
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t raw_slot_stride;
@@ -12167,6 +12168,7 @@ int ds4_gpu_attention_segmented_mixed_heads_tensor(
         uint32_t                n_slots,
         uint32_t                raw_cap,
         uint32_t                comp_cap,
+        uint32_t                comp_kv_f16,
         uint32_t                top_k,
         uint32_t                ratio,
         uint32_t                n_head,
@@ -12187,9 +12189,11 @@ int ds4_gpu_attention_segmented_mixed_heads_tensor(
         }
 
         const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t comp_row_bytes =
+            (uint64_t)head_dim * (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
         const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
         const uint64_t raw_bytes = (uint64_t)n_slots * raw_cap * row_bytes;
-        const uint64_t comp_bytes = (uint64_t)n_slots * comp_cap * row_bytes;
+        const uint64_t comp_bytes = (uint64_t)n_slots * comp_cap * comp_row_bytes;
         const uint64_t topk_bytes = (uint64_t)(top_k ? top_k : 1u) * n_tokens * sizeof(int32_t);
         const uint64_t rows_bytes = (uint64_t)n_tokens * sizeof(ds4_gpu_segmented_attention_row);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
@@ -12244,12 +12248,13 @@ int ds4_gpu_attention_segmented_mixed_heads_tensor(
             .comp_cap = comp_cap,
             .top_k = top_k,
             .ratio = ratio,
+            .comp_kv_f16 = comp_kv_f16 ? 1u : 0u,
             .q_token_stride = (uint64_t)n_head * row_bytes,
             .q_head_stride = row_bytes,
             .raw_slot_stride = (uint64_t)raw_cap * row_bytes,
             .raw_row_stride = row_bytes,
-            .comp_slot_stride = (uint64_t)comp_cap * row_bytes,
-            .comp_row_stride = row_bytes,
+            .comp_slot_stride = (uint64_t)comp_cap * comp_row_bytes,
+            .comp_row_stride = comp_row_bytes,
             .topk_token_stride = (uint64_t)(top_k ? top_k : 1u) * sizeof(int32_t),
             .dst_token_stride = (uint64_t)n_head * row_bytes,
             .dst_head_stride = row_bytes,

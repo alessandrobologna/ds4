@@ -546,6 +546,7 @@ int ds4_gpu_attention_segmented_mixed_heads_tensor(
         uint32_t                n_slots,
         uint32_t                raw_cap,
         uint32_t                comp_cap,
+        uint32_t                comp_kv_f16,
         uint32_t                top_k,
         uint32_t                ratio,
         uint32_t                n_head,

@@ -6,9 +6,9 @@
  * The benchmark walks one fixed token sequence to configurable context
  * frontiers, measuring only the newest prefill interval at each frontier.  It
  * then snapshots the live session in memory, performs a fixed greedy decode
- * run without allowing EOS, restores the snapshot, and continues to the next
- * frontier.  Snapshot save/restore time is intentionally outside both timing
- * windows.
+ * probe, restores the snapshot, and continues to the next frontier. Snapshot
+ * save/restore time is intentionally outside both timing windows but is
+ * reported separately.
  */
 
 #include <errno.h>
@@ -42,6 +42,7 @@ typedef struct {
     ds4_dist_options dist;
     const char *batch_backend;
     bool batch_common_prefix;
+    bool decode_top;
     bool warm_weights;
     bool quality;
 } bench_config;
@@ -58,8 +59,8 @@ static void usage(FILE *fp) {
         "\n"
         "Benchmarks instantaneous prefill and generation throughput at context\n"
         "frontiers such as 2048, 4096, 6144, ... . Generation is always greedy,\n"
-        "runs for exactly --gen-tokens tokens, and skips EOS so every row is\n"
-        "comparable.\n"
+        "runs for exactly --gen-tokens tokens. The default full-logits path\n"
+        "skips EOS so every row is comparable.\n"
         "\n"
         "Input:\n"
         "  --prompt-file FILE\n"
@@ -90,6 +91,9 @@ static void usage(FILE *fp) {
         "  --step-mul F           Multiplicative step. Default: 1\n"
         "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
         "  --gen-tokens N         Greedy decode tokens per frontier. Use 0 for pure prefill. Default: 128\n"
+        "  --decode-top\n"
+        "      Use the top-token decode API during generation. The first token\n"
+        "      still skips EOS; subsequent tokens come from the backend top-1 path.\n"
         "\n"
         "Batch sweep:\n"
         "  --batch-sessions N     Run a multi-session sweep instead of the single-session sweep.\n"
@@ -268,6 +272,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.batch_prefill_rows = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--batch-common-prefix")) {
             c.batch_common_prefix = true;
+        } else if (!strcmp(arg, "--decode-top")) {
+            c.decode_top = true;
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
@@ -578,6 +584,10 @@ static const char *bench_batch_slice_label(const bench_config *cfg) {
     return cfg->batch_common_prefix ? "common-prefix" : "distinct-slices";
 }
 
+static const char *bench_decode_label(const bench_config *cfg) {
+    return cfg->decode_top ? "top-token" : "full-logits";
+}
+
 static int bench_serialized_multisession(
         ds4_engine         *engine,
         const bench_config *cfg,
@@ -626,6 +636,8 @@ static int bench_serialized_multisession(
         if (rc != 0) break;
 
         uint64_t snapshot_bytes = 0;
+        double snapshot_s = 0.0;
+        const double snapshot_save_t0 = bench_now_sec();
         for (int i = 0; i < cfg->batch_sessions; i++) {
             if (ds4_session_save_snapshot(sessions[i], &snap[i], err, errlen) != 0) {
                 fprintf(stderr, "ds4-bench: serialized snapshot slot %d at %d failed: %s\n",
@@ -635,10 +647,12 @@ static int bench_serialized_multisession(
             }
             snapshot_bytes += snap[i].len;
         }
+        snapshot_s += bench_now_sec() - snapshot_save_t0;
         if (rc != 0) break;
 
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg->batch_sessions && rc == 0; i++) {
+            int next_token = -1;
             for (int j = 0; j < cfg->gen_tokens; j++) {
                 if (ds4_session_pos(sessions[i]) + 1 >= ds4_session_ctx(sessions[i])) {
                     fprintf(stderr, "ds4-bench: serialized generation would exceed context at frontier %d\n",
@@ -646,14 +660,23 @@ static int bench_serialized_multisession(
                     rc = 1;
                     break;
                 }
-                const int token = ds4_session_argmax_excluding(sessions[i], eos);
+                const int token = cfg->decode_top && next_token >= 0 ?
+                    next_token : ds4_session_argmax_excluding(sessions[i], eos);
                 if (token < 0) {
                     fprintf(stderr, "ds4-bench: serialized argmax failed at frontier %d slot %d\n",
                             frontier, i);
                     rc = 1;
                     break;
                 }
-                if (ds4_session_eval(sessions[i], token, err, errlen) != 0) {
+                if (cfg->decode_top) {
+                    if (ds4_session_eval_top(sessions[i], token, &next_token,
+                                             err, errlen) != 0) {
+                        fprintf(stderr, "ds4-bench: serialized top-token decode failed at frontier %d slot %d: %s\n",
+                                frontier, i, err);
+                        rc = 1;
+                        break;
+                    }
+                } else if (ds4_session_eval(sessions[i], token, err, errlen) != 0) {
                     fprintf(stderr, "ds4-bench: serialized decode failed at frontier %d slot %d: %s\n",
                             frontier, i, err);
                     rc = 1;
@@ -664,6 +687,7 @@ static int bench_serialized_multisession(
         const double gen_t1 = bench_now_sec();
         if (rc != 0) break;
 
+        const double snapshot_load_t0 = bench_now_sec();
         for (int i = 0; i < cfg->batch_sessions; i++) {
             if (ds4_session_load_snapshot(sessions[i], &snap[i], err, errlen) != 0) {
                 fprintf(stderr, "ds4-bench: serialized restore slot %d at %d failed: %s\n",
@@ -672,6 +696,7 @@ static int bench_serialized_multisession(
                 break;
             }
         }
+        snapshot_s += bench_now_sec() - snapshot_load_t0;
         if (rc != 0) break;
 
         const int prefill_tokens = (frontier - previous) * cfg->batch_sessions;
@@ -679,7 +704,7 @@ static int bench_serialized_multisession(
         const double prefill_sec = prefill_t1 - prefill_t0;
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "serialized,%s,%d,%d,%d,%d,%.2f,%d,%.2f,%llu\n",
+                "serialized,%s,%d,%d,%d,%d,%.2f,%d,%.2f,%llu,%s,%.6f\n",
                 bench_batch_slice_label(cfg),
                 cfg->batch_sessions,
                 frontier,
@@ -688,7 +713,9 @@ static int bench_serialized_multisession(
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 gen_tokens,
                 gen_sec > 0.0 ? (double)gen_tokens / gen_sec : 0.0,
-                (unsigned long long)snapshot_bytes);
+                (unsigned long long)snapshot_bytes,
+                bench_decode_label(cfg),
+                snapshot_s);
         fflush(out);
 
         previous = frontier;
@@ -727,10 +754,12 @@ static int bench_batch_multisession(
         calloc((size_t)cfg->batch_sessions, sizeof(*segments));
     ds4_batch_step *steps =
         calloc((size_t)cfg->batch_sessions, sizeof(*steps));
-    if (!snap || !segments || !steps) {
+    int *top_tokens = calloc((size_t)cfg->batch_sessions, sizeof(*top_tokens));
+    if (!snap || !segments || !steps || !top_tokens) {
         fprintf(stderr, "ds4-bench: out of memory creating batch sweep buffers\n");
         free(segments);
         free(steps);
+        free(top_tokens);
         bench_free_snapshots(snap, cfg->batch_sessions);
         ds4_batch_free(batch);
         return 1;
@@ -761,6 +790,8 @@ static int bench_batch_multisession(
         const double prefill_t1 = bench_now_sec();
 
         uint64_t snapshot_bytes = 0;
+        double snapshot_s = 0.0;
+        const double snapshot_save_t0 = bench_now_sec();
         for (int i = 0; i < cfg->batch_sessions; i++) {
             if (ds4_batch_save_slot_snapshot(batch, i, &snap[i],
                                              err, errlen) != 0) {
@@ -771,12 +802,15 @@ static int bench_batch_multisession(
             }
             snapshot_bytes += snap[i].len;
         }
+        snapshot_s += bench_now_sec() - snapshot_save_t0;
         if (rc != 0) break;
 
+        for (int i = 0; i < cfg->batch_sessions; i++) top_tokens[i] = -1;
         const double gen_t0 = bench_now_sec();
         for (int j = 0; j < cfg->gen_tokens; j++) {
             for (int i = 0; i < cfg->batch_sessions; i++) {
-                const int token = ds4_batch_argmax_excluding(batch, i, eos);
+                const int token = cfg->decode_top && top_tokens[i] >= 0 ?
+                    top_tokens[i] : ds4_batch_argmax_excluding(batch, i, eos);
                 if (token < 0) {
                     fprintf(stderr, "ds4-bench: batch argmax failed at frontier %d slot %d\n",
                             frontier, i);
@@ -786,7 +820,15 @@ static int bench_batch_multisession(
                 steps[i] = (ds4_batch_step){ .slot = i, .token = token };
             }
             if (rc != 0) break;
-            if (ds4_batch_eval(batch, steps, cfg->batch_sessions, err, errlen) != 0) {
+            if (cfg->decode_top) {
+                if (ds4_batch_eval_top(batch, steps, cfg->batch_sessions,
+                                       top_tokens, err, errlen) != 0) {
+                    fprintf(stderr, "ds4-bench: batch top-token decode failed at frontier %d: %s\n",
+                            frontier, err);
+                    rc = 1;
+                    break;
+                }
+            } else if (ds4_batch_eval(batch, steps, cfg->batch_sessions, err, errlen) != 0) {
                 fprintf(stderr, "ds4-bench: batch decode failed at frontier %d: %s\n",
                         frontier, err);
                 rc = 1;
@@ -796,6 +838,7 @@ static int bench_batch_multisession(
         const double gen_t1 = bench_now_sec();
         if (rc != 0) break;
 
+        const double snapshot_load_t0 = bench_now_sec();
         for (int i = 0; i < cfg->batch_sessions; i++) {
             if (ds4_batch_load_slot_snapshot(batch, i, &snap[i],
                                              err, errlen) != 0) {
@@ -805,6 +848,7 @@ static int bench_batch_multisession(
                 break;
             }
         }
+        snapshot_s += bench_now_sec() - snapshot_load_t0;
         if (rc != 0) break;
 
         const int prefill_tokens = delta * cfg->batch_sessions;
@@ -812,7 +856,7 @@ static int bench_batch_multisession(
         const double prefill_sec = prefill_t1 - prefill_t0;
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "batch,%s:%s,%d,%d,%d,%d,%.2f,%d,%.2f,%llu\n",
+                "batch,%s:%s,%d,%d,%d,%d,%.2f,%d,%.2f,%llu,%s,%.6f\n",
                 ds4_batch_backend_name(batch),
                 bench_batch_slice_label(cfg),
                 cfg->batch_sessions,
@@ -822,7 +866,9 @@ static int bench_batch_multisession(
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 gen_tokens,
                 gen_sec > 0.0 ? (double)gen_tokens / gen_sec : 0.0,
-                (unsigned long long)snapshot_bytes);
+                (unsigned long long)snapshot_bytes,
+                bench_decode_label(cfg),
+                snapshot_s);
         fflush(out);
 
         previous = frontier;
@@ -832,6 +878,7 @@ static int bench_batch_multisession(
     for (int i = 0; i < cfg->batch_sessions; i++) ds4_batch_release_slot(batch, i);
     free(segments);
     free(steps);
+    free(top_tokens);
     bench_free_snapshots(snap, cfg->batch_sessions);
     ds4_batch_free(batch);
     return rc;
@@ -847,7 +894,7 @@ static int run_batch_bench(
     FILE *out = NULL;
     if (bench_open_output(cfg, &out) != 0) return 1;
     fprintf(out,
-            "mode,label,batch_sessions,ctx_tokens,prefill_tokens,total_prefill_tokens,prefill_tps,total_gen_tokens,gen_tps,kvcache_bytes\n");
+            "mode,label,batch_sessions,ctx_tokens,prefill_tokens,total_prefill_tokens,prefill_tps,total_gen_tokens,gen_tps,kvcache_bytes,decode_mode,snapshot_sec\n");
     fflush(out);
 
     char err[256];
@@ -940,7 +987,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,decode_mode,snapshot_sec\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -972,28 +1019,42 @@ int main(int argc, char **argv) {
             break;
         }
 
+        double snapshot_s = 0.0;
+        bool have_snapshot = false;
         if (cfg.gen_tokens > 0 && !distributed) {
+            const double snapshot_save_t0 = bench_now_sec();
             if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
+            snapshot_s += bench_now_sec() - snapshot_save_t0;
+            have_snapshot = true;
         }
 
         const double gen_t0 = bench_now_sec();
+        int next_token = -1;
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
-            const int token = ds4_session_argmax_excluding(session, eos);
+            const int token = cfg.decode_top && next_token >= 0 ?
+                next_token : ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            if (cfg.decode_top) {
+                if (ds4_session_eval_top(session, token, &next_token,
+                                         err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: top-token decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+            } else if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
@@ -1011,22 +1072,26 @@ int main(int argc, char **argv) {
                 break;
             }
         } else {
+            const double snapshot_load_t0 = bench_now_sec();
             if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
+            snapshot_s += bench_now_sec() - snapshot_load_t0;
         }
 
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%llu,%s,%.6f\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)(distributed ? 0 : snap.len));
+                (unsigned long long)(have_snapshot ? snap.len : 0),
+                bench_decode_label(&cfg),
+                snapshot_s);
         fflush(out);
 
         previous = frontier;

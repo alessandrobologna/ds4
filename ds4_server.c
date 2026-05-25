@@ -11938,13 +11938,32 @@ static bool batch_admit_waiting(server *s, batch_request *reqs) {
     return admitted;
 }
 
+typedef struct {
+    double save_s;
+    double load_s;
+    uint64_t bytes;
+    int loads;
+} batch_clone_slot_metrics;
+
 static bool batch_clone_slot_snapshot(server *s, int src_slot, const int *dst_slots,
-                                      int n_dst, char *err, size_t errlen) {
+                                      int n_dst, batch_clone_slot_metrics *metrics,
+                                      char *err, size_t errlen) {
+    if (metrics) memset(metrics, 0, sizeof(*metrics));
     ds4_session_snapshot snap = {0};
+    const double save_t0 = now_sec();
     bool ok = ds4_batch_save_slot_snapshot(s->batch, src_slot, &snap, err, errlen) == 0;
+    if (metrics) {
+        metrics->save_s = now_sec() - save_t0;
+        metrics->bytes = snap.len;
+    }
     for (int i = 0; ok && i < n_dst; i++) {
+        const double load_t0 = now_sec();
         ok = ds4_batch_load_slot_snapshot(s->batch, dst_slots[i], &snap,
                                           err, errlen) == 0;
+        if (metrics) {
+            metrics->load_s += now_sec() - load_t0;
+            metrics->loads++;
+        }
     }
     ds4_session_snapshot_free(&snap);
     return ok;
@@ -12069,6 +12088,7 @@ static bool batch_prefill_shared_prefix_many(server *s, batch_request *reqs) {
     ds4_tokens prefix = {0};
     tokens_copy_prefix(&prefix, src->prompt, best_target);
     const double step_t0 = now_sec();
+    const double sync_t0 = step_t0;
     if (ds4_batch_sync(s->batch, src->slot, &prefix, src->err, sizeof(src->err)) != 0) {
         ds4_tokens_free(&prefix);
         ds4_batch_set_progress(s->batch, src->slot, NULL, NULL);
@@ -12078,9 +12098,12 @@ static bool batch_prefill_shared_prefix_many(server *s, batch_request *reqs) {
     }
     ds4_tokens_free(&prefix);
     ds4_batch_set_progress(s->batch, src->slot, NULL, NULL);
+    const double sync_s = now_sec() - sync_t0;
 
     char err[160] = {0};
-    if (!batch_clone_slot_snapshot(s, src->slot, dst_slots, n_dst, err, sizeof(err))) {
+    batch_clone_slot_metrics clone_metrics = {0};
+    if (!batch_clone_slot_snapshot(s, src->slot, dst_slots, n_dst,
+                                   &clone_metrics, err, sizeof(err))) {
         batch_prefill_fail_group(s, reqs, dst_group, n_dst,
                                  "batch prefill fanout clone failed", err);
     } else {
@@ -12100,7 +12123,7 @@ static bool batch_prefill_shared_prefix_many(server *s, batch_request *reqs) {
     const char *backend = ds4_batch_backend_name(s->batch);
     const bool shared_decode = !strcmp(backend, "shared-decode");
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: batch backend=%s mode=%s attention=%s active=%d batch=%d prefill=fanout from=%d to=%d rows=%d slots=%d common=%d step_ms=%.1f",
+               "ds4-server: batch backend=%s mode=%s attention=%s active=%d batch=%d prefill=fanout from=%d to=%d rows=%d slots=%d common=%d step_ms=%.1f sync_ms=%.1f clone_ms=%.1f clone_save_ms=%.1f clone_load_ms=%.1f clone_bytes=%llu clone_slots=%d",
                backend,
                shared_decode ? "row-batched" : "session-slots",
                shared_decode ? "segmented-direct" : "session",
@@ -12111,7 +12134,13 @@ static bool batch_prefill_shared_prefix_many(server *s, batch_request *reqs) {
                best_target - best_current,
                n_dst + 1,
                best_target,
-               step_s * 1000.0);
+               step_s * 1000.0,
+               sync_s * 1000.0,
+               (clone_metrics.save_s + clone_metrics.load_s) * 1000.0,
+               clone_metrics.save_s * 1000.0,
+               clone_metrics.load_s * 1000.0,
+               (unsigned long long)clone_metrics.bytes,
+               clone_metrics.loads);
     return true;
 }
 

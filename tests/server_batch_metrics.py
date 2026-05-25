@@ -260,6 +260,22 @@ def field_values(lines: list[str], name: str) -> list[float]:
     return values
 
 
+def field_values_with_marker(lines: list[str], marker: str, name: str) -> list[float]:
+    rx = re.compile(rf"\b{re.escape(name)}=([0-9]+(?:\.[0-9]+)?)")
+    values: list[float] = []
+    for line in lines:
+        if marker not in line:
+            continue
+        match = rx.search(line)
+        if match:
+            values.append(float(match.group(1)))
+    return values
+
+
+def count_lines_with_marker(lines: list[str], marker: str) -> int:
+    return sum(1 for line in lines if marker in line)
+
+
 def batch_hist(lines: list[str], marker: str) -> dict[str, int]:
     hist: collections.Counter[int] = collections.Counter()
     for line in lines:
@@ -306,6 +322,13 @@ def summarize_server_metrics(lines: list[str], rss_samples_kib: list[int]) -> di
     slot_wait = field_values(lines, "slot_wait_ms")
     request_prefill = field_values(lines, "prefill_ms")
     request_decode = field_values(lines, "decode_ms")
+    fanout_step_ms = field_values_with_marker(lines, "prefill=fanout", "step_ms")
+    fanout_sync_ms = field_values_with_marker(lines, "prefill=fanout", "sync_ms")
+    fanout_clone_ms = field_values_with_marker(lines, "prefill=fanout", "clone_ms")
+    fanout_clone_save_ms = field_values_with_marker(lines, "prefill=fanout", "clone_save_ms")
+    fanout_clone_load_ms = field_values_with_marker(lines, "prefill=fanout", "clone_load_ms")
+    segment_step_ms = field_values_with_marker(lines, "prefill=segment", "step_ms")
+    chunk_step_ms = field_values_with_marker(lines, "prefill=chunk", "step_ms")
     peak_rss_kib = max(rss_samples_kib) if rss_samples_kib else 0
     avg_rss_kib = sum(rss_samples_kib) / len(rss_samples_kib) if rss_samples_kib else 0.0
     return {
@@ -323,6 +346,18 @@ def summarize_server_metrics(lines: list[str], rss_samples_kib: list[int]) -> di
         "server_decode_step_count": len(decode_step_ms),
         "server_decode_step_total_ms": sum(decode_step_ms),
         "server_decode_step_p50_ms": percentile(decode_step_ms, 0.50),
+        "server_prefill_fanout_count": count_lines_with_marker(lines, "prefill=fanout"),
+        "server_prefill_fanout_total_ms": sum(fanout_step_ms),
+        "server_prefill_fanout_p50_ms": percentile(fanout_step_ms, 0.50),
+        "server_prefill_fanout_sync_total_ms": sum(fanout_sync_ms),
+        "server_prefill_fanout_clone_total_ms": sum(fanout_clone_ms),
+        "server_prefill_fanout_clone_p50_ms": percentile(fanout_clone_ms, 0.50),
+        "server_prefill_fanout_clone_save_total_ms": sum(fanout_clone_save_ms),
+        "server_prefill_fanout_clone_load_total_ms": sum(fanout_clone_load_ms),
+        "server_prefill_segment_count": count_lines_with_marker(lines, "prefill=segment"),
+        "server_prefill_segment_total_ms": sum(segment_step_ms),
+        "server_prefill_chunk_count": count_lines_with_marker(lines, "prefill=chunk"),
+        "server_prefill_chunk_total_ms": sum(chunk_step_ms),
         "decode_batch_hist": batch_hist(lines, "decode="),
         "prefill_batch_hist": batch_hist(lines, "prefill="),
         "observed_max_batch": max_batch_for(lines, "decode="),
@@ -452,6 +487,10 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "ttft_ms",
         "srv_pre_ms",
         "srv_dec_ms",
+        "fanout",
+        "segment",
+        "chunk",
+        "clone_ms",
         "rss_mib",
         "speedup",
         "eff/slot",
@@ -472,6 +511,10 @@ def print_table(rows: list[dict[str, Any]]) -> None:
             f"{fmt_ms(row['ttft_p50_ms']):>10}",
             f"{row.get('server_request_prefill_p50_ms', 0.0):10.1f}",
             f"{row.get('server_request_decode_p50_ms', 0.0):10.1f}",
+            f"{int(row.get('server_prefill_fanout_count') or 0):10d}",
+            f"{int(row.get('server_prefill_segment_count') or 0):10d}",
+            f"{int(row.get('server_prefill_chunk_count') or 0):10d}",
+            f"{row.get('server_prefill_fanout_clone_total_ms', 0.0):10.1f}",
             f"{row.get('rss_peak_mib', 0.0):10.1f}",
             f"{row['speedup_vs_baseline']:10.2f}",
             f"{row['slot_efficiency_vs_baseline']:10.2f}",

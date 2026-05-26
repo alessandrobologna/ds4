@@ -105,7 +105,7 @@ def make_prompt(args: argparse.Namespace, index: int) -> str:
 
 
 def metrics_chat_body(prompt: str, max_tokens: int, stream: bool) -> dict[str, Any]:
-    return {
+    body: dict[str, Any] = {
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
@@ -113,6 +113,9 @@ def metrics_chat_body(prompt: str, max_tokens: int, stream: bool) -> dict[str, A
         "stream": stream,
         "thinking": {"type": "disabled"},
     }
+    if stream:
+        body["stream_options"] = {"include_usage": True}
+    return body
 
 
 def measure_stream_chat(
@@ -130,6 +133,7 @@ def measure_stream_chat(
     content_events = 0
     completion_tokens = 0
     prompt_tokens = 0
+    usage_seen = False
     text_chars = 0
     done = False
     try:
@@ -162,11 +166,15 @@ def measure_stream_chat(
                 obj = json.loads(raw.decode("utf-8", "replace"))
             except json.JSONDecodeError:
                 continue
-            usage = obj.get("usage") or {}
-            prompt_tokens = max(prompt_tokens, int(usage.get("prompt_tokens") or 0))
-            completion_tokens = max(
-                completion_tokens, int(usage.get("completion_tokens") or 0)
-            )
+            usage = obj.get("usage")
+            if isinstance(usage, dict) and (
+                "prompt_tokens" in usage or "completion_tokens" in usage
+            ):
+                usage_seen = True
+                prompt_tokens = max(prompt_tokens, int(usage.get("prompt_tokens") or 0))
+                completion_tokens = max(
+                    completion_tokens, int(usage.get("completion_tokens") or 0)
+                )
             for choice in obj.get("choices") or []:
                 delta = choice.get("delta") or {}
                 content = delta.get("content") or ""
@@ -180,8 +188,12 @@ def measure_stream_chat(
     ended = time.perf_counter()
     if not done:
         raise CheckError("stream request did not receive [DONE]")
+    if not usage_seen:
+        raise CheckError("stream request did not receive usage metrics")
+    if prompt_tokens <= 0:
+        raise CheckError("stream usage did not include prompt tokens")
     if completion_tokens <= 0:
-        completion_tokens = max(1, content_events)
+        raise CheckError("stream usage did not include generated tokens")
     return {
         "latency_s": ended - started,
         "ttfe_s": (first_event - started) if first_event is not None else None,
@@ -309,6 +321,37 @@ def slot_reuse_count(lines: list[str]) -> int:
     return sum(max(0, count - 1) for count in starts.values())
 
 
+def decode_token_work(lines: list[str]) -> int:
+    total = 0
+    for line in lines:
+        if "decode=" not in line:
+            continue
+        match = re.search(r"\bbatch=(\d+)\b", line)
+        if match:
+            total += int(match.group(1))
+    return total
+
+
+def prefill_row_work(lines: list[str]) -> tuple[int, int]:
+    compute_rows = 0
+    logical_rows = 0
+    for line in lines:
+        if "prefill=" not in line:
+            continue
+        rows_match = re.search(r"\brows=(\d+)\b", line)
+        if not rows_match:
+            continue
+        rows = int(rows_match.group(1))
+        compute_rows += rows
+        if "prefill=fanout" in line:
+            slots_match = re.search(r"\bslots=(\d+)\b", line)
+            slots = int(slots_match.group(1)) if slots_match else 1
+            logical_rows += rows * slots
+        else:
+            logical_rows += rows
+    return compute_rows, logical_rows
+
+
 def summarize_server_metrics(lines: list[str], rss_samples_kib: list[int]) -> dict[str, Any]:
     prefill_step_ms = [
         float(match.group(1))
@@ -335,6 +378,10 @@ def summarize_server_metrics(lines: list[str], rss_samples_kib: list[int]) -> di
     fanout_clone_load_ms = field_values_with_marker(lines, "prefill=fanout", "clone_load_ms")
     segment_step_ms = field_values_with_marker(lines, "prefill=segment", "step_ms")
     chunk_step_ms = field_values_with_marker(lines, "prefill=chunk", "step_ms")
+    decode_tokens = decode_token_work(lines)
+    prefill_compute_rows, prefill_logical_rows = prefill_row_work(lines)
+    prefill_total_ms = sum(prefill_step_ms)
+    decode_total_ms = sum(decode_step_ms)
     peak_rss_kib = max(rss_samples_kib) if rss_samples_kib else 0
     avg_rss_kib = sum(rss_samples_kib) / len(rss_samples_kib) if rss_samples_kib else 0.0
     return {
@@ -347,11 +394,29 @@ def summarize_server_metrics(lines: list[str], rss_samples_kib: list[int]) -> di
         "server_request_decode_p50_ms": percentile(request_decode, 0.50),
         "server_request_decode_p95_ms": percentile(request_decode, 0.95),
         "server_prefill_step_count": len(prefill_step_ms),
-        "server_prefill_step_total_ms": sum(prefill_step_ms),
+        "server_prefill_step_total_ms": prefill_total_ms,
         "server_prefill_step_p50_ms": percentile(prefill_step_ms, 0.50),
         "server_decode_step_count": len(decode_step_ms),
-        "server_decode_step_total_ms": sum(decode_step_ms),
+        "server_decode_step_total_ms": decode_total_ms,
         "server_decode_step_p50_ms": percentile(decode_step_ms, 0.50),
+        "server_prefill_compute_rows": prefill_compute_rows,
+        "server_prefill_logical_rows": prefill_logical_rows,
+        "server_prefill_compute_tps": (
+            prefill_compute_rows / (prefill_total_ms / 1000.0)
+            if prefill_total_ms > 0.0
+            else 0.0
+        ),
+        "server_prefill_logical_tps": (
+            prefill_logical_rows / (prefill_total_ms / 1000.0)
+            if prefill_total_ms > 0.0
+            else 0.0
+        ),
+        "server_decode_token_work": decode_tokens,
+        "server_decode_token_tps": (
+            decode_tokens / (decode_total_ms / 1000.0)
+            if decode_total_ms > 0.0
+            else 0.0
+        ),
         "server_prefill_fanout_count": count_lines_with_marker(lines, "prefill=fanout"),
         "server_prefill_fanout_total_ms": sum(fanout_step_ms),
         "server_prefill_fanout_p50_ms": percentile(fanout_step_ms, 0.50),
@@ -430,6 +495,7 @@ def run_one_slot_size(args: argparse.Namespace, max_slots: int) -> dict[str, Any
                     args.request_timeout,
                 )
 
+            metric_line_start = len(server.lines)
             started = time.perf_counter()
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
                 futures = [
@@ -444,7 +510,8 @@ def run_one_slot_size(args: argparse.Namespace, max_slots: int) -> dict[str, Any
                 ]
                 results = [future.result() for future in concurrent.futures.as_completed(futures)]
             wall_s = time.perf_counter() - started
-        server_metrics = summarize_server_metrics(server.lines, rss.samples)
+        metric_lines = server.lines[metric_line_start:]
+        server_metrics = summarize_server_metrics(metric_lines, rss.samples)
         if max_slots == 1 and server_metrics["observed_max_batch"] == 0:
             server_metrics["observed_max_batch"] = 1
         if args.log_dir:
@@ -488,6 +555,9 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "req/s",
         "out_tok/s",
         "tot_tok/s",
+        "pre_cmp/s",
+        "pre_log/s",
+        "dec_tok/s",
         "p50_ms",
         "p95_ms",
         "ttft_ms",
@@ -512,6 +582,9 @@ def print_table(rows: list[dict[str, Any]]) -> None:
             f"{row['request_per_s']:10.2f}",
             f"{row['completion_tok_per_s']:10.2f}",
             f"{row['total_tok_per_s']:10.2f}",
+            f"{row.get('server_prefill_compute_tps', 0.0):10.2f}",
+            f"{row.get('server_prefill_logical_tps', 0.0):10.2f}",
+            f"{row.get('server_decode_token_tps', 0.0):10.2f}",
             f"{row['latency_p50_ms']:10.1f}",
             f"{row['latency_p95_ms']:10.1f}",
             f"{fmt_ms(row['ttft_p50_ms']):>10}",
@@ -617,6 +690,7 @@ def main(argv: list[str]) -> int:
                     or max((args.concurrency or max(args.slots)) * 2, 8),
                     "tokens": args.tokens,
                     "stream": args.stream,
+                    "stream_include_usage": bool(args.stream),
                     "batch_wait_us": args.batch_wait_us,
                     "prompt_mode": args.prompt_mode,
                     "prefill_repeats": args.prefill_repeats,

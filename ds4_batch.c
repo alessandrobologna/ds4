@@ -150,7 +150,7 @@ static int batch_validate_steps(ds4_batch *b, const ds4_batch_step *steps,
             batch_set_err(err, errlen, "batch slot is in an error state");
             return 1;
         }
-        if (ds4_session_pos(s) >= ds4_session_ctx(s)) {
+        if (ds4_session_pos(s) + 1 >= ds4_session_ctx(s)) {
             batch_set_err(err, errlen, "batch slot has no context room");
             return 1;
         }

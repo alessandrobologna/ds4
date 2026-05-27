@@ -1572,6 +1572,25 @@ static void test_batch_api_session_slots(void) {
     TEST_ASSERT(ds4_batch_common_prefix(batch, 0, &prompt_a) == prompt_a.len);
     TEST_ASSERT(ds4_batch_slot_logits_valid(batch, 0));
     TEST_ASSERT(ds4_batch_slot_payload_valid(batch, 0));
+
+    ds4_batch *edge_batch = NULL;
+    ds4_batch_options edge_opt = {
+        .ctx_size = prompt_a.len + 1,
+        .max_slots = 1,
+        .backend = DS4_BATCH_BACKEND_SESSION_SLOTS,
+    };
+    TEST_ASSERT(ds4_batch_create_with_options(&edge_batch, engine, &edge_opt,
+                                              err, sizeof(err)) == 0);
+    if (edge_batch) {
+        ds4_batch_claim_slot(edge_batch, 0);
+        TEST_ASSERT(ds4_batch_sync(edge_batch, 0, &prompt_a, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_batch_pos(edge_batch, 0) + 1 == ds4_batch_ctx(edge_batch));
+        ds4_batch_step edge_step = { .slot = 0, .token = ds4_batch_argmax(edge_batch, 0) };
+        TEST_ASSERT(edge_step.token >= 0);
+        TEST_ASSERT(ds4_batch_eval(edge_batch, &edge_step, 1, err, sizeof(err)) != 0);
+        ds4_batch_free(edge_batch);
+    }
+
     ds4_batch_rewind_slot(batch, 1, prompt_b.len - 1);
     TEST_ASSERT(ds4_batch_pos(batch, 1) == prompt_b.len - 1);
     TEST_ASSERT(!ds4_batch_slot_logits_valid(batch, 1));

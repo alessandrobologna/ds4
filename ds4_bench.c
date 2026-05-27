@@ -562,20 +562,19 @@ static int bench_batch_slice_starts(
         return 0;
     }
 
-    const int max_start = prompt->len - cfg->ctx_max - cfg->gen_tokens - 1;
+    const int max_start = prompt->len - cfg->ctx_max;
     if (max_start < cfg->batch_sessions - 1) {
         fprintf(stderr,
                 "ds4-bench: prompt has %d tokens, need enough room for %d distinct "
-                "slices of ctx=%d plus gen=%d\n",
+                "slices of ctx=%d\n",
                 prompt->len,
                 cfg->batch_sessions,
-                cfg->ctx_max,
-                cfg->gen_tokens);
+                cfg->ctx_max);
         return 1;
     }
     for (int i = 0; i < cfg->batch_sessions; i++) {
         starts[i] = cfg->batch_sessions == 1 ? 0 :
-            (int)(((int64_t)max_start * i) / cfg->batch_sessions);
+            (int)(((int64_t)max_start * i) / (cfg->batch_sessions - 1));
     }
     return 0;
 }

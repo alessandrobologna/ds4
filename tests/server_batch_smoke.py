@@ -177,6 +177,9 @@ def server_with_retries(
                 break
             time.sleep(0.05 * attempt)
             continue
+        except Exception:
+            server.stop()
+            raise
         try:
             yield server, port
         finally:
@@ -746,8 +749,8 @@ def benchmark_prompts(args: argparse.Namespace, workload: str, clients: int) -> 
         ]
     if workload in {"prefill", "mixed"} and args.prefill_unique_suffix:
         prompts = [
-            prompt + f"\nUnique request suffix {i:02d}: answer for client {i} only after the shared context."
-            for i in range(clients)
+            item + f"\nUnique request suffix {i:02d}: answer for client {i} only after the shared context."
+            for i, item in enumerate(prompts)
         ]
     return prompts, max_tokens
 

@@ -1650,6 +1650,12 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
     }
 }
 
+extern "C" void ds4_gpu_push_serial_matmul_rows(void) {
+}
+
+extern "C" void ds4_gpu_pop_serial_matmul_rows(void) {
+}
+
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
@@ -7527,6 +7533,7 @@ extern "C" int ds4_gpu_attention_segmented_mixed_heads_tensor(
         uint32_t                n_slots,
         uint32_t                raw_cap,
         uint32_t                comp_cap,
+        uint32_t                comp_kv_f16,
         uint32_t                top_k,
         uint32_t                ratio,
         uint32_t                n_head,
@@ -7544,6 +7551,7 @@ extern "C" int ds4_gpu_attention_segmented_mixed_heads_tensor(
     (void)n_slots;
     (void)raw_cap;
     (void)comp_cap;
+    (void)comp_kv_f16;
     (void)top_k;
     (void)ratio;
     (void)n_head;

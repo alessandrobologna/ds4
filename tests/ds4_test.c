@@ -1514,6 +1514,7 @@ static void test_batch_api_session_slots(void) {
     if (!engine) return;
 
     char err[256];
+#ifdef __APPLE__
     ds4_batch *shared = NULL;
     ds4_batch_options shared_opt = {
         .ctx_size = 32768,
@@ -1525,6 +1526,7 @@ static void test_batch_api_session_slots(void) {
     TEST_ASSERT(shared != NULL);
     TEST_ASSERT(!strcmp(ds4_batch_backend_name(shared), "shared-decode"));
     ds4_batch_free(shared);
+#endif
 
     ds4_tokens prompt_a = {0};
     ds4_tokens prompt_b = {0};
@@ -1720,6 +1722,22 @@ static void test_batch_api_shared_decode(void) {
     if (!engine) return;
 
     char err[256];
+    ds4_batch_options opt = {
+        .ctx_size = 32768,
+        .max_slots = 3,
+        .backend = DS4_BATCH_BACKEND_SHARED_DECODE,
+    };
+
+#ifndef __APPLE__
+    ds4_batch *unsupported = NULL;
+    err[0] = '\0';
+    TEST_ASSERT(ds4_batch_create_with_options(&unsupported, engine, &opt,
+                                              err, sizeof(err)) != 0);
+    TEST_ASSERT(unsupported == NULL);
+    TEST_ASSERT(strstr(err, "Metal graph backend") != NULL);
+    return;
+#endif
+
     ds4_tokens prompt_a = {0};
     ds4_tokens prompt_b = {0};
     ds4_encode_chat_prompt(engine, "", "Reply with the next token after north.", DS4_THINK_NONE, &prompt_a);
@@ -1735,11 +1753,6 @@ static void test_batch_api_shared_decode(void) {
     if (single_b) TEST_ASSERT(ds4_session_sync(single_b, &prompt_b, err, sizeof(err)) == 0);
 
     ds4_batch *batch = NULL;
-    ds4_batch_options opt = {
-        .ctx_size = 32768,
-        .max_slots = 3,
-        .backend = DS4_BATCH_BACKEND_SHARED_DECODE,
-    };
     TEST_ASSERT(ds4_batch_create_with_options(&batch, engine, &opt, err, sizeof(err)) == 0);
     TEST_ASSERT(batch != NULL);
     if (!batch || !single_a || !single_b) {

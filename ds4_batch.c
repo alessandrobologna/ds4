@@ -684,7 +684,7 @@ int ds4_batch_prefill_segments(ds4_batch *b,
             batch_set_err(err, errlen, "batch slot is in an error state");
             return 1;
         }
-        if (ds4_session_pos(sessions[i]) + segments[i].n_tokens > ds4_session_ctx(sessions[i])) {
+        if (ds4_session_pos(sessions[i]) + segments[i].n_tokens >= ds4_session_ctx(sessions[i])) {
             batch_set_err(err, errlen, "batch prefill segment exceeds context");
             return 1;
         }

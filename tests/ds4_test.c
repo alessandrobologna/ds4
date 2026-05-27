@@ -1588,6 +1588,15 @@ static void test_batch_api_session_slots(void) {
         ds4_batch_step edge_step = { .slot = 0, .token = ds4_batch_argmax(edge_batch, 0) };
         TEST_ASSERT(edge_step.token >= 0);
         TEST_ASSERT(ds4_batch_eval(edge_batch, &edge_step, 1, err, sizeof(err)) != 0);
+        int edge_tokens[1] = { edge_step.token };
+        ds4_batch_prefill_segment edge_segment = {
+            .slot = 0,
+            .tokens = edge_tokens,
+            .n_tokens = 1,
+            .refresh_logits = 1,
+        };
+        TEST_ASSERT(ds4_batch_prefill_segments(edge_batch, &edge_segment, 1,
+                                               err, sizeof(err)) != 0);
         ds4_batch_free(edge_batch);
     }
 

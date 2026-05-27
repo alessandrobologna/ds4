@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <netdb.h>
@@ -14,7 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -244,7 +247,7 @@ static void http_eval_usage(FILE *fp) {
         "  --url URL              Chat completions URL. Default: http://127.0.0.1:8000/v1/chat/completions\n"
         "  --model NAME           Request model name. Default: deepseek-v4-flash\n"
         "  --parallel N           Concurrent HTTP requests. Default: 1\n"
-        "  --timeout-ms N         Socket timeout per request. Default: 600000\n"
+        "  --timeout-ms N         Connect and socket I/O timeout after DNS. Default: 600000\n"
         "  --stream               Use SSE streaming and measure client-visible TTFT.\n"
         "\n"
         "Evaluation:\n"
@@ -469,6 +472,75 @@ static void http_eval_set_socket_timeout(int fd, int timeout_ms) {
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+static int http_eval_timed_connect(int fd, const struct sockaddr *addr,
+                                   socklen_t addrlen, int timeout_ms) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+
+    int rc;
+    do {
+        rc = connect(fd, addr, addrlen);
+    } while (rc < 0 && errno == EINTR);
+    if (rc == 0) {
+        (void)fcntl(fd, F_SETFL, flags);
+        return 0;
+    }
+    if (errno != EINPROGRESS) {
+        int saved = errno;
+        (void)fcntl(fd, F_SETFL, flags);
+        errno = saved;
+        return -1;
+    }
+
+    const double deadline = now_sec() + (double)timeout_ms / 1000.0;
+    for (;;) {
+        const double left = deadline - now_sec();
+        if (left <= 0.0) {
+            (void)fcntl(fd, F_SETFL, flags);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        struct timeval tv;
+        tv.tv_sec = (time_t)left;
+        tv.tv_usec = (suseconds_t)((left - (double)tv.tv_sec) * 1000000.0);
+        if (tv.tv_sec == 0 && tv.tv_usec == 0) tv.tv_usec = 1;
+
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            int saved = errno;
+            (void)fcntl(fd, F_SETFL, flags);
+            errno = saved;
+            return -1;
+        }
+        if (rc == 0) {
+            (void)fcntl(fd, F_SETFL, flags);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+
+        int socket_error = 0;
+        socklen_t socket_error_len = sizeof(socket_error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                       &socket_error, &socket_error_len) < 0) {
+            int saved = errno;
+            (void)fcntl(fd, F_SETFL, flags);
+            errno = saved;
+            return -1;
+        }
+        (void)fcntl(fd, F_SETFL, flags);
+        if (socket_error != 0) {
+            errno = socket_error;
+            return -1;
+        }
+        return 0;
+    }
+}
+
 static int http_eval_connect(const http_eval_url *url, int timeout_ms,
                              char **err) {
     char port_buf[16];
@@ -495,8 +567,11 @@ static int http_eval_connect(const http_eval_url *url, int timeout_ms,
             last_errno = errno;
             continue;
         }
-        http_eval_set_socket_timeout(fd, timeout_ms);
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        if (http_eval_timed_connect(fd, ai->ai_addr, ai->ai_addrlen,
+                                    timeout_ms) == 0) {
+            http_eval_set_socket_timeout(fd, timeout_ms);
+            break;
+        }
         last_errno = errno;
         close(fd);
         fd = -1;

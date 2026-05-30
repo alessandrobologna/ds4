@@ -29,6 +29,10 @@ Useful narrower checks:
 
 ```sh
 ./ds4_test --server
+./ds4_test --batch-api
+make server-batch-smoke
+make server-batch-metrics
+make server-batch-benchmark
 ./ds4_test --logprob-vectors
 ./ds4_test --long-context
 ./ds4_test --tool-call-quality
@@ -40,6 +44,23 @@ What they cover:
 - `--server`: request parsing, chat rendering, streaming, tool-call parsing,
   thinking controls, KV disk-cache bookkeeping, and other server-side logic.
   This is the best quick check for API and prompt-rendering changes.
+- `--batch-api`: public batch API slot contract checks for both the portable
+  session-slot backend and the private shared-decode storage-slot backend.
+- `make server-batch-smoke`: launches `ds4-server` and exercises the
+  experimental public batch path through HTTP parity, concurrent request,
+  streaming, cancellation, disk-cache, and batched-prefill checks. It uses
+  `DS4_TEST_MODEL` when set, otherwise `ds4flash.gguf`.
+- `make server-batch-metrics`: launches `ds4-server` repeatedly and captures
+  observed request throughput, token throughput, latency, TTFT, speedup, and
+  slot efficiency across `--max-slots 1,2,4`. It is a local measurement harness,
+  not a correctness gate. Tune the sweep with `DS4_BATCH_METRIC_SLOTS`,
+  `DS4_BATCH_METRIC_REQUESTS`, `DS4_BATCH_METRIC_CONCURRENCY`, and
+  `DS4_BATCH_METRIC_BACKEND`; set `DS4_BATCH_METRIC_JSON` to save the raw rows.
+- `make server-batch-benchmark`: runs the label/workload benchmark harness used
+  by the batch integration tests. The default is a short shared-prefix prefill
+  check with fanout assertions; tune it with `DS4_BATCH_BENCH_WORKLOAD`,
+  `DS4_BATCH_BENCH_CLIENTS`, `DS4_BATCH_BENCH_LABELS`,
+  `DS4_BATCH_BENCH_TRIALS`, and `DS4_BATCH_BENCH_EXTRA`.
 - `--logprob-vectors`: compares local token bytes and top-logprob slices against
   official DeepSeek V4 Flash continuation vectors. This catches tokenizer,
   template, attention, and logits regressions.

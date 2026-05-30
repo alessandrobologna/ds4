@@ -107,6 +107,19 @@ typedef struct {
     char *path;
 } ds4_kvstore_load_result;
 
+typedef struct {
+    void *ud;
+    const ds4_tokens *(*tokens)(void *ud);
+    int (*ctx)(void *ud);
+    uint64_t (*payload_bytes)(void *ud);
+    int (*stage_payload)(void *ud, ds4_session_payload_file *out,
+                         char *err, size_t err_len);
+    int (*save_payload)(void *ud, FILE *fp, char *err, size_t err_len);
+    int (*load_payload)(void *ud, FILE *fp, uint64_t payload_bytes,
+                        char *err, size_t err_len);
+    void (*invalidate)(void *ud);
+} ds4_kvstore_session_ops;
+
 ds4_kvstore_options ds4_kvstore_default_options(void);
 uint8_t ds4_kvstore_reason_code(const char *reason);
 const char *ds4_kvstore_key_kind(uint8_t ext_flags);
@@ -137,6 +150,7 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 const ds4_tokens *prompt,
                                 int user_token_id,
                                 int assistant_token_id);
+int ds4_kvstore_continued_step(const ds4_kvstore *kc);
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens);
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens);
 int ds4_kvstore_suppress_continued_store(ds4_kvstore *kc, int tokens);
@@ -172,6 +186,19 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len);
+bool ds4_kvstore_store_live_prefix_text_with_ops(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        const ds4_kvstore_session_ops *session,
+        const ds4_tokens *tokens,
+        int store_len,
+        const char *reason,
+        const char *cache_text_override,
+        uint8_t cache_text_ext,
+        const char *cache_text_key,
+        const ds4_kvstore_trailer_hooks *hooks,
+        char *err,
+        size_t err_len);
 bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    ds4_engine *engine,
                                    ds4_session *session,
@@ -181,12 +208,29 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    const ds4_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len);
+bool ds4_kvstore_store_live_prefix_with_ops(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        const ds4_kvstore_session_ops *session,
+        const ds4_tokens *tokens,
+        int store_len,
+        const char *reason,
+        const ds4_kvstore_trailer_hooks *hooks,
+        char *err,
+        size_t err_len);
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
                                        ds4_engine *engine,
                                        ds4_session *session,
                                        const ds4_kvstore_trailer_hooks *hooks,
                                        char *err,
                                        size_t err_len);
+bool ds4_kvstore_maybe_store_continued_with_ops(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        const ds4_kvstore_session_ops *session,
+        const ds4_kvstore_trailer_hooks *hooks,
+        char *err,
+        size_t err_len);
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
@@ -195,6 +239,15 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
                               bool responses_protocol);
+int ds4_kvstore_try_load_text_with_ops(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        const ds4_kvstore_session_ops *session,
+        const char *prompt_text,
+        ds4_tokens *effective_prompt,
+        ds4_kvstore_load_result *result,
+        const ds4_kvstore_trailer_hooks *hooks,
+        bool responses_protocol);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,

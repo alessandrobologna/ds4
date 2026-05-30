@@ -1650,6 +1650,12 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
     }
 }
 
+extern "C" void ds4_gpu_push_serial_matmul_rows(void) {
+}
+
+extern "C" void ds4_gpu_pop_serial_matmul_rows(void) {
+}
+
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
@@ -7502,6 +7508,139 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
+
+static int cuda_batch_attention_unsupported(const char *what) {
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "ds4: CUDA %s is not implemented\n",
+                what ? what : "batch attention");
+    }
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_segmented_mixed_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *topk,
+        const ds4_gpu_tensor *rows,
+        uint32_t                n_tokens,
+        uint32_t                n_slots,
+        uint32_t                raw_cap,
+        uint32_t                comp_cap,
+        uint32_t                comp_kv_f16,
+        uint32_t                top_k,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads;
+    (void)model_map;
+    (void)model_size;
+    (void)sinks_offset;
+    (void)q;
+    (void)raw_kv;
+    (void)comp_kv;
+    (void)topk;
+    (void)rows;
+    (void)n_tokens;
+    (void)n_slots;
+    (void)raw_cap;
+    (void)comp_cap;
+    (void)comp_kv_f16;
+    (void)top_k;
+    (void)ratio;
+    (void)n_head;
+    (void)head_dim;
+    return cuda_batch_attention_unsupported("segmented mixed batch attention");
+}
+
+extern "C" int ds4_gpu_attention_prefill_masked_raw_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const uint16_t         *mask,
+        uint32_t                n_tokens,
+        uint32_t                n_keys,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads;
+    (void)model_map;
+    (void)model_size;
+    (void)sinks_offset;
+    (void)q;
+    (void)raw_kv;
+    (void)mask;
+    (void)n_tokens;
+    (void)n_keys;
+    (void)n_head;
+    (void)head_dim;
+    return cuda_batch_attention_unsupported("masked raw prefill batch attention");
+}
+
+extern "C" int ds4_gpu_attention_prefill_masked_multi_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *packed_kv,
+        const uint16_t         *mask,
+        uint32_t                n_batches,
+        uint32_t                n_tokens,
+        uint32_t                n_keys,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads;
+    (void)model_map;
+    (void)model_size;
+    (void)sinks_offset;
+    (void)q;
+    (void)packed_kv;
+    (void)mask;
+    (void)n_batches;
+    (void)n_tokens;
+    (void)n_keys;
+    (void)n_head;
+    (void)head_dim;
+    return cuda_batch_attention_unsupported("masked multi-span prefill batch attention");
+}
+
+extern "C" int ds4_gpu_attention_prefill_segmented_flash_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *packed_kv,
+        const ds4_gpu_tensor *rows,
+        uint32_t                n_tokens,
+        uint32_t                n_packed_keys,
+        uint32_t                max_keys,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads;
+    (void)model_map;
+    (void)model_size;
+    (void)sinks_offset;
+    (void)q;
+    (void)packed_kv;
+    (void)rows;
+    (void)n_tokens;
+    (void)n_packed_keys;
+    (void)max_keys;
+    (void)n_head;
+    (void)head_dim;
+    return cuda_batch_attention_unsupported("segmented flash prefill batch attention");
+}
+
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,

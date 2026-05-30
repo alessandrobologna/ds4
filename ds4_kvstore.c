@@ -727,7 +727,7 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
     return last_user >= kc->opt.min_tokens ? last_user : -1;
 }
 
-static int kv_cache_continued_step(const ds4_kvstore *kc) {
+int ds4_kvstore_continued_step(const ds4_kvstore *kc) {
     if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return 0;
     int step = kc->opt.continued_interval_tokens;
     const int align = kc->opt.boundary_align_tokens;
@@ -739,7 +739,7 @@ static int kv_cache_continued_step(const ds4_kvstore *kc) {
 }
 
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
-    const int step = kv_cache_continued_step(kc);
+    const int step = ds4_kvstore_continued_step(kc);
     if (step <= 0) return 0;
     if (live_tokens < kc->opt.min_tokens) return 0;
     if (live_tokens % step != 0) return 0;
@@ -920,18 +920,72 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
     (void)ok;
 }
 
-bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
-                                        ds4_engine *engine,
-                                        ds4_session *session,
-                                        const ds4_tokens *tokens,
-                                        int store_len,
-                                        const char *reason,
-                                        const char *cache_text_override,
-                                        uint8_t cache_text_ext,
-                                        const char *cache_text_key,
-                                        const ds4_kvstore_trailer_hooks *hooks,
-                                        char *err,
-                                        size_t err_len) {
+static const ds4_tokens *kv_session_tokens_cb(void *ud) {
+    return ds4_session_tokens((ds4_session *)ud);
+}
+
+static int kv_session_ctx_cb(void *ud) {
+    return ds4_session_ctx((ds4_session *)ud);
+}
+
+static uint64_t kv_session_payload_bytes_cb(void *ud) {
+    return ds4_session_payload_bytes((ds4_session *)ud);
+}
+
+static int kv_session_stage_payload_cb(void *ud, ds4_session_payload_file *out,
+                                       char *err, size_t err_len) {
+    return ds4_session_stage_payload((ds4_session *)ud, out, err, err_len);
+}
+
+static int kv_session_save_payload_cb(void *ud, FILE *fp,
+                                      char *err, size_t err_len) {
+    return ds4_session_save_payload((ds4_session *)ud, fp, err, err_len);
+}
+
+static int kv_session_load_payload_cb(void *ud, FILE *fp,
+                                      uint64_t payload_bytes,
+                                      char *err, size_t err_len) {
+    return ds4_session_load_payload((ds4_session *)ud, fp, payload_bytes,
+                                    err, err_len);
+}
+
+static void kv_session_invalidate_cb(void *ud) {
+    ds4_session_invalidate((ds4_session *)ud);
+}
+
+static ds4_kvstore_session_ops kv_session_ops(ds4_session *session) {
+    return (ds4_kvstore_session_ops){
+        .ud = session,
+        .tokens = kv_session_tokens_cb,
+        .ctx = kv_session_ctx_cb,
+        .payload_bytes = kv_session_payload_bytes_cb,
+        .stage_payload = kv_session_stage_payload_cb,
+        .save_payload = kv_session_save_payload_cb,
+        .load_payload = kv_session_load_payload_cb,
+        .invalidate = kv_session_invalidate_cb,
+    };
+}
+
+static bool kv_session_ops_valid(const ds4_kvstore_session_ops *session) {
+    return session && session->ud && session->tokens && session->ctx &&
+           session->payload_bytes && session->save_payload &&
+           session->load_payload && session->invalidate;
+}
+
+bool ds4_kvstore_store_live_prefix_text_with_ops(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        const ds4_kvstore_session_ops *session,
+        const ds4_tokens *tokens,
+        int store_len,
+        const char *reason,
+        const char *cache_text_override,
+        uint8_t cache_text_ext,
+        const char *cache_text_key,
+        const ds4_kvstore_trailer_hooks *hooks,
+        char *err,
+        size_t err_len) {
+    if (!kv_session_ops_valid(session)) return false;
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
     const int original_len = tokens->len;
@@ -947,7 +1001,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     const int model_id = ds4_engine_model_id(engine);
 
     char save_err[160] = {0};
-    const ds4_tokens *live_tokens = ds4_session_tokens(session);
+    const ds4_tokens *live_tokens = session->tokens(session->ud);
     if (!live_tokens ||
         live_tokens->len != store_tokens.len ||
         !ds4_tokens_starts_with(live_tokens, &store_tokens))
@@ -996,7 +1050,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
-                                     quant_bits, ds4_session_ctx(session))) {
+                                     quant_bits, session->ctx(session->ud))) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         free(text);
         free(path);
@@ -1005,22 +1059,35 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     }
 
     ds4_session_payload_file staged = {0};
-    if (ds4_session_stage_payload(session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
-                kv_log_name(kc),
-                store_tokens.len,
-                reason,
-                save_err[0] ? save_err : "unknown error");
-        if (err && err_len) snprintf(err, err_len, "%s",
-                                     save_err[0] ? save_err : "unknown error");
-        free(text);
-        free(path);
-        ds4_tokens_free(&store_tokens);
-        return false;
+    bool have_staged_payload = false;
+    uint64_t payload_bytes = 0;
+    if (session->stage_payload) {
+        if (session->stage_payload(session->ud, &staged,
+                                   save_err, sizeof(save_err)) != 0) {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
+                    kv_log_name(kc),
+                    store_tokens.len,
+                    reason,
+                    save_err[0] ? save_err : "unknown error");
+            if (err && err_len) snprintf(err, err_len, "%s",
+                                         save_err[0] ? save_err : "unknown error");
+            free(text);
+            free(path);
+            ds4_tokens_free(&store_tokens);
+            return false;
+        }
+        payload_bytes = staged.bytes;
+        have_staged_payload = true;
+    } else {
+        payload_bytes = session->payload_bytes(session->ud);
+        if (payload_bytes == 0) {
+            free(text);
+            free(path);
+            ds4_tokens_free(&store_tokens);
+            return false;
+        }
     }
-    uint64_t payload_bytes = staged.bytes;
 
     uint64_t est_file_bytes = 0, est_required_bytes = 0;
     if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
@@ -1046,7 +1113,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .text_len = text_len,
         .model_id = (uint8_t)model_id,
         .quant_bits = (uint8_t)quant_bits,
-        .ctx_size = (uint32_t)ds4_session_ctx(session),
+        .ctx_size = (uint32_t)session->ctx(session->ud),
         .reject_different_quant = kc->reject_different_quant,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
@@ -1076,7 +1143,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
-                            (uint32_t)ds4_session_ctx(session),
+                            (uint32_t)session->ctx(session->ud),
                             now, now, payload_bytes);
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
@@ -1085,8 +1152,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
+              (have_staged_payload ?
+                   ds4_session_write_staged_payload(&staged, fp,
+                                                    save_err,
+                                                    sizeof(save_err)) == 0 :
+                   session->save_payload(session->ud, fp, save_err,
+                                         sizeof(save_err)) == 0) &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
               fflush(fp) == 0;
     int saved_errno = errno;
@@ -1154,6 +1225,24 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     return ok;
 }
 
+bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+                                        ds4_engine *engine,
+                                        ds4_session *session,
+                                        const ds4_tokens *tokens,
+                                        int store_len,
+                                        const char *reason,
+                                        const char *cache_text_override,
+                                        uint8_t cache_text_ext,
+                                        const char *cache_text_key,
+                                        const ds4_kvstore_trailer_hooks *hooks,
+                                        char *err,
+                                        size_t err_len) {
+    ds4_kvstore_session_ops ops = kv_session_ops(session);
+    return ds4_kvstore_store_live_prefix_text_with_ops(
+        kc, engine, &ops, tokens, store_len, reason, cache_text_override,
+        cache_text_ext, cache_text_key, hooks, err, err_len);
+}
+
 bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    ds4_engine *engine,
                                    ds4_session *session,
@@ -1168,18 +1257,47 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                               hooks, err, err_len);
 }
 
+bool ds4_kvstore_store_live_prefix_with_ops(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        const ds4_kvstore_session_ops *session,
+        const ds4_tokens *tokens,
+        int store_len,
+        const char *reason,
+        const ds4_kvstore_trailer_hooks *hooks,
+        char *err,
+        size_t err_len) {
+    return ds4_kvstore_store_live_prefix_text_with_ops(
+        kc, engine, session, tokens, store_len, reason, NULL, 0, NULL,
+        hooks, err, err_len);
+}
+
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
                                        ds4_engine *engine,
                                        ds4_session *session,
                                        const ds4_kvstore_trailer_hooks *hooks,
                                        char *err,
                                        size_t err_len) {
-    const ds4_tokens *tokens = ds4_session_tokens(session);
+    ds4_kvstore_session_ops ops = kv_session_ops(session);
+    return ds4_kvstore_maybe_store_continued_with_ops(kc, engine, &ops,
+                                                      hooks, err, err_len);
+}
+
+bool ds4_kvstore_maybe_store_continued_with_ops(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        const ds4_kvstore_session_ops *session,
+        const ds4_kvstore_trailer_hooks *hooks,
+        char *err,
+        size_t err_len) {
+    if (!kv_session_ops_valid(session)) return false;
+    const ds4_tokens *tokens = session->tokens(session->ud);
     if (!tokens) return false;
     const int target = ds4_kvstore_continued_store_target(kc, tokens->len);
     if (target == 0) return false;
-    if (ds4_kvstore_store_live_prefix(kc, engine, session, tokens, target,
-                                      "continued", hooks, err, err_len))
+    if (ds4_kvstore_store_live_prefix_with_ops(kc, engine, session, tokens,
+                                               target, "continued", hooks,
+                                               err, err_len))
     {
         ds4_kvstore_note_store(kc, target);
         return true;
@@ -1212,23 +1330,25 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     return best;
 }
 
-int ds4_kvstore_try_load_text(ds4_kvstore *kc,
-                              ds4_engine *engine,
-                              ds4_session *session,
-                              const char *prompt_text,
-                              ds4_tokens *effective_prompt,
-                              ds4_kvstore_load_result *result,
-                              const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol) {
+int ds4_kvstore_try_load_text_with_ops(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        const ds4_kvstore_session_ops *session,
+        const char *prompt_text,
+        ds4_tokens *effective_prompt,
+        ds4_kvstore_load_result *result,
+        const ds4_kvstore_trailer_hooks *hooks,
+        bool responses_protocol) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
+    if (!kv_session_ops_valid(session)) return 0;
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
+                                           session->ctx(session->ud));
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
@@ -1274,9 +1394,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     char err[160] = {0};
     int loaded = 0;
     if (header_ok &&
-        ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
+        session->load_payload(session->ud, fp, hdr.payload_bytes, err,
+                              sizeof(err)) == 0)
     {
-        const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
+        const ds4_tokens *loaded_tokens = session->tokens(session->ud);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
             if (effective_prompt) {
@@ -1292,7 +1413,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                 hooks->load(hooks->ud, fp, hooks->load_wanted);
             }
         } else {
-            ds4_session_invalidate(session);
+            session->invalidate(session->ud);
             unlink(path);
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache discarded corrupt text-prefix payload%s%s %s",
@@ -1302,7 +1423,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                     path);
         }
     } else {
-        if (header_ok) ds4_session_invalidate(session);
+        if (header_ok) session->invalidate(session->ud);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
                 kv_log_name(kc),
@@ -1350,6 +1471,20 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     free(cached_text);
     free(path);
     return loaded;
+}
+
+int ds4_kvstore_try_load_text(ds4_kvstore *kc,
+                              ds4_engine *engine,
+                              ds4_session *session,
+                              const char *prompt_text,
+                              ds4_tokens *effective_prompt,
+                              ds4_kvstore_load_result *result,
+                              const ds4_kvstore_trailer_hooks *hooks,
+                              bool responses_protocol) {
+    ds4_kvstore_session_ops ops = kv_session_ops(session);
+    return ds4_kvstore_try_load_text_with_ops(kc, engine, &ops, prompt_text,
+                                              effective_prompt, result, hooks,
+                                              responses_protocol);
 }
 
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result) {

@@ -13,11 +13,26 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
+DS4_TEST_MODEL ?= ds4flash.gguf
+DS4_BATCH_METRIC_SLOTS ?= 1,2,4
+DS4_BATCH_METRIC_TOKENS ?= 16
+DS4_BATCH_METRIC_CONCURRENCY ?=
+DS4_BATCH_METRIC_REQUESTS ?=
+DS4_BATCH_METRIC_JSON ?=
+DS4_BATCH_METRIC_BACKEND ?= session-slots
+DS4_BATCH_BENCH_WORKLOAD ?= prefill
+DS4_BATCH_BENCH_CLIENTS ?= 2
+DS4_BATCH_BENCH_LABELS ?= serialized,shared-decode
+DS4_BATCH_BENCH_TRIALS ?= 1
+DS4_BATCH_BENCH_CTX ?= 512
+DS4_BATCH_BENCH_PREFILL_REPEATS ?= 6
+DS4_BATCH_BENCH_EXTRA ?= --prefill-unique-suffix --expect-prefill-fanout --expect-prefill-batch --expect-prefill-chunk
+DS4_BATCH_BENCH_OUT ?= /tmp/ds4-batch-bench
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_batch.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_batch.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,22 +43,38 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
-CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_batch.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_batch.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test server-batch-smoke server-batch-metrics server-batch-metrics-decode-medium server-batch-metrics-mixed-medium server-batch-metrics-mixed-shared-medium server-batch-benchmark server-batch-benchmark-compare server-batch-benchmark-stress cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
+all: ds4 ds4-server ds4-bench ds4-eval ds4-eval-http ds4-agent
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-eval-http, and ./ds4-agent"
+	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-eval-http, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
+	@echo "  make server-batch-smoke"
+	@echo "                    Run experimental server batch integration checks"
+	@echo "  make server-batch-metrics"
+	@echo "                    Capture experimental server batch efficiency metrics"
+	@echo "  make server-batch-metrics-decode-medium"
+	@echo "                    Capture slots 1/2/4/8 decode-heavy metrics"
+	@echo "  make server-batch-metrics-mixed-medium"
+	@echo "                    Capture slots 1/2/4/8 mixed prefill+decode metrics"
+	@echo "  make server-batch-metrics-mixed-shared-medium"
+	@echo "                    Capture shared-decode mixed prefill+decode metrics"
+	@echo "  make server-batch-benchmark"
+	@echo "                    Run old-style batch benchmark labels/workloads"
+	@echo "  make server-batch-benchmark-compare"
+	@echo "                    Compare serialized vs shared-decode for decode and prefill"
+	@echo "  make server-batch-benchmark-stress"
+	@echo "                    Run a heavier mixed prefill stress benchmark"
 	@echo "  make clean        Remove build outputs"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -55,17 +86,21 @@ ds4-server: ds4_server.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ds4-bench: ds4_bench.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-eval: ds4_eval.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_eval.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-eval: ds4_eval.o ds4_eval_common.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_eval.o ds4_eval_common.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+ds4-eval-http: ds4_eval_http.o ds4_eval_common.o
+	$(CC) $(CFLAGS) -o $@ ds4_eval_http.o ds4_eval_common.o $(LDLIBS)
 
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_http.o ds4_eval_common.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_common.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-eval-http ds4_eval_http.o ds4_eval_common.o $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression:
@@ -78,15 +113,30 @@ help:
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10 with Spark HBM weight cache"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
-	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-eval-http, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
+	@echo "  make server-batch-smoke  Run experimental server batch integration checks"
+	@echo "  make server-batch-metrics"
+	@echo "                          Capture experimental server batch efficiency metrics"
+	@echo "  make server-batch-metrics-decode-medium"
+	@echo "                          Capture slots 1/2/4/8 decode-heavy metrics"
+	@echo "  make server-batch-metrics-mixed-medium"
+	@echo "                          Capture slots 1/2/4/8 mixed prefill+decode metrics"
+	@echo "  make server-batch-metrics-mixed-shared-medium"
+	@echo "                          Capture shared-decode mixed prefill+decode metrics"
+	@echo "  make server-batch-benchmark"
+	@echo "                          Run old-style batch benchmark labels/workloads"
+	@echo "  make server-batch-benchmark-compare"
+	@echo "                          Compare serialized vs shared-decode for decode and prefill"
+	@echo "  make server-batch-benchmark-stress"
+	@echo "                          Run a heavier mixed prefill stress benchmark"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH= CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCCFLAGS="$(NVCCFLAGS) $(CUDA_SPARK_FLAGS)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-eval-http ds4-agent CUDA_ARCH= CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCCFLAGS="$(NVCCFLAGS) $(CUDA_SPARK_FLAGS)"
 
 cuda-generic:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-eval-http ds4-agent CUDA_ARCH=native
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
@@ -94,7 +144,7 @@ cuda:
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-eval-http ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -105,39 +155,46 @@ ds4-server: ds4_server.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ds4-bench: ds4_bench.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-eval: ds4_eval.o $(CORE_OBJS)
+ds4-eval: ds4_eval.o ds4_eval_common.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+ds4-eval-http: ds4_eval_http.o ds4_eval_common.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_http.o ds4_eval_common.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_common.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-eval-http ds4_eval_http.o ds4_eval_common.o $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_distributed.h ds4_batch.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
-ds4_cli.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
+ds4_batch.o: ds4_batch.c ds4.h ds4_batch.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_batch.c
+
+ds4_cli.o: ds4_cli.c ds4.h ds4_distributed.h ds4_batch.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
 ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
 
-ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h
+ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_batch.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_bench.o: ds4_bench.c ds4.h
+ds4_bench.o: ds4_bench.c ds4.h ds4_batch.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
-ds4_eval.o: ds4_eval.c ds4.h
+ds4_eval.o: ds4_eval.c ds4.h ds4_batch.h ds4_eval_common.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
 
 ds4_agent.o: ds4_agent.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
@@ -149,7 +206,13 @@ ds4_web.o: ds4_web.c ds4_web.h
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h
+ds4_eval_common.o: ds4_eval_common.c ds4_eval_common.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_eval_common.c
+
+ds4_eval_http.o: ds4_eval_http.c ds4.h ds4_eval_common.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_eval_http.c
+
+ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_distributed.h ds4_batch.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
@@ -161,19 +224,19 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_distributed.h ds4_batch.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
-ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
+ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_distributed.h ds4_batch.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
-ds4_server_cpu.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h
+ds4_server_cpu.o: ds4_server.c ds4.h ds4_distributed.h ds4_batch.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
-ds4_bench_cpu.o: ds4_bench.c ds4.h
+ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_batch.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
-ds4_eval_cpu.o: ds4_eval.c ds4.h
+ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_batch.h ds4_eval_common.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
 
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
@@ -199,5 +262,34 @@ test: ds4_test ds4-eval
 	./ds4-eval --self-test-extractors
 	./ds4_test
 
+server-batch-smoke: ds4-server
+	python3 tests/server_batch_smoke.py all --server ./ds4-server --model "$(DS4_TEST_MODEL)"
+
+server-batch-metrics: ds4-server
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --backend "$(DS4_BATCH_METRIC_BACKEND)" --slots "$(DS4_BATCH_METRIC_SLOTS)" --tokens "$(DS4_BATCH_METRIC_TOKENS)" $(if $(strip $(DS4_BATCH_METRIC_CONCURRENCY)),--concurrency "$(DS4_BATCH_METRIC_CONCURRENCY)") $(if $(strip $(DS4_BATCH_METRIC_REQUESTS)),--requests "$(DS4_BATCH_METRIC_REQUESTS)") $(if $(strip $(DS4_BATCH_METRIC_JSON)),--json-out "$(DS4_BATCH_METRIC_JSON)")
+
+server-batch-metrics-decode-medium: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)/logs-decode-medium"
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 512 --backend session-slots --slots 1,2,4,8 --tokens 64 --prompt-mode long-decode --requests 16 --warmup-requests 1 --request-timeout 600 --json-out "$(DS4_BATCH_BENCH_OUT)/decode-medium.json" --log-dir "$(DS4_BATCH_BENCH_OUT)/logs-decode-medium"
+
+server-batch-metrics-mixed-medium: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)/logs-mixed-medium"
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 2048 --backend session-slots --slots 1,2,4,8 --tokens 32 --prompt-mode mixed --prefill-repeats 30 --experimental-batched-prefill --requests 16 --warmup-requests 1 --request-timeout 600 --json-out "$(DS4_BATCH_BENCH_OUT)/mixed-medium.json" --log-dir "$(DS4_BATCH_BENCH_OUT)/logs-mixed-medium"
+
+server-batch-metrics-mixed-shared-medium: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)/logs-mixed-shared-medium"
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 2048 --backend shared-decode --slots 1,2,4,8 --tokens 32 --prompt-mode mixed --prefill-repeats 30 --experimental-batched-prefill --requests 16 --warmup-requests 1 --request-timeout 600 --json-out "$(DS4_BATCH_BENCH_OUT)/mixed-shared-medium.json" --log-dir "$(DS4_BATCH_BENCH_OUT)/logs-mixed-shared-medium"
+
+server-batch-benchmark: ds4-server
+	python3 tests/server_batch_smoke.py benchmark --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx "$(DS4_BATCH_BENCH_CTX)" --workload "$(DS4_BATCH_BENCH_WORKLOAD)" --clients "$(DS4_BATCH_BENCH_CLIENTS)" --labels "$(DS4_BATCH_BENCH_LABELS)" --trials "$(DS4_BATCH_BENCH_TRIALS)" --prefill-repeats "$(DS4_BATCH_BENCH_PREFILL_REPEATS)" $(DS4_BATCH_BENCH_EXTRA)
+
+server-batch-benchmark-compare: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)"
+	python3 tests/server_batch_smoke.py benchmark --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 2048 --workload both --clients 2,4 --labels serialized,shared-decode --trials 1 --max-tokens 64 --prefill-repeats 30 --prefill-max-tokens 1 --prefill-unique-suffix --request-timeout 600 --progress | tee "$(DS4_BATCH_BENCH_OUT)/benchmark-compare.txt"
+
+server-batch-benchmark-stress: ds4-server
+	mkdir -p "$(DS4_BATCH_BENCH_OUT)/logs-mixed-stress"
+	python3 tests/server_batch_metrics.py --server ./ds4-server --model "$(DS4_TEST_MODEL)" --ctx 4096 --backend shared-decode --slots 1,2,4,8 --tokens 32 --prompt-mode mixed --prefill-repeats 80 --experimental-batched-prefill --requests 16 --warmup-requests 1 --request-timeout 900 --json-out "$(DS4_BATCH_BENCH_OUT)/mixed-stress.json" --log-dir "$(DS4_BATCH_BENCH_OUT)/logs-mixed-stress"
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-eval-http ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
